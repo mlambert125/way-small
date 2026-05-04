@@ -1,0 +1,60 @@
+use tracing::debug;
+
+use crate::wayland_socket::ClientMessage;
+
+use super::{ArgReader, ArgWriter, ClientState, ObjectType, next_serial, message, wl_registry};
+
+pub const OBJECT_ID: u32 = 1;
+
+// Request opcodes
+const SYNC: u16 = 0;
+const GET_REGISTRY: u16 = 1;
+
+// Event opcodes
+pub const ERROR: u16 = 0;
+const DELETE_ID: u16 = 1;
+
+// wl_callback event opcodes
+const WL_CALLBACK_DONE: u16 = 0;
+
+pub async fn handle(state: &mut ClientState, msg: &ClientMessage) {
+    match msg.message.op_code {
+        SYNC => handle_sync(state, msg).await,
+        GET_REGISTRY => handle_get_registry(state, msg).await,
+        op => {
+            tracing::warn!("wl_display: unhandled opcode {}", op);
+        }
+    }
+}
+
+async fn handle_sync(state: &mut ClientState, msg: &ClientMessage) {
+    let Some(callback_id) = ArgReader::new(&msg.message.args).new_id() else {
+        state.send_error(OBJECT_ID, 0, "wl_display.sync: missing callback id").await;
+        return;
+    };
+    debug!("wl_display.sync -> callback_id={}", callback_id);
+
+    state.register(callback_id, ObjectType::WlCallback);
+
+    let serial = next_serial();
+    let args = ArgWriter::new().u32(serial).build();
+    if state.send(message(callback_id, WL_CALLBACK_DONE, args)).await.is_err() {
+        return;
+    }
+
+    state.unregister(callback_id);
+
+    let args = ArgWriter::new().u32(callback_id).build();
+    let _ = state.send(message(OBJECT_ID, DELETE_ID, args)).await;
+}
+
+async fn handle_get_registry(state: &mut ClientState, msg: &ClientMessage) {
+    let Some(registry_id) = ArgReader::new(&msg.message.args).new_id() else {
+        state.send_error(OBJECT_ID, 0, "wl_display.get_registry: missing registry id").await;
+        return;
+    };
+    state.register(registry_id, ObjectType::WlRegistry);
+    debug!("wl_display.get_registry -> registry_id={}", registry_id);
+
+    wl_registry::advertise_globals(state, registry_id).await;
+}

@@ -1,13 +1,22 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use sendfd::{RecvWithFd, SendWithFd};
 use tokio::{
     net::{UnixSocket, UnixStream},
     select,
     sync::mpsc::{Sender, channel},
+    task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
+
+static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
 pub struct WaylandMessage {
     pub object_id: u32,
@@ -16,9 +25,15 @@ pub struct WaylandMessage {
     pub fds: VecDeque<i32>,
 }
 
-pub struct WaylandSocketMessage {
+pub struct ClientMessage {
+    pub client_id: u32,
     pub message: WaylandMessage,
-    pub send_channel: Sender<WaylandMessage>,
+    pub socket_sender: Sender<WaylandMessage>,
+}
+
+pub enum WaylandSocketMessage {
+    Message(ClientMessage),
+    ClientDisconnected { client_id: u32 },
 }
 
 pub async fn run_wayland_socket(
@@ -36,14 +51,19 @@ pub async fn run_wayland_socket(
 
     debug!("Wayland socket listening on {}", socket_path);
 
+    let mut client_handles: Vec<JoinHandle<()>> = Vec::new();
+
     loop {
         let res = select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
                         let stream = Arc::new(stream);
                         let compositor_message_channel = compositor_message_sender.clone();
-                        handle_client(stream, compositor_message_channel, cancel_token.clone()).await
+                        let handle = handle_client(client_id, stream, compositor_message_channel, cancel_token.clone());
+                        client_handles.push(handle);
+                        Ok(())
                     }
                     Err(e) => {
                         debug!("Error accepting client: {}", e);
@@ -59,23 +79,30 @@ pub async fn run_wayland_socket(
             break;
         }
     }
+
+    for handle in client_handles {
+        let _ = handle.await;
+    }
     info!("Wayland socket shutting down...");
+    if let Err(e) = std::fs::remove_file(&socket_path) {
+        debug!("Failed to remove socket file: {}", e);
+    }
     Ok(())
 }
 
-async fn handle_client(
+fn handle_client(
+    client_id: u32,
     stream: Arc<UnixStream>,
     compositor_message_channel: Sender<WaylandSocketMessage>,
     cancel_token: CancellationToken,
-) -> anyhow::Result<()> {
+) -> JoinHandle<()> {
     let sender_stream = stream.clone();
     tokio::spawn(async move {
         debug!("New client connected");
         let mut data = VecDeque::<u8>::new();
         let mut pending_fds = VecDeque::<i32>::new();
-        let (socket_send_tx, socket_send_rx) = channel::<WaylandMessage>(1);
+        let (socket_send_tx, socket_send_rx) = channel::<WaylandMessage>(64);
 
-        // Spawn a task to handle sending messages back to the client
         let sender_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
             let mut socket_send_rx = socket_send_rx;
@@ -93,11 +120,28 @@ async fn handle_client(
                             buffer.extend_from_slice(&message_length_and_opcode.to_le_bytes());
                             buffer.extend_from_slice(&message.args);
 
-                            if let Err(e) = sender_stream
-                                .send_with_fd(&buffer, &message.fds.iter().cloned().collect::<Vec<i32>>())
-                            {
-                                debug!("Error sending message to client: {}", e);
-                                break;
+                            let fds_vec: Vec<i32> = message.fds.iter().cloned().collect();
+                            let mut bytes_sent = 0;
+                            let mut fds_sent = false;
+                            while bytes_sent < buffer.len() {
+                                if let Err(e) = sender_stream.writable().await {
+                                    debug!("Error waiting for writable: {}", e);
+                                    return;
+                                }
+                                let fds_to_send = if fds_sent { &[][..] } else { &fds_vec[..] };
+                                match sender_stream.try_io(tokio::io::Interest::WRITABLE, || {
+                                    sender_stream.send_with_fd(&buffer[bytes_sent..], fds_to_send)
+                                }) {
+                                    Ok(n) => {
+                                        bytes_sent += n;
+                                        fds_sent = true;
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                                    Err(e) => {
+                                        debug!("Error sending message to client: {}", e);
+                                        return;
+                                    }
+                                }
                             }
                         } else {
                             debug!("Wayland socket send channel closed");
@@ -112,7 +156,7 @@ async fn handle_client(
             }
         });
 
-        loop {
+        'outer: loop {
             select! {
                  _ = cancel_token.cancelled() => {
                     debug!("Wayland socket receive task received shutdown signal");
@@ -131,9 +175,11 @@ async fn handle_client(
 
             let mut buffer = [0u8; 4096];
             let mut fds = [0; 10];
-            let result = stream.recv_with_fd(&mut buffer, &mut fds);
+            let result = stream.try_io(tokio::io::Interest::READABLE, || {
+                stream.recv_with_fd(&mut buffer, &mut fds)
+            });
             match result {
-                Ok((0, 0)) => {
+                Ok((0, _)) => {
                     debug!("Client disconnected");
                     break;
                 }
@@ -153,6 +199,13 @@ async fn handle_client(
                         let message_length_and_opcode =
                             u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
                         let message_length = (message_length_and_opcode >> 16) as u16;
+                        if message_length < 8 {
+                            debug!(
+                                "Invalid message length {} from client, disconnecting",
+                                message_length
+                            );
+                            break 'outer;
+                        }
                         if data.len() < message_length as usize {
                             break;
                         }
@@ -185,13 +238,17 @@ async fn handle_client(
                             fds: pending_fds.clone(),
                         };
 
-                        compositor_message_channel
-                            .clone()
-                            .try_send(WaylandSocketMessage {
+                        if let Err(e) = compositor_message_channel
+                            .send(WaylandSocketMessage::Message(ClientMessage {
+                                client_id,
                                 message: msg,
-                                send_channel: socket_send_tx.clone(),
-                            })
-                            .ok();
+                                socket_sender: socket_send_tx.clone(),
+                            }))
+                            .await
+                        {
+                            debug!("Failed to send message to compositor: {}", e);
+                            break 'outer;
+                        }
 
                         pending_fds.clear();
                     }
@@ -205,6 +262,9 @@ async fn handle_client(
                 }
             }
         }
-    });
-    Ok(())
+
+        let _ = compositor_message_channel
+            .send(WaylandSocketMessage::ClientDisconnected { client_id })
+            .await;
+    })
 }

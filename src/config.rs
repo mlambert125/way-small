@@ -1,0 +1,43 @@
+use std::path::PathBuf;
+
+use serde::Deserialize;
+use tracing::info;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ConfigFile {
+    pub backend: Option<String>,
+    pub socket_path: Option<String>,
+}
+
+impl ConfigFile {
+    pub fn load() -> Self {
+        // Check ./config.toml first (development), then XDG config dir
+        let candidates = [
+            Some(PathBuf::from("config.toml")),
+            dirs::config_dir().map(|d| d.join("way-small/config.toml")),
+        ];
+
+        for path in candidates.into_iter().flatten() {
+            if path.exists() {
+                info!("Loading config from {}", path.display());
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
+                        Ok(config) => return config,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse {}: {}",
+                                path.display(),
+                                e,
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to read {}: {}", path.display(), e);
+                    }
+                }
+            }
+        }
+
+        Self::default()
+    }
+}
