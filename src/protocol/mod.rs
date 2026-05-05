@@ -14,8 +14,6 @@ pub mod wl_data_device;
 pub mod wl_data_device_manager;
 pub mod wl_data_offer;
 pub mod wl_data_source;
-pub mod wl_subcompositor;
-pub mod wl_subsurface;
 pub mod wl_display;
 pub mod wl_keyboard;
 pub mod wl_output;
@@ -25,9 +23,12 @@ pub mod wl_registry;
 pub mod wl_seat;
 pub mod wl_shm;
 pub mod wl_shm_pool;
+pub mod wl_subcompositor;
+pub mod wl_subsurface;
 pub mod wl_surface;
 pub mod xdg_positioner;
 pub mod xdg_surface;
+pub mod xdg_system_bell;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
 
@@ -42,7 +43,6 @@ pub use wire::{ArgReader, ArgWriter, message};
 
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 
-/// Get the next monotonically increasing serial number.
 pub fn next_serial() -> u32 {
     NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
@@ -72,6 +72,7 @@ pub enum ObjectType {
     WlDataOffer,
     XdgWmBase,
     XdgSurface,
+    XdgSystemBell,
     XdgToplevel,
     XdgPositioner,
 }
@@ -111,6 +112,10 @@ pub static GLOBALS: &[Global] = &[
         interface: "xdg_wm_base",
         version: 5,
     },
+    Global {
+        interface: "xdg_system_bell_v1",
+        version: 1,
+    },
 ];
 
 pub async fn handle_message(
@@ -141,6 +146,9 @@ pub async fn handle_message(
         }
         Some(ObjectType::WlRegistry) => {
             wl_registry::handle(state, message).await;
+        }
+        Some(ObjectType::WlCallback) => {
+            wl_callback::handle(message);
         }
         Some(ObjectType::WlShm) => {
             wl_shm::handle(state, message).await;
@@ -193,6 +201,9 @@ pub async fn handle_message(
         Some(ObjectType::XdgSurface) => {
             xdg_surface::handle(state, message).await;
         }
+        Some(ObjectType::XdgSystemBell) => {
+            xdg_system_bell::handle(state, message);
+        }
         Some(ObjectType::XdgToplevel) => {
             xdg_toplevel::handle(state, message).await;
         }
@@ -201,9 +212,6 @@ pub async fn handle_message(
         }
         Some(ObjectType::WlBuffer) => {
             wl_buffer::handle(state, message);
-        }
-        Some(ObjectType::WlCallback) => {
-            wl_callback::handle(message);
         }
         None => {
             tracing::warn!(

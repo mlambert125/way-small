@@ -10,7 +10,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
 use super::wire::{ArgReader, ArgWriter, message};
-use super::{ClientState, ObjectType, GLOBALS, wl_output, wl_seat, wl_shm};
+use super::{ClientState, GLOBALS, ObjectType, wl_output, wl_seat, wl_shm};
 
 // Request opcodes
 const BIND: u16 = 0;
@@ -100,6 +100,10 @@ async fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         "xdg_wm_base" => {
             let client = state.clients.get_or_create(msg.client_id);
             client.register_with_version(new_id, ObjectType::XdgWmBase, bound_version);
+        }
+        "xdg_system_bell_v1" => {
+            let client = state.clients.get_or_create(msg.client_id);
+            client.register_with_version(new_id, ObjectType::XdgSystemBell, bound_version);
         }
         "wl_seat" => {
             let client = state.clients.get_or_create(msg.client_id);

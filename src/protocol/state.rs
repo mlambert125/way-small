@@ -40,9 +40,14 @@ pub struct SurfacePending {
 /// Committed surface state.
 #[derive(Debug)]
 pub struct Surface {
+    // The wayland client that owns this surface.
     pub client_id: u32,
+    // The currently attached buffer, if any.
     pub buffer_id: Option<u32>,
+    // The callback to trigger on the next frame, if any.
     pub frame_callback: Option<u32>,
+    // Pending state from the most recent commit. This is cleared when the compositor
+    // applies the commit, but we keep it around here for debugging purposes.
     pub pending: SurfacePending,
     /// If this is a subsurface, its parent surface id.
     pub parent: Option<u32>,
@@ -57,16 +62,20 @@ pub struct Surface {
 /// A region: a set of rectangles (adds minus subtracts).
 #[derive(Debug, Default)]
 pub struct Region {
+    // The wayland client that owns this region.
     pub client_id: u32,
+    // Rectangles that make up this region
     pub rects: Vec<(i32, i32, i32, i32)>,
+    // Negative rectangles (subtracted) that make up this region.
     pub subtracts: Vec<(i32, i32, i32, i32)>,
 }
 
 /// XDG surface role (toplevel or popup).
 #[derive(Debug)]
 pub enum XdgRole {
+    // Top-level surface with associated object id
     #[allow(dead_code)]
-    Toplevel(u32), // toplevel object id
+    Toplevel(u32),
 }
 
 /// State for an xdg_surface (wraps a wl_surface with window semantics).
@@ -148,7 +157,6 @@ pub struct CompositorState {
     pub output: Option<OutputState>,
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
-    /// The surface that currently has pointer/keyboard focus.
     pub focused_surface: Option<u32>,
     /// Maps wl_subsurface object id -> the wl_surface id it controls.
     pub subsurface_map: HashMap<u32, u32>,
@@ -330,7 +338,8 @@ impl CompositorState {
         self.xdg_positioners.retain(|_, p| p.client_id != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
-        self.subsurface_map.retain(|_, surface_id| self.surfaces.contains_key(surface_id));
+        self.subsurface_map
+            .retain(|_, surface_id| self.surfaces.contains_key(surface_id));
         // Clear focus if it pointed to a surface owned by this client
         if let Some(surface_id) = self.focused_surface
             && !self.surfaces.contains_key(&surface_id)

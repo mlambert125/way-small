@@ -38,7 +38,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     let config = config::ConfigFile::load();
@@ -67,27 +67,38 @@ async fn main() -> anyhow::Result<()> {
     let socket_path = if std::path::Path::new(&socket_name).is_absolute() {
         socket_name.clone()
     } else {
-        let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-            .expect("XDG_RUNTIME_DIR is not set");
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is not set");
         format!("{}/{}", runtime_dir, socket_name)
     };
 
     info!("Using backend: {:?}", backend);
-    info!("Wayland socket: {} (WAYLAND_DISPLAY={})", socket_path, socket_name);
+    info!(
+        "Wayland socket: {} (WAYLAND_DISPLAY={})",
+        socket_path, socket_name
+    );
+
+    // Channels
     let (wayland_message_tx, wayland_message_rx) =
         channel::<wayland_socket::WaylandSocketMessage>(10000);
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(10000);
     let (frame_tx, frame_rx) = channel::<RenderFrame>(2); // double-buffer: only 2 in flight
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
-    let winit_handle = match backend {
+    let backend_handle = match backend {
         Backend::Winit => {
             // Winit needs the real WAYLAND_DISPLAY to connect to the host compositor.
             // We set our override only after winit signals it has built its event loop.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             let handle = tokio::task::spawn_blocking({
                 let cancel_token = cancel_token.clone();
-                move || winit_backend::run_winit_backend(backend_message_tx, cancel_token, ready_tx, frame_rx)
+                move || {
+                    winit_backend::run_winit_backend(
+                        backend_message_tx,
+                        cancel_token,
+                        ready_tx,
+                        frame_rx,
+                    )
+                }
             });
             let _ = ready_rx.await;
             // SAFETY: winit has connected to the host compositor; override for child processes
@@ -108,15 +119,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let socket_handle = tokio::spawn(wayland_socket::run_wayland_socket(
-        socket_path,
-        wayland_message_tx,
-        cancel_token.clone(),
-    ));
     let compositor_handle = tokio::spawn(compositor::run_compositor(
         wayland_message_rx,
         backend_message_rx,
         frame_tx,
+        cancel_token.clone(),
+    ));
+
+    let socket_handle = tokio::spawn(wayland_socket::run_wayland_socket(
+        socket_path,
+        wayland_message_tx,
         cancel_token.clone(),
     ));
 
@@ -131,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (_, _) = tokio::join!(socket_handle, compositor_handle);
-    if let Some(handle) = winit_handle {
+    if let Some(handle) = backend_handle {
         let _ = handle.await;
     }
     Ok(())
