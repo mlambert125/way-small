@@ -1,3 +1,8 @@
+//! Configuration file loading.
+//!
+//! Looks for config.toml in the working directory (dev) or
+//! $XDG_CONFIG_HOME/way-small/ and deserializes backend and socket options.
+
 use std::path::PathBuf;
 
 use serde::Deserialize;

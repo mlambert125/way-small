@@ -1993,6 +1993,7 @@ dependencies = [
  "async-stream",
  "clap",
  "dirs",
+ "libc",
  "sendfd",
  "serde",
  "softbuffer",

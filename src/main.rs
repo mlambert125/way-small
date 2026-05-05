@@ -1,14 +1,21 @@
+//! Entry point for way-small.
+//!
+//! Parses CLI args and config, selects a backend, wires up channels between
+//! the Wayland socket listener, compositor loop, and display backend, then
+//! waits for shutdown.
+
 use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc::channel;
 use tracing::info;
 
-use crate::backend::BackendMessage;
+use crate::backend::{BackendMessage, RenderFrame};
 
 mod backend;
 mod compositor;
 mod config;
 mod null_backend;
 mod protocol;
+mod renderer;
 mod wayland_socket;
 mod winit_backend;
 
@@ -65,16 +72,41 @@ async fn main() -> anyhow::Result<()> {
         format!("{}/{}", runtime_dir, socket_name)
     };
 
-    // Set WAYLAND_DISPLAY so child processes / clients can find the socket
-    // SAFETY: called before spawning any threads
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-
     info!("Using backend: {:?}", backend);
     info!("Wayland socket: {} (WAYLAND_DISPLAY={})", socket_path, socket_name);
     let (wayland_message_tx, wayland_message_rx) =
         channel::<wayland_socket::WaylandSocketMessage>(10000);
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(10000);
+    let (frame_tx, frame_rx) = channel::<RenderFrame>(2); // double-buffer: only 2 in flight
     let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let winit_handle = match backend {
+        Backend::Winit => {
+            // Winit needs the real WAYLAND_DISPLAY to connect to the host compositor.
+            // We set our override only after winit signals it has built its event loop.
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::task::spawn_blocking({
+                let cancel_token = cancel_token.clone();
+                move || winit_backend::run_winit_backend(backend_message_tx, cancel_token, ready_tx, frame_rx)
+            });
+            let _ = ready_rx.await;
+            // SAFETY: winit has connected to the host compositor; override for child processes
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+            Some(handle)
+        }
+        Backend::None => {
+            // SAFETY: no windowing backend needs the real WAYLAND_DISPLAY
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+            // Keep frame_rx alive so the compositor's frame_sender doesn't error.
+            // Frames are just dropped (no display).
+            let cancel = cancel_token.clone();
+            tokio::spawn(async move {
+                let _frame_rx = frame_rx;
+                null_backend::run_null_backend(backend_message_tx, cancel).await
+            });
+            None
+        }
+    };
 
     let socket_handle = tokio::spawn(wayland_socket::run_wayland_socket(
         socket_path,
@@ -84,22 +116,9 @@ async fn main() -> anyhow::Result<()> {
     let compositor_handle = tokio::spawn(compositor::run_compositor(
         wayland_message_rx,
         backend_message_rx,
+        frame_tx,
         cancel_token.clone(),
     ));
-
-    let winit_handle = match backend {
-        Backend::Winit => Some(tokio::task::spawn_blocking({
-            let cancel_token = cancel_token.clone();
-            move || winit_backend::run_winit_backend(backend_message_tx, cancel_token)
-        })),
-        Backend::None => {
-            tokio::spawn(null_backend::run_null_backend(
-                backend_message_tx,
-                cancel_token.clone(),
-            ));
-            None
-        }
-    };
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

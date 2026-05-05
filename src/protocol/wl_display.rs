@@ -1,8 +1,14 @@
+//! wl_display protocol handler (object id 1).
+//!
+//! Handles the two core requests every client makes first:
+//! - sync: creates a transient wl_callback, fires done event, then deletes it
+//! - get_registry: creates a wl_registry and advertises all globals
+
 use tracing::debug;
 
-use crate::wayland_socket::ClientMessage;
+use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::{ArgReader, ArgWriter, ClientState, ObjectType, next_serial, message, wl_registry};
+use super::{ArgReader, ArgWriter, ClientState, ObjectType, message, next_serial, wl_registry};
 
 pub const OBJECT_ID: u32 = 1;
 
@@ -17,7 +23,7 @@ const DELETE_ID: u16 = 1;
 // wl_callback event opcodes
 const WL_CALLBACK_DONE: u16 = 0;
 
-pub async fn handle(state: &mut ClientState, msg: &ClientMessage) {
+pub async fn handle(state: &mut ClientState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         SYNC => handle_sync(state, msg).await,
         GET_REGISTRY => handle_get_registry(state, msg).await,
@@ -27,9 +33,11 @@ pub async fn handle(state: &mut ClientState, msg: &ClientMessage) {
     }
 }
 
-async fn handle_sync(state: &mut ClientState, msg: &ClientMessage) {
+async fn handle_sync(state: &mut ClientState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(callback_id) = ArgReader::new(&msg.message.args).new_id() else {
-        state.send_error(OBJECT_ID, 0, "wl_display.sync: missing callback id").await;
+        state
+            .send_error(OBJECT_ID, 0, "wl_display.sync: missing callback id")
+            .await;
         return;
     };
     debug!("wl_display.sync -> callback_id={}", callback_id);
@@ -38,7 +46,11 @@ async fn handle_sync(state: &mut ClientState, msg: &ClientMessage) {
 
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).build();
-    if state.send(message(callback_id, WL_CALLBACK_DONE, args)).await.is_err() {
+    if state
+        .send(message(callback_id, WL_CALLBACK_DONE, args))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -48,9 +60,11 @@ async fn handle_sync(state: &mut ClientState, msg: &ClientMessage) {
     let _ = state.send(message(OBJECT_ID, DELETE_ID, args)).await;
 }
 
-async fn handle_get_registry(state: &mut ClientState, msg: &ClientMessage) {
+async fn handle_get_registry(state: &mut ClientState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(registry_id) = ArgReader::new(&msg.message.args).new_id() else {
-        state.send_error(OBJECT_ID, 0, "wl_display.get_registry: missing registry id").await;
+        state
+            .send_error(OBJECT_ID, 0, "wl_display.get_registry: missing registry id")
+            .await;
         return;
     };
     state.register(registry_id, ObjectType::WlRegistry);

@@ -1,23 +1,31 @@
+//! Winit display backend.
+//!
+//! Opens a window on the host compositor via winit, renders composited frames
+//! received from the compositor, and translates host input events (keyboard,
+//! mouse, focus) into BackendMessages sent to the compositor loop. Also manages
+//! XKB state for keycode-to-keysym resolution.
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use softbuffer::{Context, Surface};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    platform::scancode::PhysicalKeyExtScancode,
     platform::wayland::EventLoopBuilderExtWayland,
     window::{Window, WindowAttributes, WindowId},
 };
 use xkbcommon::xkb;
 
-use crate::backend::{BackendMessage, ButtonState, KeyState, MouseButton};
+use crate::backend::{BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame};
 
-#[derive(Debug)]
 enum UserEvent {
     Shutdown,
+    Frame(RenderFrame),
 }
 
 struct App {
@@ -33,6 +41,53 @@ struct App {
     #[allow(dead_code)]
     xkb_keymap: xkb::Keymap,
     xkb_state: xkb::State,
+    // Last received frame for repainting on resize
+    last_frame: Option<RenderFrame>,
+}
+
+impl App {
+    fn present_frame(&mut self, frame: &RenderFrame) {
+        if let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) {
+            let size = window.inner_size();
+            if let (Some(width), Some(height)) =
+                (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+            {
+                surface
+                    .resize(width, height)
+                    .expect("failed to resize surface");
+                let mut buffer = surface.buffer_mut().expect("failed to get surface buffer");
+
+                // Blit the frame into the window buffer, handling size mismatch
+                let dst_w = size.width as usize;
+                let dst_h = size.height as usize;
+                let src_w = frame.width as usize;
+                let src_h = frame.height as usize;
+
+                for y in 0..dst_h.min(src_h) {
+                    let dst_start = y * dst_w;
+                    let src_start = y * src_w;
+                    let copy_w = dst_w.min(src_w);
+                    buffer[dst_start..dst_start + copy_w]
+                        .copy_from_slice(&frame.pixels[src_start..src_start + copy_w]);
+                    // Fill remaining columns with background
+                    if dst_w > src_w {
+                        for x in src_w..dst_w {
+                            buffer[dst_start + x] = 0xff1a_1a2e;
+                        }
+                    }
+                }
+                // Fill remaining rows with background
+                for y in src_h..dst_h {
+                    let dst_start = y * dst_w;
+                    for x in 0..dst_w {
+                        buffer[dst_start + x] = 0xff1a_1a2e;
+                    }
+                }
+
+                buffer.present().expect("failed to present buffer");
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -50,8 +105,28 @@ impl ApplicationHandler<UserEvent> for App {
 
             self.context = Some(context);
             self.surface = Some(surface);
-            window.request_redraw();
+
+            // Report hardware capabilities
+            let size = window.inner_size();
+            let _ = self.backend_sender.blocking_send(BackendMessage::SeatCapabilities {
+                pointer: true,
+                keyboard: true,
+            });
+            let _ = self.backend_sender.blocking_send(BackendMessage::OutputInfo {
+                width: size.width,
+                height: size.height,
+                refresh_mhz: 60000,
+            });
+
             self.window = Some(window);
+
+            // Present initial dark background
+            let initial = RenderFrame {
+                pixels: vec![0xff1a_1a2e; 800 * 600],
+                width: 800,
+                height: 600,
+            };
+            self.present_frame(&initial);
         }
     }
 
@@ -63,32 +138,34 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                let _ = self.backend_sender.blocking_send(BackendMessage::Resized(size.width, size.height));
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
+                let _ = self
+                    .backend_sender
+                    .blocking_send(BackendMessage::Resized(size.width, size.height));
+                // Repaint with last frame if we have one
+                if let Some(frame) = self.last_frame.as_ref() {
+                    // Clone to satisfy borrow checker (frame borrows self)
+                    let frame_clone = RenderFrame {
+                        pixels: frame.pixels.clone(),
+                        width: frame.width,
+                        height: frame.height,
+                    };
+                    self.present_frame(&frame_clone);
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut())
-                {
-                    let size = window.inner_size();
-                    if let (Some(width), Some(height)) =
-                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                    {
-                        surface
-                            .resize(width, height)
-                            .expect("failed to resize surface");
-                        let mut buffer =
-                            surface.buffer_mut().expect("failed to get surface buffer");
-                        buffer.fill(0xff1a_1a2e);
-                        buffer.present().expect("failed to present buffer");
-                    }
+                if let Some(frame) = self.last_frame.as_ref() {
+                    let frame_clone = RenderFrame {
+                        pixels: frame.pixels.clone(),
+                        width: frame.width,
+                        height: frame.height,
+                    };
+                    self.present_frame(&frame_clone);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
-                    // winit KeyCode enum → evdev scancode + 8 = xkb keycode
-                    let xkb_keycode: xkb::Keycode = (code as u32 + 8).into();
+                if let Some(scancode) = event.physical_key.to_scancode() {
+                    // scancode is evdev keycode on Linux; xkb keycode = evdev + 8
+                    let xkb_keycode: xkb::Keycode = (scancode + 8).into();
                     let key_state = if event.state.is_pressed() {
                         KeyState::Pressed
                     } else {
@@ -136,7 +213,9 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
-                let _ = self.backend_sender.blocking_send(BackendMessage::MouseScroll { dx, dy });
+                let _ = self
+                    .backend_sender
+                    .blocking_send(BackendMessage::MouseScroll { dx, dy });
             }
             WindowEvent::Focused(focused) => {
                 let msg = if focused {
@@ -155,6 +234,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Shutdown => {
                 event_loop.exit();
             }
+            UserEvent::Frame(frame) => {
+                self.present_frame(&frame);
+                self.last_frame = Some(frame);
+            }
         }
     }
 }
@@ -162,18 +245,36 @@ impl ApplicationHandler<UserEvent> for App {
 pub fn run_winit_backend(
     backend_sender: Sender<BackendMessage>,
     cancel_token: CancellationToken,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+    frame_rx: Receiver<RenderFrame>,
 ) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_any_thread(true)
         .build()?;
 
+    // Signal that the event loop is built and has connected to the host compositor
+    let _ = ready_tx.send(());
+
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
     let rt = tokio::runtime::Handle::current();
 
+    // Spawn task to forward shutdown signal
+    let shutdown_proxy = proxy.clone();
     let cancel_token_for_shutdown = cancel_token.clone();
     rt.spawn(async move {
         cancel_token_for_shutdown.cancelled().await;
-        let _ = proxy.send_event(UserEvent::Shutdown);
+        let _ = shutdown_proxy.send_event(UserEvent::Shutdown);
+    });
+
+    // Spawn task to forward frames from compositor to the event loop
+    let frame_proxy = proxy.clone();
+    rt.spawn(async move {
+        let mut frame_rx = frame_rx;
+        while let Some(frame) = frame_rx.recv().await {
+            if frame_proxy.send_event(UserEvent::Frame(frame)).is_err() {
+                break;
+            }
+        }
     });
 
     let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -198,6 +299,7 @@ pub fn run_winit_backend(
         xkb_context,
         xkb_keymap,
         xkb_state,
+        last_frame: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

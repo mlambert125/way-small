@@ -1,3 +1,8 @@
+//! Null backend (headless).
+//!
+//! Does nothing except wait for cancellation. Useful for testing protocol
+//! logic without a display server or GPU.
+
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::info;

@@ -6,7 +6,19 @@
       "Bash(cargo add:*)",
       "Bash(cargo check:*)",
       "Bash(cargo clippy:*)",
-      "Bash(cargo remove:*)"
+      "Bash(cargo remove:*)",
+      "Bash(cargo run:*)",
+      "Bash(timeout 3 bash -c 'WAYLAND_DISPLAY=way-small-0 weston-flower 2>&1')",
+      "Bash(xkbcli compile-keymap:*)",
+      "Bash(grep -v \"^$\")",
+      "WebFetch(domain:wayland.app)",
+      "Bash(WAYLAND_DISPLAY=way-small-0 foot)",
+      "Bash(kill %2)",
+      "Bash(kill %1)",
+      "Bash(wait)",
+      "Bash(grep -r \"key_without_modifiers\\\\|text_with_all\\\\|scancode\\\\|KeyEventExtra\" ~/.cargo/registry/src/*/winit-0.30.13/src/platform_impl/linux/)",
+      "Bash(grep -r \"physicalkey_to_scancode\\\\|KeyCodeExtScancode\\\\|to_scancode\" ~/.cargo/registry/src/*/winit-0.30.13/src/platform/)",
+      "Bash(wc -l /home/mikel/projects/way-small/src/**/*.rs /home/mikel/projects/way-small/src/*.rs)"
     ]
   }
 }

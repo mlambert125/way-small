@@ -1,3 +1,9 @@
+//! Wayland Unix socket listener and per-client I/O.
+//!
+//! Accepts client connections on the Wayland socket, spawns read/write tasks
+//! per client, frames the wire protocol (8-byte header + args), passes FDs,
+//! and forwards parsed messages to the compositor via a channel.
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -18,21 +24,21 @@ use tracing::{debug, info};
 
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
-pub struct WaylandMessage {
+pub struct WaylandProtocolMessage {
     pub object_id: u32,
     pub op_code: u16,
     pub args: Vec<u8>,
     pub fds: VecDeque<i32>,
 }
 
-pub struct ClientMessage {
+pub struct WaylandProtocolMessageWithClientInfo {
     pub client_id: u32,
-    pub message: WaylandMessage,
-    pub socket_sender: Sender<WaylandMessage>,
+    pub message: WaylandProtocolMessage,
+    pub socket_sender: Sender<WaylandProtocolMessage>,
 }
 
 pub enum WaylandSocketMessage {
-    Message(ClientMessage),
+    Message(WaylandProtocolMessageWithClientInfo),
     ClientDisconnected { client_id: u32 },
 }
 
@@ -101,7 +107,7 @@ fn handle_client(
         debug!("New client connected");
         let mut data = VecDeque::<u8>::new();
         let mut pending_fds = VecDeque::<i32>::new();
-        let (socket_send_tx, socket_send_rx) = channel::<WaylandMessage>(64);
+        let (socket_send_tx, socket_send_rx) = channel::<WaylandProtocolMessage>(64);
 
         let sender_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
@@ -231,7 +237,7 @@ fn handle_client(
                             args_buffer[i] = data.pop_front().unwrap();
                         });
 
-                        let msg = WaylandMessage {
+                        let msg = WaylandProtocolMessage {
                             object_id,
                             op_code: op_code as u16,
                             args: args_buffer,
@@ -239,19 +245,21 @@ fn handle_client(
                         };
 
                         if let Err(e) = compositor_message_channel
-                            .send(WaylandSocketMessage::Message(ClientMessage {
-                                client_id,
-                                message: msg,
-                                socket_sender: socket_send_tx.clone(),
-                            }))
+                            .send(WaylandSocketMessage::Message(
+                                WaylandProtocolMessageWithClientInfo {
+                                    client_id,
+                                    message: msg,
+                                    socket_sender: socket_send_tx.clone(),
+                                },
+                            ))
                             .await
                         {
                             debug!("Failed to send message to compositor: {}", e);
                             break 'outer;
                         }
-
-                        pending_fds.clear();
                     }
+
+                    pending_fds.clear();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     continue;
