@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::ObjectType;
 use super::state::CompositorState;
 use super::wire::ArgReader;
-use super::ObjectType;
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -62,7 +62,11 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     let surface_id = msg.message.object_id;
     if let Some(surface) = state.surfaces.get_mut(&surface_id) {
         // buffer_id 0 means detach
-        surface.pending.buffer_id = if buffer_id == 0 { None } else { Some(buffer_id) };
+        surface.pending.buffer_id = if buffer_id == 0 {
+            None
+        } else {
+            Some(buffer_id)
+        };
     }
 }
 
@@ -104,10 +108,12 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         // Apply pending buffer, releasing the old one if it changed
         if surface.pending.buffer_id.is_some() {
             let new_buffer = surface.pending.buffer_id.take();
-            if let Some(old_buffer) = surface.buffer_id {
-                if surface.buffer_id != new_buffer {
-                    state.buffers_pending_release.push((surface.client_id, old_buffer));
-                }
+            if let Some(old_buffer) = surface.buffer_id
+                && surface.buffer_id != new_buffer
+            {
+                state
+                    .buffers_pending_release
+                    .push((surface.client_id, old_buffer));
             }
             surface.buffer_id = new_buffer;
         }

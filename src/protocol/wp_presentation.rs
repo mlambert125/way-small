@@ -9,9 +9,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::ObjectType;
 use super::state::CompositorState;
 use super::wire::{ArgReader, ArgWriter, message};
-use super::ObjectType;
 
 // wp_presentation request opcodes
 const DESTROY: u16 = 0;

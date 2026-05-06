@@ -34,7 +34,7 @@ pub async fn run_compositor(
     let mut output_width: u32 = 800;
     let mut output_height: u32 = 600;
     let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
-    let mut dirty = true; // Start dirty to send initial frame
+    let mut dirty = true;
     let start_time = Instant::now();
 
     loop {
@@ -99,11 +99,17 @@ pub async fn run_compositor(
                             wl_keyboard::send_modifiers(&mut state, kb.client_id, kb.object_id, mods_depressed, mods_latched, mods_locked, mods_group).await;
                         }
                     }
+
+                    // TODO: Mouse Events aren't really grouped/framed at this point, and probably should be.
+                    // (See wl_pointer::frame event)
                     BackendMessage::MouseMove { x, y } => {
                         state.cursor_x = x;
                         state.cursor_y = y;
                         dirty = true;
                         let time_ms = start_time.elapsed().as_millis() as u32;
+                        // TODO: track which surface(s) the cursor is over to set focus (focus on
+                        // hover, alternatively do this in MouseButton for focus on click)
+
                         // Auto-focus: find first surface and enter it if not already focused
                         if state.focused_surface.is_none() && let Some((&surface_id, surface_client_id)) = state.surfaces.iter().next().map(|(id, s)| (id, s.client_id)) {
                             state.focused_surface = Some(surface_id);
@@ -142,11 +148,11 @@ pub async fn run_compositor(
                         let time_ms = start_time.elapsed().as_millis() as u32;
                         for ptr in state.pointers.clone() {
                             if dy != 0.0 {
-                                // axis 0 = vertical
+                                // mouse axis 0 = vertical
                                 wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 0, dy * 10.0).await;
                             }
                             if dx != 0.0 {
-                                // axis 1 = horizontal
+                                // mouse axis 1 = horizontal
                                 wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 1, dx * 10.0).await;
                             }
                             wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;

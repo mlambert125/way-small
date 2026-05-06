@@ -3,11 +3,12 @@
 //! Delivers pointer (mouse) events to focused clients: enter, leave,
 //! motion, button, and axis (scroll) events.
 
+use crate::protocol::ArgReader;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::next_serial;
 use super::state::CompositorState;
 use super::wire::{ArgWriter, message};
-use super::next_serial;
 
 // Request opcodes
 const SET_CURSOR: u16 = 0;
@@ -24,7 +25,7 @@ pub const FRAME: u16 = 5;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         SET_CURSOR => {
-            // Client wants to set cursor image — ignored for now
+            process_set_cursor(state, msg);
         }
         RELEASE => {
             let pointer_id = msg.message.object_id;
@@ -35,6 +36,15 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         op => {
             tracing::warn!("wl_pointer: unhandled opcode {}", op);
         }
+    }
+}
+
+fn process_set_cursor(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let mut args = ArgReader::new(&msg.message.args);
+    if let (Some(_serial), Some(_surface), Some(_hotspot_x), Some(_hotspot_y)) =
+        (args.u32(), args.u32(), args.i32(), args.i32())
+    {
+        // TODO: Process set cursor message
     }
 }
 
@@ -59,7 +69,12 @@ pub async fn send_enter(
 }
 
 /// Send wl_pointer.leave to a client's pointer object.
-pub async fn send_leave(state: &mut CompositorState, client_id: u32, pointer_id: u32, surface_id: u32) {
+pub async fn send_leave(
+    state: &mut CompositorState,
+    client_id: u32,
+    pointer_id: u32,
+    surface_id: u32,
+) {
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).u32(surface_id).build();
     let client = state.clients.get_or_create(client_id);
