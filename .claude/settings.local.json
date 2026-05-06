@@ -18,7 +18,9 @@
       "Bash(wait)",
       "Bash(grep -r \"key_without_modifiers\\\\|text_with_all\\\\|scancode\\\\|KeyEventExtra\" ~/.cargo/registry/src/*/winit-0.30.13/src/platform_impl/linux/)",
       "Bash(grep -r \"physicalkey_to_scancode\\\\|KeyCodeExtScancode\\\\|to_scancode\" ~/.cargo/registry/src/*/winit-0.30.13/src/platform/)",
-      "Bash(wc -l /home/mikel/projects/way-small/src/**/*.rs /home/mikel/projects/way-small/src/*.rs)"
+      "Bash(wc -l /home/mikel/projects/way-small/src/**/*.rs /home/mikel/projects/way-small/src/*.rs)",
+      "Bash(grep:*)",
+      "Bash(wc -l /home/mikel/projects/way-small/src/protocol/*.rs)"
     ]
   }
 }

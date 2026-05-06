@@ -25,7 +25,7 @@ use crate::backend::{BackendMessage, ButtonState, KeyState, MouseButton, RenderF
 
 enum UserEvent {
     Shutdown,
-    Frame(RenderFrame),
+    Frame(Arc<RenderFrame>),
 }
 
 struct App {
@@ -42,7 +42,7 @@ struct App {
     xkb_keymap: xkb::Keymap,
     xkb_state: xkb::State,
     // Last received frame for repainting on resize
-    last_frame: Option<RenderFrame>,
+    last_frame: Option<Arc<RenderFrame>>,
 }
 
 impl App {
@@ -118,6 +118,7 @@ impl ApplicationHandler<UserEvent> for App {
                 refresh_mhz: 60000,
             });
 
+            window.set_cursor_visible(false);
             self.window = Some(window);
 
             // Present initial dark background
@@ -142,24 +143,13 @@ impl ApplicationHandler<UserEvent> for App {
                     .backend_sender
                     .blocking_send(BackendMessage::Resized(size.width, size.height));
                 // Repaint with last frame if we have one
-                if let Some(frame) = self.last_frame.as_ref() {
-                    // Clone to satisfy borrow checker (frame borrows self)
-                    let frame_clone = RenderFrame {
-                        pixels: frame.pixels.clone(),
-                        width: frame.width,
-                        height: frame.height,
-                    };
-                    self.present_frame(&frame_clone);
+                if let Some(frame) = self.last_frame.clone() {
+                    self.present_frame(&frame);
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(frame) = self.last_frame.as_ref() {
-                    let frame_clone = RenderFrame {
-                        pixels: frame.pixels.clone(),
-                        width: frame.width,
-                        height: frame.height,
-                    };
-                    self.present_frame(&frame_clone);
+                if let Some(frame) = self.last_frame.clone() {
+                    self.present_frame(&frame);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -171,17 +161,24 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         KeyState::Released
                     };
-                    let keysym = self.xkb_state.key_get_one_sym(xkb_keycode);
+                    let _keysym = self.xkb_state.key_get_one_sym(xkb_keycode);
                     let direction = if event.state.is_pressed() {
                         xkb::KeyDirection::Down
                     } else {
                         xkb::KeyDirection::Up
                     };
                     self.xkb_state.update_key(xkb_keycode, direction);
+                    let mods_depressed = self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+                    let mods_latched = self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED);
+                    let mods_locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
+                    let mods_group = self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
                     let _ = self.backend_sender.blocking_send(BackendMessage::KeyInput {
                         keycode: xkb_keycode.raw(),
-                        keysym: keysym.raw(),
                         state: key_state,
+                        mods_depressed,
+                        mods_latched,
+                        mods_locked,
+                        mods_group,
                     });
                 }
             }
@@ -246,7 +243,7 @@ pub fn run_winit_backend(
     backend_sender: Sender<BackendMessage>,
     cancel_token: CancellationToken,
     ready_tx: tokio::sync::oneshot::Sender<()>,
-    frame_rx: Receiver<RenderFrame>,
+    frame_rx: Receiver<Arc<RenderFrame>>,
 ) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_any_thread(true)

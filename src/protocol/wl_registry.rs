@@ -115,6 +115,15 @@ async fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
             client.register_with_version(new_id, ObjectType::WlOutput, bound_version);
             wl_output::send_output_info(state, msg.client_id, new_id).await;
         }
+        "wp_viewporter" => {
+            let client = state.clients.get_or_create(msg.client_id);
+            client.register_with_version(new_id, ObjectType::WpViewporter, bound_version);
+        }
+        "wp_presentation" => {
+            let client = state.clients.get_or_create(msg.client_id);
+            client.register_with_version(new_id, ObjectType::WpPresentation, bound_version);
+            super::wp_presentation::send_clock_id(state, msg.client_id, new_id).await;
+        }
         _ => {
             tracing::warn!(
                 "wl_registry.bind: no handler for interface '{}' yet",

@@ -26,6 +26,11 @@ pub mod wl_shm_pool;
 pub mod wl_subcompositor;
 pub mod wl_subsurface;
 pub mod wl_surface;
+pub mod wp_presentation;
+pub mod wp_presentation_feedback;
+pub mod wp_viewport;
+pub mod wp_viewporter;
+pub mod xdg_popup;
 pub mod xdg_positioner;
 pub mod xdg_surface;
 pub mod xdg_system_bell;
@@ -74,7 +79,12 @@ pub enum ObjectType {
     XdgSurface,
     XdgSystemBell,
     XdgToplevel,
+    XdgPopup,
     XdgPositioner,
+    WpPresentation,
+    WpPresentationFeedback,
+    WpViewporter,
+    WpViewport,
 }
 
 /// A global interface that clients can bind via wl_registry.
@@ -114,6 +124,14 @@ pub static GLOBALS: &[Global] = &[
     },
     Global {
         interface: "xdg_system_bell_v1",
+        version: 1,
+    },
+    Global {
+        interface: "wp_viewporter",
+        version: 1,
+    },
+    Global {
+        interface: "wp_presentation",
         version: 1,
     },
 ];
@@ -207,11 +225,26 @@ pub async fn handle_message(
         Some(ObjectType::XdgToplevel) => {
             xdg_toplevel::handle(state, message).await;
         }
+        Some(ObjectType::XdgPopup) => {
+            xdg_popup::handle(state, message).await;
+        }
         Some(ObjectType::XdgPositioner) => {
             xdg_positioner::handle(state, message).await;
         }
         Some(ObjectType::WlBuffer) => {
             wl_buffer::handle(state, message);
+        }
+        Some(ObjectType::WpPresentation) => {
+            wp_presentation::handle(state, message).await;
+        }
+        Some(ObjectType::WpPresentationFeedback) => {
+            wp_presentation_feedback::handle(state, message);
+        }
+        Some(ObjectType::WpViewporter) => {
+            wp_viewporter::handle(state, message).await;
+        }
+        Some(ObjectType::WpViewport) => {
+            wp_viewport::handle(state, message).await;
         }
         None => {
             tracing::warn!(

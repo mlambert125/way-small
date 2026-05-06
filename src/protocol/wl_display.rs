@@ -10,6 +10,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::{ArgReader, ArgWriter, ClientState, ObjectType, message, next_serial, wl_registry};
 
+// The wl_display global is always object id 1 for every client.
 pub const OBJECT_ID: u32 = 1;
 
 // Request opcodes

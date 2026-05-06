@@ -8,6 +8,8 @@ use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc::channel;
 use tracing::info;
 
+use std::sync::Arc;
+
 use crate::backend::{BackendMessage, RenderFrame};
 
 mod backend;
@@ -81,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let (wayland_message_tx, wayland_message_rx) =
         channel::<wayland_socket::WaylandSocketMessage>(10000);
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(10000);
-    let (frame_tx, frame_rx) = channel::<RenderFrame>(2); // double-buffer: only 2 in flight
+    let (frame_tx, frame_rx) = channel::<Arc<RenderFrame>>(2); // double-buffer: only 2 in flight
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
     let backend_handle = match backend {

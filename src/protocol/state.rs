@@ -35,6 +35,7 @@ pub struct SurfacePending {
     pub buffer_id: Option<u32>,
     pub damage: Vec<(i32, i32, i32, i32)>,
     pub frame_callback: Option<u32>,
+    pub presentation_feedbacks: Vec<u32>,
 }
 
 /// Committed surface state.
@@ -46,6 +47,8 @@ pub struct Surface {
     pub buffer_id: Option<u32>,
     // The callback to trigger on the next frame, if any.
     pub frame_callback: Option<u32>,
+    // Committed presentation feedback objects awaiting the next present.
+    pub presentation_feedbacks: Vec<u32>,
     // Pending state from the most recent commit. This is cleared when the compositor
     // applies the commit, but we keep it around here for debugging purposes.
     pub pending: SurfacePending,
@@ -57,6 +60,21 @@ pub struct Surface {
     pub subsurface_position: (i32, i32),
     /// Whether this subsurface commits in sync with its parent.
     pub subsurface_sync: bool,
+}
+
+/// Viewport state for wp_viewporter (crop + scale).
+#[derive(Debug)]
+pub struct ViewportState {
+    pub client_id: u32,
+    pub surface_id: u32,
+    /// Committed source crop (x, y, width, height) in buffer coordinates.
+    pub source: Option<(f64, f64, f64, f64)>,
+    /// Committed destination size (width, height) in surface coordinates.
+    pub destination: Option<(i32, i32)>,
+    /// Pending source, applied on next commit. outer Option = "changed", inner = value.
+    pub pending_source: Option<Option<(f64, f64, f64, f64)>>,
+    /// Pending destination, applied on next commit.
+    pub pending_destination: Option<Option<(i32, i32)>>,
 }
 
 /// A region: a set of rectangles (adds minus subtracts).
@@ -73,9 +91,8 @@ pub struct Region {
 /// XDG surface role (toplevel or popup).
 #[derive(Debug)]
 pub enum XdgRole {
-    // Top-level surface with associated object id
-    #[allow(dead_code)]
     Toplevel(u32),
+    Popup(u32),
 }
 
 /// State for an xdg_surface (wraps a wl_surface with window semantics).
@@ -99,6 +116,21 @@ pub struct XdgToplevelState {
     pub xdg_surface_id: u32,
     pub title: Option<String>,
     pub app_id: Option<String>,
+}
+
+/// State for an xdg_popup.
+#[derive(Debug)]
+pub struct XdgPopupState {
+    pub client_id: u32,
+    pub xdg_surface_id: u32,
+    /// The parent xdg_surface this popup is positioned relative to.
+    pub parent_xdg_surface_id: u32,
+    /// Computed position relative to parent surface (from positioner).
+    pub x: i32,
+    pub y: i32,
+    /// Size from positioner.
+    pub width: i32,
+    pub height: i32,
 }
 
 /// State for an xdg_positioner (used to position popup surfaces).
@@ -152,14 +184,21 @@ pub struct CompositorState {
     pub regions: HashMap<u32, Region>,
     pub xdg_surfaces: HashMap<u32, XdgSurfaceState>,
     pub xdg_toplevels: HashMap<u32, XdgToplevelState>,
+    pub xdg_popups: HashMap<u32, XdgPopupState>,
     pub xdg_positioners: HashMap<u32, XdgPositionerState>,
     pub seat: SeatState,
     pub output: Option<OutputState>,
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
     pub focused_surface: Option<u32>,
+    pub cursor_x: f64,
+    pub cursor_y: f64,
     /// Maps wl_subsurface object id -> the wl_surface id it controls.
     pub subsurface_map: HashMap<u32, u32>,
+    /// wp_viewport objects keyed by viewport object id.
+    pub viewports: HashMap<u32, ViewportState>,
+    /// Buffers to release on the next render (old buffers replaced by commit).
+    pub buffers_pending_release: Vec<(u32, u32)>,
 }
 
 impl CompositorState {
@@ -172,13 +211,18 @@ impl CompositorState {
             regions: HashMap::new(),
             xdg_surfaces: HashMap::new(),
             xdg_toplevels: HashMap::new(),
+            xdg_popups: HashMap::new(),
             xdg_positioners: HashMap::new(),
             seat: SeatState::default(),
             output: None,
             pointers: Vec::new(),
             keyboards: Vec::new(),
             focused_surface: None,
+            cursor_x: 0.0,
+            cursor_y: 0.0,
             subsurface_map: HashMap::new(),
+            viewports: HashMap::new(),
+            buffers_pending_release: Vec::new(),
         }
     }
 
@@ -242,6 +286,7 @@ impl CompositorState {
                 client_id,
                 buffer_id: None,
                 frame_callback: None,
+                presentation_feedbacks: Vec::new(),
                 pending: SurfacePending::default(),
                 parent: None,
                 children: Vec::new(),
@@ -305,6 +350,39 @@ impl CompositorState {
         self.xdg_toplevels.remove(&toplevel_id);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_xdg_popup(
+        &mut self,
+        popup_id: u32,
+        client_id: u32,
+        xdg_surface_id: u32,
+        parent_xdg_surface_id: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) {
+        self.xdg_popups.insert(
+            popup_id,
+            XdgPopupState {
+                client_id,
+                xdg_surface_id,
+                parent_xdg_surface_id,
+                x,
+                y,
+                width,
+                height,
+            },
+        );
+        if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&xdg_surface_id) {
+            xdg_surface.role = Some(XdgRole::Popup(popup_id));
+        }
+    }
+
+    pub fn destroy_xdg_popup(&mut self, popup_id: u32) {
+        self.xdg_popups.remove(&popup_id);
+    }
+
     pub fn create_xdg_positioner(&mut self, positioner_id: u32, client_id: u32) {
         self.xdg_positioners.insert(
             positioner_id,
@@ -317,6 +395,24 @@ impl CompositorState {
 
     pub fn destroy_xdg_positioner(&mut self, positioner_id: u32) {
         self.xdg_positioners.remove(&positioner_id);
+    }
+
+    pub fn create_viewport(&mut self, viewport_id: u32, client_id: u32, surface_id: u32) {
+        self.viewports.insert(
+            viewport_id,
+            ViewportState {
+                client_id,
+                surface_id,
+                source: None,
+                destination: None,
+                pending_source: None,
+                pending_destination: None,
+            },
+        );
+    }
+
+    pub fn destroy_viewport(&mut self, viewport_id: u32) {
+        self.viewports.remove(&viewport_id);
     }
 
     /// Remove all pools, buffers, and surfaces belonging to a disconnecting client.
@@ -334,8 +430,10 @@ impl CompositorState {
         self.surfaces.retain(|_, s| s.client_id != client_id);
         self.regions.retain(|_, r| r.client_id != client_id);
         self.xdg_toplevels.retain(|_, t| t.client_id != client_id);
+        self.xdg_popups.retain(|_, p| p.client_id != client_id);
         self.xdg_surfaces.retain(|_, s| s.client_id != client_id);
         self.xdg_positioners.retain(|_, p| p.client_id != client_id);
+        self.viewports.retain(|_, v| v.client_id != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
         self.subsurface_map

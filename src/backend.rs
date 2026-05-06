@@ -39,8 +39,11 @@ pub enum BackendMessage {
     Resized(u32, u32),
     KeyInput {
         keycode: u32,
-        keysym: u32,
         state: KeyState,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        mods_group: u32,
     },
     MouseMove {
         x: f64,

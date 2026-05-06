@@ -101,15 +101,26 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     let surface_id = msg.message.object_id;
 
     if let Some(surface) = state.surfaces.get_mut(&surface_id) {
-        // Apply pending buffer
+        // Apply pending buffer, releasing the old one if it changed
         if surface.pending.buffer_id.is_some() {
-            surface.buffer_id = surface.pending.buffer_id.take();
+            let new_buffer = surface.pending.buffer_id.take();
+            if let Some(old_buffer) = surface.buffer_id {
+                if surface.buffer_id != new_buffer {
+                    state.buffers_pending_release.push((surface.client_id, old_buffer));
+                }
+            }
+            surface.buffer_id = new_buffer;
         }
 
         // Move frame callback to committed state (fired on next render)
         if surface.pending.frame_callback.is_some() {
             surface.frame_callback = surface.pending.frame_callback.take();
         }
+
+        // Move presentation feedbacks to committed state
+        surface
+            .presentation_feedbacks
+            .append(&mut surface.pending.presentation_feedbacks);
 
         // Clear pending damage
         surface.pending.damage.clear();
@@ -118,5 +129,18 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             "wl_surface.commit: surface_id={} buffer={:?}",
             surface_id, surface.buffer_id
         );
+    }
+
+    // Apply pending viewport state
+    for vp in state.viewports.values_mut() {
+        if vp.surface_id == surface_id {
+            if let Some(src) = vp.pending_source.take() {
+                vp.source = src;
+            }
+            if let Some(dst) = vp.pending_destination.take() {
+                vp.destination = dst;
+            }
+            break;
+        }
     }
 }
