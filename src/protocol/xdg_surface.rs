@@ -62,18 +62,60 @@ async fn handle_get_toplevel(
         toplevel_id, xdg_surface_id
     );
 
-    let client = state.clients.get_or_create(msg.client_id);
+    let client_id = msg.client_id;
+    let client = state.clients.get_or_create(client_id);
     client.register(toplevel_id, ObjectType::XdgToplevel);
-    state.create_xdg_toplevel(msg.client_id, toplevel_id, xdg_surface_id);
+    state.create_xdg_toplevel(client_id, toplevel_id, xdg_surface_id);
 
     // Send initial xdg_toplevel.configure (empty states, 0x0 = client picks size)
-    super::xdg_toplevel::send_configure(state, msg.client_id, toplevel_id, 0, 0).await;
+    super::xdg_toplevel::send_configure(state, client_id, toplevel_id, 0, 0).await;
 
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
     let args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(msg.client_id);
+    let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
+
+    // Take focus: send leave to old surface, enter to new
+    let wl_surface_id = state
+        .xdg_surfaces
+        .get(&(client_id, xdg_surface_id))
+        .map(|s| s.wl_surface_id);
+    if let Some(wl_surface_id) = wl_surface_id {
+        let new_key = (client_id, wl_surface_id);
+        if state.focused_surface != Some(new_key) {
+            if let Some(old_key) = state.focused_surface {
+                let old_client = old_key.0;
+                let old_surface = old_key.1;
+                for ptr in state.pointers.clone() {
+                    if ptr.client_id == old_client {
+                        super::wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_surface).await;
+                        super::wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
+                    }
+                }
+                for kb in state.keyboards.clone() {
+                    if kb.client_id == old_client {
+                        super::wl_keyboard::send_leave(state, kb.client_id, kb.object_id, old_surface).await;
+                    }
+                }
+            }
+
+            state.focused_surface = Some(new_key);
+            let cx = state.cursor_x;
+            let cy = state.cursor_y;
+            for ptr in state.pointers.clone() {
+                if ptr.client_id == client_id {
+                    super::wl_pointer::send_enter(state, ptr.client_id, ptr.object_id, wl_surface_id, cx, cy).await;
+                    super::wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
+                }
+            }
+            for kb in state.keyboards.clone() {
+                if kb.client_id == client_id {
+                    super::wl_keyboard::send_enter(state, kb.client_id, kb.object_id, wl_surface_id).await;
+                }
+            }
+        }
+    }
 }
 
 async fn handle_get_popup(

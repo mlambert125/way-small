@@ -63,6 +63,8 @@ pub struct Surface {
     pub subsurface_position: (i32, i32),
     /// Whether this subsurface commits in sync with its parent.
     pub subsurface_sync: bool,
+    /// Position of this surface in global compositor coordinates (for toplevels).
+    pub position: (i32, i32),
 }
 
 /// Viewport state for wp_viewporter (crop + scale).
@@ -202,6 +204,10 @@ pub struct CompositorState {
     pub viewports: HashMap<ClientObjectId, ViewportState>,
     /// Buffers to release on the next render (old buffers replaced by commit).
     pub buffers_pending_release: Vec<ClientObjectId>,
+    /// Next position for cascading toplevel placement.
+    pub next_toplevel_position: (i32, i32),
+    /// Toplevel surface draw order, bottom to top.
+    pub surface_stack: Vec<ClientObjectId>,
 }
 
 impl CompositorState {
@@ -226,6 +232,8 @@ impl CompositorState {
             subsurface_map: HashMap::new(),
             viewports: HashMap::new(),
             buffers_pending_release: Vec::new(),
+            next_toplevel_position: (50, 50),
+            surface_stack: Vec::new(),
         }
     }
 
@@ -295,6 +303,7 @@ impl CompositorState {
                 children: Vec::new(),
                 subsurface_position: (0, 0),
                 subsurface_sync: true,
+                position: (0, 0),
             },
         );
     }
@@ -346,6 +355,17 @@ impl CompositorState {
         );
         if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_surface_id)) {
             xdg_surface.role = Some(XdgRole::Toplevel(toplevel_id));
+            // Assign cascade position to the toplevel's wl_surface
+            let wl_surface_id = xdg_surface.wl_surface_id;
+            if let Some(surface) = self.surfaces.get_mut(&(client_id, wl_surface_id)) {
+                surface.position = self.next_toplevel_position;
+            }
+            self.next_toplevel_position.0 += 50;
+            self.next_toplevel_position.1 += 50;
+            // Add to top of surface stack
+            let surface_key = (client_id, wl_surface_id);
+            self.surface_stack.retain(|k| *k != surface_key);
+            self.surface_stack.push(surface_key);
         }
     }
 
@@ -440,6 +460,7 @@ impl CompositorState {
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
         self.subsurface_map.retain(|(cid, _), _| *cid != client_id);
+        self.surface_stack.retain(|(cid, _)| *cid != client_id);
         // Clear focus if it pointed to a surface owned by this client
         if let Some((cid, _)) = self.focused_surface {
             if cid == client_id {

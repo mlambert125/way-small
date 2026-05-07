@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol;
-use crate::protocol::state::OutputState;
+use crate::protocol::state::{ClientObjectId, OutputState};
 use crate::protocol::wire::{ArgWriter, message};
 use crate::protocol::{wl_keyboard, wl_pointer};
 use crate::renderer;
@@ -59,9 +59,32 @@ pub async fn run_compositor(
                         }
                         WaylandSocketMessage::ClientDisconnected { client_id } => {
                             info!("Client {} disconnected", client_id);
+                            let was_focused = state.focused_surface.map(|(cid, _)| cid) == Some(client_id);
                             state.remove_client_resources(client_id);
                             state.clients.remove(client_id);
                             dirty = true;
+
+                            // Focus the next surface down the stack
+                            if was_focused {
+                                if let Some(&new_key) = state.surface_stack.last() {
+                                    state.focused_surface = Some(new_key);
+                                    let new_client = new_key.0;
+                                    let new_surface = new_key.1;
+                                    let cx = state.cursor_x;
+                                    let cy = state.cursor_y;
+                                    for ptr in state.pointers.clone() {
+                                        if ptr.client_id == new_client {
+                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
+                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                        }
+                                    }
+                                    for kb in state.keyboards.clone() {
+                                        if kb.client_id == new_client {
+                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -110,25 +133,29 @@ pub async fn run_compositor(
                         state.cursor_y = y;
                         dirty = true;
                         let time_ms = start_time.elapsed().as_millis() as u32;
-                        // TODO: track which surface(s) the cursor is over to set focus (focus on
-                        // hover, alternatively do this in MouseButton for focus on click)
 
-                        // Auto-focus: find first surface and enter it if not already focused
-                        if state.focused_surface.is_none() && let Some((&surface_key, surface_client_id)) = state.surfaces.iter().next().map(|(key, s)| (key, s.client_id)) {
-                            state.focused_surface = Some(surface_key);
-                            let surface_obj_id = surface_key.1;
-                            for ptr in state.pointers.clone() {
-                                if ptr.client_id == surface_client_id {
-                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
-                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                }
-                            }
-                            for kb in state.keyboards.clone() {
-                                if kb.client_id == surface_client_id {
-                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
+                        // Auto-focus the top surface if nothing is focused yet
+                        if state.focused_surface.is_none() {
+                            if let Some(&top_key) = state.surface_stack.last() {
+                                if let Some(surface) = state.surfaces.get(&top_key) {
+                                    let client_id = surface.client_id;
+                                    let surface_obj_id = top_key.1;
+                                    state.focused_surface = Some(top_key);
+                                    for ptr in state.pointers.clone() {
+                                        if ptr.client_id == client_id {
+                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
+                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                        }
+                                    }
+                                    for kb in state.keyboards.clone() {
+                                        if kb.client_id == client_id {
+                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
+                                        }
+                                    }
                                 }
                             }
                         }
+
                         let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
                             if Some(ptr.client_id) == focused_client {
@@ -146,6 +173,55 @@ pub async fn run_compositor(
                             MouseButton::Right => 0x111,
                             MouseButton::Middle => 0x112,
                         };
+
+                        // On press, hit-test and raise/focus the clicked surface
+                        let cx = state.cursor_x;
+                        let cy = state.cursor_y;
+                        if pressed {
+                            if let Some(clicked) = hit_test(&state, cx, cy) {
+                                if state.focused_surface != Some(clicked) {
+                                    // Raise to top of stack
+                                    state.surface_stack.retain(|k| *k != clicked);
+                                    state.surface_stack.push(clicked);
+                                    dirty = true;
+
+                                    // Send leave events to old focused surface
+                                    if let Some(old_key) = state.focused_surface {
+                                        let old_client = old_key.0;
+                                        let old_surface = old_key.1;
+                                        for ptr in state.pointers.clone() {
+                                            if ptr.client_id == old_client {
+                                                wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_surface).await;
+                                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                            }
+                                        }
+                                        for kb in state.keyboards.clone() {
+                                            if kb.client_id == old_client {
+                                                wl_keyboard::send_leave(&mut state, kb.client_id, kb.object_id, old_surface).await;
+                                            }
+                                        }
+                                    }
+
+                                    // Send enter events to new focused surface
+                                    let new_client = clicked.0;
+                                    let new_surface = clicked.1;
+                                    state.focused_surface = Some(clicked);
+                                    for ptr in state.pointers.clone() {
+                                        if ptr.client_id == new_client {
+                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
+                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                        }
+                                    }
+                                    for kb in state.keyboards.clone() {
+                                        if kb.client_id == new_client {
+                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send button event to focused client
                         let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
                             if Some(ptr.client_id) == focused_client {
@@ -280,4 +356,54 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
         let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(buffer_id, 0, Vec::new())).await;
     }
+}
+
+/// Hit-test the surface stack from top to bottom, returning the first surface
+/// that contains the given point. Uses the buffer dimensions as the surface size.
+fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<ClientObjectId> {
+    let px = x as i32;
+    let py = y as i32;
+
+    // Iterate from top (last) to bottom (first)
+    for &key in state.surface_stack.iter().rev() {
+        let Some(surface) = state.surfaces.get(&key) else {
+            continue;
+        };
+        let (sx, sy) = surface.position;
+
+        // Get surface dimensions from its attached buffer
+        let (w, h) = surface_dimensions(state, key);
+        if w == 0 || h == 0 {
+            continue;
+        }
+
+        if px >= sx && py >= sy && px < sx + w && py < sy + h {
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// Get the pixel dimensions of a surface from its buffer (or viewport destination).
+fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) -> (i32, i32) {
+    let Some(surface) = state.surfaces.get(&key) else {
+        return (0, 0);
+    };
+    let client_id = surface.client_id;
+
+    // Check for viewport destination override
+    if let Some(vp) = state.viewports.values().find(|v| v.client_id == client_id && v.surface_id == key.1) {
+        if let Some((dw, dh)) = vp.destination {
+            return (dw, dh);
+        }
+    }
+
+    // Fall back to buffer dimensions
+    let Some(buffer_id) = surface.buffer_id else {
+        return (0, 0);
+    };
+    let Some(buf) = state.shm_buffers.get(&(client_id, buffer_id)) else {
+        return (0, 0);
+    };
+    (buf.width, buf.height)
 }

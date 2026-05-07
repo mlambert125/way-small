@@ -17,16 +17,10 @@ const BYTES_PER_PIXEL: u64 = 4;
 pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> RenderFrame {
     let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
 
-    // Collect top-level surface keys (those without a parent)
-    let toplevel_keys: Vec<ClientObjectId> = state
-        .surfaces
-        .iter()
-        .filter(|(_, s)| s.parent.is_none())
-        .map(|(&key, _)| key)
-        .collect();
-
-    for key in toplevel_keys {
-        blit_surface_tree(state, &mut pixels, width, height, key, 0, 0);
+    // Draw surfaces in stack order (bottom to top)
+    for &key in &state.surface_stack {
+        let (ox, oy) = state.surfaces.get(&key).map(|s| s.position).unwrap_or((0, 0));
+        blit_surface_tree(state, &mut pixels, width, height, key, ox, oy);
     }
 
     // Draw the hardware cursor last so that it's on top
