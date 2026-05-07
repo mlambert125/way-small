@@ -4,7 +4,7 @@
 //! The only client request is destroy. The compositor sends the release
 //! event when it's done reading the buffer's contents.
 
-use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
+use crate::{protocol::message, wayland_socket::WaylandProtocolMessageWithClientInfo};
 
 use super::state::CompositorState;
 
@@ -26,4 +26,10 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             tracing::warn!("wl_buffer: unhandled opcode {}", op);
         }
     }
+}
+
+#[allow(dead_code)]
+pub async fn send_release(state: &mut CompositorState, client_id: u32, buffer_id: u32) {
+    let client = state.clients.get_or_create(client_id);
+    let _ = client.send(message(buffer_id, RELEASE, vec![])).await;
 }

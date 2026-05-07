@@ -462,10 +462,10 @@ impl CompositorState {
         self.subsurface_map.retain(|(cid, _), _| *cid != client_id);
         self.surface_stack.retain(|(cid, _)| *cid != client_id);
         // Clear focus if it pointed to a surface owned by this client
-        if let Some((cid, _)) = self.focused_surface {
-            if cid == client_id {
-                self.focused_surface = None;
-            }
+        if let Some((cid, _)) = self.focused_surface
+            && cid == client_id
+        {
+            self.focused_surface = None;
         }
     }
 }

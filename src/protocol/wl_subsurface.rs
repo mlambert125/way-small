@@ -46,10 +46,10 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
                 surface.parent = None;
             }
             // Remove from parent's children
-            if let Some(parent_id) = parent_id {
-                if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
-                    parent.children.retain(|&id| id != surface_id);
-                }
+            if let Some(parent_id) = parent_id
+                && let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id))
+            {
+                parent.children.retain(|&id| id != surface_id);
             }
         }
         state.subsurface_map.remove(&(client_id, subsurface_id));
@@ -67,10 +67,10 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
 
     let subsurface_id = msg.message.object_id;
     let client_id = msg.client_id;
-    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) {
-        if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
-            surface.subsurface_position = (x, y);
-        }
+    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id))
+        && let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id))
+    {
+        surface.subsurface_position = (x, y);
     }
 }
 
@@ -130,12 +130,16 @@ fn handle_place_below(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     }
 }
 
-fn handle_set_sync(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo, sync: bool) {
+fn handle_set_sync(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+    sync: bool,
+) {
     let subsurface_id = msg.message.object_id;
     let client_id = msg.client_id;
-    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) {
-        if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
-            surface.subsurface_sync = sync;
-        }
+    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id))
+        && let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id))
+    {
+        surface.subsurface_sync = sync;
     }
 }

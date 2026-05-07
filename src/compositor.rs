@@ -65,23 +65,21 @@ pub async fn run_compositor(
                             dirty = true;
 
                             // Focus the next surface down the stack
-                            if was_focused {
-                                if let Some(&new_key) = state.surface_stack.last() {
-                                    state.focused_surface = Some(new_key);
-                                    let new_client = new_key.0;
-                                    let new_surface = new_key.1;
-                                    let cx = state.cursor_x;
-                                    let cy = state.cursor_y;
-                                    for ptr in state.pointers.clone() {
-                                        if ptr.client_id == new_client {
-                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
-                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                        }
+                            if was_focused && let Some(&new_key) = state.surface_stack.last() {
+                                state.focused_surface = Some(new_key);
+                                let new_client = new_key.0;
+                                let new_surface = new_key.1;
+                                let cx = state.cursor_x;
+                                let cy = state.cursor_y;
+                                for ptr in state.pointers.clone() {
+                                    if ptr.client_id == new_client {
+                                        wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
+                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
                                     }
-                                    for kb in state.keyboards.clone() {
-                                        if kb.client_id == new_client {
-                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
-                                        }
+                                }
+                                for kb in state.keyboards.clone() {
+                                    if kb.client_id == new_client {
+                                        wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
                                     }
                                 }
                             }
@@ -135,23 +133,22 @@ pub async fn run_compositor(
                         let time_ms = start_time.elapsed().as_millis() as u32;
 
                         // Auto-focus the top surface if nothing is focused yet
-                        if state.focused_surface.is_none() {
-                            if let Some(&top_key) = state.surface_stack.last() {
-                                if let Some(surface) = state.surfaces.get(&top_key) {
-                                    let client_id = surface.client_id;
-                                    let surface_obj_id = top_key.1;
-                                    state.focused_surface = Some(top_key);
-                                    for ptr in state.pointers.clone() {
-                                        if ptr.client_id == client_id {
-                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
-                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                        }
-                                    }
-                                    for kb in state.keyboards.clone() {
-                                        if kb.client_id == client_id {
-                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
-                                        }
-                                    }
+                        if state.focused_surface.is_none() &&
+                           let Some(&top_key) = state.surface_stack.last() &&
+                           let Some(surface) = state.surfaces.get(&top_key) {
+
+                            let client_id = surface.client_id;
+                            let surface_obj_id = top_key.1;
+                            state.focused_surface = Some(top_key);
+                            for ptr in state.pointers.clone() {
+                                if ptr.client_id == client_id {
+                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
+                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                }
+                            }
+                            for kb in state.keyboards.clone() {
+                                if kb.client_id == client_id {
+                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
                                 }
                             }
                         }
@@ -177,46 +174,42 @@ pub async fn run_compositor(
                         // On press, hit-test and raise/focus the clicked surface
                         let cx = state.cursor_x;
                         let cy = state.cursor_y;
-                        if pressed {
-                            if let Some(clicked) = hit_test(&state, cx, cy) {
-                                if state.focused_surface != Some(clicked) {
-                                    // Raise to top of stack
-                                    state.surface_stack.retain(|k| *k != clicked);
-                                    state.surface_stack.push(clicked);
-                                    dirty = true;
+                        if pressed && let Some(clicked) = hit_test(&state, cx, cy) && state.focused_surface != Some(clicked) {
+                            // Raise to top of stack
+                            state.surface_stack.retain(|k| *k != clicked);
+                            state.surface_stack.push(clicked);
+                            dirty = true;
 
-                                    // Send leave events to old focused surface
-                                    if let Some(old_key) = state.focused_surface {
-                                        let old_client = old_key.0;
-                                        let old_surface = old_key.1;
-                                        for ptr in state.pointers.clone() {
-                                            if ptr.client_id == old_client {
-                                                wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_surface).await;
-                                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                            }
-                                        }
-                                        for kb in state.keyboards.clone() {
-                                            if kb.client_id == old_client {
-                                                wl_keyboard::send_leave(&mut state, kb.client_id, kb.object_id, old_surface).await;
-                                            }
-                                        }
+                            // Send leave events to old focused surface
+                            if let Some(old_key) = state.focused_surface {
+                                let old_client = old_key.0;
+                                let old_surface = old_key.1;
+                                for ptr in state.pointers.clone() {
+                                    if ptr.client_id == old_client {
+                                        wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_surface).await;
+                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
                                     }
+                                }
+                                for kb in state.keyboards.clone() {
+                                    if kb.client_id == old_client {
+                                        wl_keyboard::send_leave(&mut state, kb.client_id, kb.object_id, old_surface).await;
+                                    }
+                                }
+                            }
 
-                                    // Send enter events to new focused surface
-                                    let new_client = clicked.0;
-                                    let new_surface = clicked.1;
-                                    state.focused_surface = Some(clicked);
-                                    for ptr in state.pointers.clone() {
-                                        if ptr.client_id == new_client {
-                                            wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
-                                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                        }
-                                    }
-                                    for kb in state.keyboards.clone() {
-                                        if kb.client_id == new_client {
-                                            wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
-                                        }
-                                    }
+                            // Send enter events to new focused surface
+                            let new_client = clicked.0;
+                            let new_surface = clicked.1;
+                            state.focused_surface = Some(clicked);
+                            for ptr in state.pointers.clone() {
+                                if ptr.client_id == new_client {
+                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
+                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                }
+                            }
+                            for kb in state.keyboards.clone() {
+                                if kb.client_id == new_client {
+                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
                                 }
                             }
                         }
@@ -392,10 +385,13 @@ fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) ->
     let client_id = surface.client_id;
 
     // Check for viewport destination override
-    if let Some(vp) = state.viewports.values().find(|v| v.client_id == client_id && v.surface_id == key.1) {
-        if let Some((dw, dh)) = vp.destination {
-            return (dw, dh);
-        }
+    if let Some(vp) = state
+        .viewports
+        .values()
+        .find(|v| v.client_id == client_id && v.surface_id == key.1)
+        && let Some((dw, dh)) = vp.destination
+    {
+        return (dw, dh);
     }
 
     // Fall back to buffer dimensions

@@ -20,7 +20,9 @@
       "Bash(grep -r \"physicalkey_to_scancode\\\\|KeyCodeExtScancode\\\\|to_scancode\" ~/.cargo/registry/src/*/winit-0.30.13/src/platform/)",
       "Bash(wc -l /home/mikel/projects/way-small/src/**/*.rs /home/mikel/projects/way-small/src/*.rs)",
       "Bash(grep:*)",
-      "Bash(wc -l /home/mikel/projects/way-small/src/protocol/*.rs)"
+      "Bash(wc -l /home/mikel/projects/way-small/src/protocol/*.rs)",
+      "Bash(find /home/mikel/projects/way-small -type f -not -path '*/.git/*' -exec wc -l {} +)",
+      "Bash(find /home/mikel/projects/way-small/src -type f -exec wc -l {} +)"
     ]
   }
 }

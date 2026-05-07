@@ -46,10 +46,10 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
             let wl_surface_id = xdg_surface.wl_surface_id;
             if let Some(surface) = state.surfaces.get(&(client_id, wl_surface_id)) {
                 let parent_id = surface.parent;
-                if let Some(parent_id) = parent_id {
-                    if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
-                        parent.children.retain(|&id| id != wl_surface_id);
-                    }
+                if let Some(parent_id) = parent_id
+                    && let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id))
+                {
+                    parent.children.retain(|&id| id != wl_surface_id);
                 }
             }
             // Clear the parent link
