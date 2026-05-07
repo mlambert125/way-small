@@ -4,6 +4,7 @@
 //! key, and modifiers events.
 
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
@@ -88,7 +89,7 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
         object_id: keyboard_id,
         op_code: KEYMAP,
         args,
-        fds: VecDeque::from([fd]),
+        fd_queue: Arc::new(Mutex::new(VecDeque::from([fd]))),
     };
 
     let client = state.clients.get_or_create(client_id);

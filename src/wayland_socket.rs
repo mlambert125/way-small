@@ -7,7 +7,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
     },
 };
@@ -28,7 +28,14 @@ pub struct WaylandProtocolMessage {
     pub object_id: u32,
     pub op_code: u16,
     pub args: Vec<u8>,
-    pub fds: VecDeque<i32>,
+
+    // This is a bit strange, but this is a shared queue of fds for a client
+    // that the compositor should pop_front on if the specific object/op code expects an fd.
+    // We can not calculate which message an fd belongs to at socket
+    // level because doing so requires finding the type of the message
+    // which requires looking up the id in the registry and then
+    // decoding the message arguments to find the op code
+    pub fd_queue: Arc<Mutex<VecDeque<i32>>>,
 }
 
 pub struct WaylandProtocolMessageWithClientInfo {
@@ -106,7 +113,7 @@ fn handle_client(
     tokio::spawn(async move {
         debug!("New client connected");
         let mut data = VecDeque::<u8>::new();
-        let mut pending_fds = VecDeque::<i32>::new();
+        let pending_fds_arc = Arc::new(Mutex::new(VecDeque::<i32>::new()));
         let (socket_send_tx, socket_send_rx) = channel::<WaylandProtocolMessage>(64);
 
         let sender_cancel_token = cancel_token.clone();
@@ -126,7 +133,8 @@ fn handle_client(
                             buffer.extend_from_slice(&message_length_and_opcode.to_le_bytes());
                             buffer.extend_from_slice(&message.args);
 
-                            let fds_vec: Vec<i32> = message.fds.iter().cloned().collect();
+                            let fds_vec: Vec<i32> = message.fd_queue.lock().unwrap()
+                                .iter().cloned().collect();
                             let mut bytes_sent = 0;
                             let mut fds_sent = false;
                             while bytes_sent < buffer.len() {
@@ -195,9 +203,12 @@ fn handle_client(
                         data.push_back(*byte);
                     }
 
-                    // Append the received file descriptors to the pending_fds queue
-                    for &fd in &fds[..fds_read] {
-                        pending_fds.push_back(fd);
+                    {
+                        let mut pending_fds = pending_fds_arc.lock().unwrap();
+                        // Append the received file descriptors to the pending_fds queue
+                        for &fd in &fds[..fds_read] {
+                            pending_fds.push_back(fd);
+                        }
                     }
 
                     while data.len() >= 8 {
@@ -241,7 +252,7 @@ fn handle_client(
                             object_id,
                             op_code: op_code as u16,
                             args: args_buffer,
-                            fds: pending_fds.clone(),
+                            fd_queue: pending_fds_arc.clone(),
                         };
 
                         if let Err(e) = compositor_message_channel
@@ -258,8 +269,6 @@ fn handle_client(
                             break 'outer;
                         }
                     }
-
-                    pending_fds.clear();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     continue;

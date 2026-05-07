@@ -40,7 +40,7 @@ dap.adapters.lldb = {
 -- Helper: resolve the debug executable for this project
 -- ---------------------------------------------------------------------------
 local function exe()
-    local name = 'mongo-archiver'
+    local name = 'way-small'
     local path = vim.fn.getcwd() .. '/target/debug/' .. name
     if vim.fn.executable(path) == 0 then
         vim.notify(

@@ -8,10 +8,10 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::wire::{ArgReader, ArgWriter, message};
+use super::ObjectType;
 use super::client::ClientState;
 use super::state::CompositorState;
-use super::ObjectType;
+use super::wire::{ArgReader, ArgWriter, message};
 
 // Request opcodes
 const CREATE_POOL: u16 = 0;
@@ -42,19 +42,28 @@ pub async fn send_formats(client: &mut ClientState, shm_id: u32) {
     }
 }
 
-async fn handle_create_pool(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_create_pool(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) {
     let mut args = ArgReader::new(&msg.message.args);
     // create_pool args: new_id, fd (passed out-of-band), int32 size
     let (Some(pool_id), Some(size)) = (args.new_id(), args.i32()) else {
         let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "wl_shm.create_pool: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_shm.create_pool: malformed args",
+            )
             .await;
         return;
     };
 
+    let fd = msg.message.fd_queue.lock().unwrap().pop_front();
+
     // The FD is the first one attached to this message
-    let Some(fd) = msg.message.fds.front().copied() else {
+    let Some(fd) = fd else {
         let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(msg.message.object_id, 0, "wl_shm.create_pool: missing fd")
