@@ -86,5 +86,5 @@ async fn handle_create_pool(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(pool_id, ObjectType::WlShmPool);
-    state.register_shm_pool(pool_id, msg.client_id, fd, size as u32);
+    state.register_shm_pool(msg.client_id, pool_id, fd, size as u32);
 }

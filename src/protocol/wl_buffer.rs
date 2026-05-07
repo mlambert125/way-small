@@ -18,7 +18,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
     match msg.message.op_code {
         DESTROY => {
             let buffer_id = msg.message.object_id;
-            state.destroy_buffer(buffer_id);
+            state.destroy_buffer(msg.client_id, buffer_id);
             let client = state.clients.get_or_create(msg.client_id);
             client.unregister(buffer_id);
         }

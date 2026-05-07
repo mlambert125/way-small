@@ -59,7 +59,7 @@ async fn handle_create_positioner(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(positioner_id, ObjectType::XdgPositioner);
-    state.create_xdg_positioner(positioner_id, msg.client_id);
+    state.create_xdg_positioner(msg.client_id, positioner_id);
 }
 
 async fn handle_get_xdg_surface(
@@ -87,7 +87,7 @@ async fn handle_get_xdg_surface(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(xdg_surface_id, ObjectType::XdgSurface);
-    state.create_xdg_surface(xdg_surface_id, msg.client_id, wl_surface_id);
+    state.create_xdg_surface(msg.client_id, xdg_surface_id, wl_surface_id);
 }
 
 fn handle_pong(msg: &WaylandProtocolMessageWithClientInfo) {

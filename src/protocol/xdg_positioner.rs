@@ -35,7 +35,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let id = msg.message.object_id;
-    state.destroy_xdg_positioner(id);
+    state.destroy_xdg_positioner(msg.client_id, id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(id);
 }
@@ -46,7 +46,7 @@ fn handle_set_size(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.width = width;
         p.height = height;
     }
@@ -59,7 +59,7 @@ fn handle_set_anchor_rect(state: &mut CompositorState, msg: &WaylandProtocolMess
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.anchor_rect = (x, y, w, h);
     }
 }
@@ -70,7 +70,7 @@ fn handle_set_anchor(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.anchor = anchor;
     }
 }
@@ -81,7 +81,7 @@ fn handle_set_gravity(state: &mut CompositorState, msg: &WaylandProtocolMessageW
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.gravity = gravity;
     }
 }
@@ -95,7 +95,7 @@ fn handle_set_constraint_adjustment(
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.constraint_adjustment = adjustment;
     }
 }
@@ -106,7 +106,7 @@ fn handle_set_offset(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         return;
     };
     let id = msg.message.object_id;
-    if let Some(p) = state.xdg_positioners.get_mut(&id) {
+    if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
         p.offset = (x, y);
     }
 }

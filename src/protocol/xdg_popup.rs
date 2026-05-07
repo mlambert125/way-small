@@ -36,30 +36,31 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let popup_id = msg.message.object_id;
+    let client_id = msg.client_id;
     debug!("xdg_popup.destroy: popup_id={}", popup_id);
 
     // Remove the popup's wl_surface from its parent's children list
-    if let Some(popup) = state.xdg_popups.get(&popup_id) {
+    if let Some(popup) = state.xdg_popups.get(&(client_id, popup_id)) {
         let xdg_surface_id = popup.xdg_surface_id;
-        if let Some(xdg_surface) = state.xdg_surfaces.get(&xdg_surface_id) {
+        if let Some(xdg_surface) = state.xdg_surfaces.get(&(client_id, xdg_surface_id)) {
             let wl_surface_id = xdg_surface.wl_surface_id;
-            if let Some(surface) = state.surfaces.get(&wl_surface_id) {
+            if let Some(surface) = state.surfaces.get(&(client_id, wl_surface_id)) {
                 let parent_id = surface.parent;
                 if let Some(parent_id) = parent_id {
-                    if let Some(parent) = state.surfaces.get_mut(&parent_id) {
+                    if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
                         parent.children.retain(|&id| id != wl_surface_id);
                     }
                 }
             }
             // Clear the parent link
-            if let Some(surface) = state.surfaces.get_mut(&wl_surface_id) {
+            if let Some(surface) = state.surfaces.get_mut(&(client_id, wl_surface_id)) {
                 surface.parent = None;
             }
         }
     }
 
-    state.destroy_xdg_popup(popup_id);
-    let client = state.clients.get_or_create(msg.client_id);
+    state.destroy_xdg_popup(client_id, popup_id);
+    let client = state.clients.get_or_create(client_id);
     client.unregister(popup_id);
 }
 

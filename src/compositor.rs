@@ -93,10 +93,13 @@ pub async fn run_compositor(
                     BackendMessage::KeyInput { keycode, state: key_state, mods_depressed, mods_latched, mods_locked, mods_group } => {
                         let time_ms = start_time.elapsed().as_millis() as u32;
                         let pressed = matches!(key_state, KeyState::Pressed);
-                        // Send to all keyboards (single-surface focus for now)
+                        // Only send key events to the focused surface's client
+                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for kb in state.keyboards.clone() {
-                            wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, keycode - 8, pressed).await;
-                            wl_keyboard::send_modifiers(&mut state, kb.client_id, kb.object_id, mods_depressed, mods_latched, mods_locked, mods_group).await;
+                            if Some(kb.client_id) == focused_client {
+                                wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, keycode - 8, pressed).await;
+                                wl_keyboard::send_modifiers(&mut state, kb.client_id, kb.object_id, mods_depressed, mods_latched, mods_locked, mods_group).await;
+                            }
                         }
                     }
 
@@ -111,23 +114,27 @@ pub async fn run_compositor(
                         // hover, alternatively do this in MouseButton for focus on click)
 
                         // Auto-focus: find first surface and enter it if not already focused
-                        if state.focused_surface.is_none() && let Some((&surface_id, surface_client_id)) = state.surfaces.iter().next().map(|(id, s)| (id, s.client_id)) {
-                            state.focused_surface = Some(surface_id);
+                        if state.focused_surface.is_none() && let Some((&surface_key, surface_client_id)) = state.surfaces.iter().next().map(|(key, s)| (key, s.client_id)) {
+                            state.focused_surface = Some(surface_key);
+                            let surface_obj_id = surface_key.1;
                             for ptr in state.pointers.clone() {
                                 if ptr.client_id == surface_client_id {
-                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_id, x, y).await;
+                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
                                     wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
                                 }
                             }
                             for kb in state.keyboards.clone() {
                                 if kb.client_id == surface_client_id {
-                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_id).await;
+                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
                                 }
                             }
                         }
+                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
-                            wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, x, y).await;
-                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                            if Some(ptr.client_id) == focused_client {
+                                wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, x, y).await;
+                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                            }
                         }
                     }
                     BackendMessage::MouseButton { button, state: btn_state } => {
@@ -139,14 +146,21 @@ pub async fn run_compositor(
                             MouseButton::Right => 0x111,
                             MouseButton::Middle => 0x112,
                         };
+                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
-                            wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed).await;
-                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                            if Some(ptr.client_id) == focused_client {
+                                wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed).await;
+                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                            }
                         }
                     }
                     BackendMessage::MouseScroll { dx, dy } => {
                         let time_ms = start_time.elapsed().as_millis() as u32;
+                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
+                            if Some(ptr.client_id) != focused_client {
+                                continue;
+                            }
                             if dy != 0.0 {
                                 // mouse axis 0 = vertical
                                 wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 0, dy * 10.0).await;
@@ -209,7 +223,7 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
         let still_attached = state
             .surfaces
             .values()
-            .any(|s| s.buffer_id == Some(buffer_id));
+            .any(|s| s.client_id == client_id && s.buffer_id == Some(buffer_id));
         if !still_attached {
             buffers_to_release.push((client_id, buffer_id));
         }

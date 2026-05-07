@@ -43,7 +43,7 @@ async fn handle_create_surface(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(surface_id, ObjectType::WlSurface);
-    state.create_surface(surface_id, msg.client_id);
+    state.create_surface(msg.client_id, surface_id);
 }
 
 async fn handle_create_region(
@@ -63,5 +63,5 @@ async fn handle_create_region(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(region_id, ObjectType::WlRegion);
-    state.create_region(region_id, msg.client_id);
+    state.create_region(msg.client_id, region_id);
 }

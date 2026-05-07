@@ -38,7 +38,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let xdg_surface_id = msg.message.object_id;
     debug!("xdg_surface.destroy: xdg_surface_id={}", xdg_surface_id);
-    state.destroy_xdg_surface(xdg_surface_id);
+    state.destroy_xdg_surface(msg.client_id, xdg_surface_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(xdg_surface_id);
 }
@@ -64,7 +64,7 @@ async fn handle_get_toplevel(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(toplevel_id, ObjectType::XdgToplevel);
-    state.create_xdg_toplevel(toplevel_id, msg.client_id, xdg_surface_id);
+    state.create_xdg_toplevel(msg.client_id, toplevel_id, xdg_surface_id);
 
     // Send initial xdg_toplevel.configure (empty states, 0x0 = client picks size)
     super::xdg_toplevel::send_configure(state, msg.client_id, toplevel_id, 0, 0).await;
@@ -97,23 +97,24 @@ async fn handle_get_popup(
     };
 
     let xdg_surface_id = msg.message.object_id;
+    let client_id = msg.client_id;
     debug!(
         "xdg_surface.get_popup: popup_id={} parent={} positioner={}",
         popup_id, parent_xdg_surface_id, positioner_id
     );
 
     // Compute position from positioner
-    let (x, y, width, height) = if let Some(pos) = state.xdg_positioners.get(&positioner_id) {
+    let (x, y, width, height) = if let Some(pos) = state.xdg_positioners.get(&(client_id, positioner_id)) {
         compute_popup_position(pos)
     } else {
         (0, 0, 1, 1)
     };
 
-    let client = state.clients.get_or_create(msg.client_id);
+    let client = state.clients.get_or_create(client_id);
     client.register(popup_id, ObjectType::XdgPopup);
     state.create_xdg_popup(
+        client_id,
         popup_id,
-        msg.client_id,
         xdg_surface_id,
         parent_xdg_surface_id,
         x,
@@ -125,30 +126,30 @@ async fn handle_get_popup(
     // Parent the popup's wl_surface under the parent's wl_surface
     let popup_wl_surface = state
         .xdg_surfaces
-        .get(&xdg_surface_id)
+        .get(&(client_id, xdg_surface_id))
         .map(|s| s.wl_surface_id);
     let parent_wl_surface = state
         .xdg_surfaces
-        .get(&parent_xdg_surface_id)
+        .get(&(client_id, parent_xdg_surface_id))
         .map(|s| s.wl_surface_id);
 
     if let (Some(popup_wl), Some(parent_wl)) = (popup_wl_surface, parent_wl_surface) {
-        if let Some(surface) = state.surfaces.get_mut(&popup_wl) {
+        if let Some(surface) = state.surfaces.get_mut(&(client_id, popup_wl)) {
             surface.parent = Some(parent_wl);
             surface.subsurface_position = (x, y);
         }
-        if let Some(parent) = state.surfaces.get_mut(&parent_wl) {
+        if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_wl)) {
             parent.children.push(popup_wl);
         }
     }
 
     // Send xdg_popup.configure with the computed position
-    super::xdg_popup::send_configure(state, msg.client_id, popup_id, x, y, width, height).await;
+    super::xdg_popup::send_configure(state, client_id, popup_id, x, y, width, height).await;
 
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
     let configure_args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(msg.client_id);
+    let client = state.clients.get_or_create(client_id);
     let _ = client
         .send(message(xdg_surface_id, CONFIGURE, configure_args))
         .await;
@@ -208,7 +209,7 @@ fn handle_set_window_geometry(state: &mut CompositorState, msg: &WaylandProtocol
         "xdg_surface.set_window_geometry: {}x{} at ({},{})",
         w, h, x, y
     );
-    if let Some(xdg_surface) = state.xdg_surfaces.get_mut(&xdg_surface_id) {
+    if let Some(xdg_surface) = state.xdg_surfaces.get_mut(&(msg.client_id, xdg_surface_id)) {
         xdg_surface.geometry = Some((x, y, w, h));
     }
 }
@@ -223,7 +224,7 @@ fn handle_ack_configure(state: &mut CompositorState, msg: &WaylandProtocolMessag
         "xdg_surface.ack_configure: xdg_surface_id={} serial={}",
         xdg_surface_id, serial
     );
-    if let Some(xdg_surface) = state.xdg_surfaces.get_mut(&xdg_surface_id) {
+    if let Some(xdg_surface) = state.xdg_surfaces.get_mut(&(msg.client_id, xdg_surface_id)) {
         xdg_surface.configured = true;
     }
 }

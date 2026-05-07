@@ -31,7 +31,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     match msg.message.op_code {
         RELEASE => {
             let keyboard_id = msg.message.object_id;
-            state.keyboards.retain(|k| k.object_id != keyboard_id);
+            state.keyboards.retain(|k| !(k.client_id == msg.client_id && k.object_id == keyboard_id));
             let client = state.clients.get_or_create(msg.client_id);
             client.unregister(keyboard_id);
         }

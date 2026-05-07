@@ -48,22 +48,23 @@ async fn handle_get_subsurface(
         return;
     };
 
+    let client_id = msg.client_id;
     debug!(
         "wl_subcompositor.get_subsurface: subsurface_id={} surface_id={} parent_id={}",
         subsurface_id, surface_id, parent_id
     );
 
     // Set up the parent-child relationship
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
         surface.parent = Some(parent_id);
     }
-    if let Some(parent) = state.surfaces.get_mut(&parent_id) {
+    if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
         parent.children.push(surface_id);
     }
 
-    let client = state.clients.get_or_create(msg.client_id);
+    let client = state.clients.get_or_create(client_id);
     client.register(subsurface_id, ObjectType::WlSubsurface);
 
     // Store the mapping from subsurface object id to the wl_surface id it controls
-    state.subsurface_map.insert(subsurface_id, surface_id);
+    state.subsurface_map.insert((client_id, subsurface_id), surface_id);
 }

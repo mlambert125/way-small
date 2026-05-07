@@ -56,7 +56,7 @@ fn handle_feedback(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
     client.register(callback_id, ObjectType::WpPresentationFeedback);
 
     // Store as pending; moved to committed list on wl_surface.commit
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
         surface.pending.presentation_feedbacks.push(callback_id);
     }
 }

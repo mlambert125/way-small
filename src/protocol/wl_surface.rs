@@ -47,7 +47,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let surface_id = msg.message.object_id;
     debug!("wl_surface.destroy: surface_id={}", surface_id);
-    state.destroy_surface(surface_id);
+    state.destroy_surface(msg.client_id, surface_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(surface_id);
 }
@@ -60,7 +60,7 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     };
 
     let surface_id = msg.message.object_id;
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
         // buffer_id 0 means detach
         surface.pending.buffer_id = if buffer_id == 0 {
             None
@@ -79,7 +79,7 @@ fn handle_damage(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     };
 
     let surface_id = msg.message.object_id;
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
         surface.pending.damage.push((x, y, w, h));
     }
 }
@@ -96,15 +96,17 @@ fn handle_frame(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCli
     let client = state.clients.get_or_create(msg.client_id);
     client.register(callback_id, ObjectType::WlCallback);
 
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
         surface.pending.frame_callback = Some(callback_id);
     }
 }
 
 fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let surface_id = msg.message.object_id;
+    let client_id = msg.client_id;
+    let key = (client_id, surface_id);
 
-    if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    if let Some(surface) = state.surfaces.get_mut(&key) {
         // Apply pending buffer, releasing the old one if it changed
         if surface.pending.buffer_id.is_some() {
             let new_buffer = surface.pending.buffer_id.take();
@@ -113,7 +115,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             {
                 state
                     .buffers_pending_release
-                    .push((surface.client_id, old_buffer));
+                    .push((client_id, old_buffer));
             }
             surface.buffer_id = new_buffer;
         }
@@ -139,7 +141,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 
     // Apply pending viewport state
     for vp in state.viewports.values_mut() {
-        if vp.surface_id == surface_id {
+        if vp.surface_id == surface_id && vp.client_id == client_id {
             if let Some(src) = vp.pending_source.take() {
                 vp.source = src;
             }

@@ -30,7 +30,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let viewport_id = msg.message.object_id;
     debug!("wp_viewport.destroy: viewport_id={}", viewport_id);
-    state.destroy_viewport(viewport_id);
+    state.destroy_viewport(msg.client_id, viewport_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(viewport_id);
 }
@@ -50,7 +50,7 @@ fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         viewport_id, x, y, width, height
     );
 
-    if let Some(vp) = state.viewports.get_mut(&viewport_id) {
+    if let Some(vp) = state.viewports.get_mut(&(msg.client_id, viewport_id)) {
         // -1.0 means "unset" per protocol
         if x == -1.0 && y == -1.0 && width == -1.0 && height == -1.0 {
             vp.pending_source = Some(None);
@@ -75,7 +75,7 @@ fn handle_set_destination(
         viewport_id, width, height
     );
 
-    if let Some(vp) = state.viewports.get_mut(&viewport_id) {
+    if let Some(vp) = state.viewports.get_mut(&(msg.client_id, viewport_id)) {
         // -1 means "unset" per protocol
         if width == -1 && height == -1 {
             vp.pending_destination = Some(None);

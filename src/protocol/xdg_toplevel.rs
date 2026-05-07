@@ -55,7 +55,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.destroy: toplevel_id={}", toplevel_id);
-    state.destroy_xdg_toplevel(toplevel_id);
+    state.destroy_xdg_toplevel(msg.client_id, toplevel_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(toplevel_id);
 }
@@ -67,7 +67,7 @@ fn handle_set_title(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     };
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.set_title: \"{}\"", title);
-    if let Some(toplevel) = state.xdg_toplevels.get_mut(&toplevel_id) {
+    if let Some(toplevel) = state.xdg_toplevels.get_mut(&(msg.client_id, toplevel_id)) {
         toplevel.title = Some(title);
     }
 }
@@ -79,7 +79,7 @@ fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     };
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.set_app_id: \"{}\"", app_id);
-    if let Some(toplevel) = state.xdg_toplevels.get_mut(&toplevel_id) {
+    if let Some(toplevel) = state.xdg_toplevels.get_mut(&(msg.client_id, toplevel_id)) {
         toplevel.app_id = Some(app_id);
     }
 }

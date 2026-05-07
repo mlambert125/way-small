@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::backend::RenderFrame;
 use crate::protocol;
+use crate::protocol::state::ClientObjectId;
 
 const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
 const BYTES_PER_PIXEL: u64 = 4;
@@ -16,16 +17,16 @@ const BYTES_PER_PIXEL: u64 = 4;
 pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> RenderFrame {
     let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
 
-    // Collect top-level surface ids (those without a parent)
-    let toplevel_ids: Vec<u32> = state
+    // Collect top-level surface keys (those without a parent)
+    let toplevel_keys: Vec<ClientObjectId> = state
         .surfaces
         .iter()
         .filter(|(_, s)| s.parent.is_none())
-        .map(|(&id, _)| id)
+        .map(|(&key, _)| key)
         .collect();
 
-    for surface_id in toplevel_ids {
-        blit_surface_tree(state, &mut pixels, width, height, surface_id, 0, 0);
+    for key in toplevel_keys {
+        blit_surface_tree(state, &mut pixels, width, height, key, 0, 0);
     }
 
     // Draw the hardware cursor last so that it's on top
@@ -50,22 +51,24 @@ fn blit_surface_tree(
     pixels: &mut [u32],
     width: u32,
     height: u32,
-    surface_id: u32,
+    surface_key: ClientObjectId,
     offset_x: i32,
     offset_y: i32,
 ) {
-    let Some(surface) = state.surfaces.get(&surface_id) else {
+    let Some(surface) = state.surfaces.get(&surface_key) else {
         return;
     };
 
+    let client_id = surface.client_id;
     let children = surface.children.clone();
 
     // Blit this surface's buffer
-    blit_surface_buffer(state, pixels, width, height, surface_id, offset_x, offset_y);
+    blit_surface_buffer(state, pixels, width, height, surface_key, offset_x, offset_y);
 
     // Blit children at their positions
     for child_id in children {
-        let Some(child) = state.surfaces.get(&child_id) else {
+        let child_key = (client_id, child_id);
+        let Some(child) = state.surfaces.get(&child_key) else {
             continue;
         };
         let (cx, cy) = child.subsurface_position;
@@ -74,7 +77,7 @@ fn blit_surface_tree(
             pixels,
             width,
             height,
-            child_id,
+            child_key,
             offset_x + cx,
             offset_y + cy,
         );
@@ -87,20 +90,21 @@ fn blit_surface_buffer(
     pixels: &mut [u32],
     width: u32,
     height: u32,
-    surface_id: u32,
+    surface_key: ClientObjectId,
     offset_x: i32,
     offset_y: i32,
 ) {
-    let Some(surface) = state.surfaces.get(&surface_id) else {
+    let Some(surface) = state.surfaces.get(&surface_key) else {
         return;
     };
+    let client_id = surface.client_id;
     let Some(buffer_id) = surface.buffer_id else {
         return;
     };
-    let Some(shm_buffer) = state.shm_buffers.get(&buffer_id) else {
+    let Some(shm_buffer) = state.shm_buffers.get(&(client_id, buffer_id)) else {
         return;
     };
-    let Some(pool) = state.shm_pools.get(&shm_buffer.pool_id) else {
+    let Some(pool) = state.shm_pools.get(&(client_id, shm_buffer.pool_id)) else {
         return;
     };
 
@@ -110,12 +114,12 @@ fn blit_surface_buffer(
     let viewport = state
         .viewports
         .values()
-        .find(|v| v.surface_id == surface_id);
+        .find(|v| v.client_id == client_id && v.surface_id == surface_key.1);
 
     // Validate the fd is still valid and large enough
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(pool.fd, &mut stat) } != 0 {
-        debug!("Pool fd {} is invalid for surface {}", pool.fd, surface_id);
+        debug!("Pool fd {} is invalid for surface {:?}", pool.fd, surface_key);
         return;
     }
     // The actual size of the entire pool file
@@ -132,8 +136,8 @@ fn blit_surface_buffer(
         + last_row_size;
     if buf_end > actual_size {
         debug!(
-            "Buffer exceeds actual file size: end={} file_size={} pool_size={} surface={}",
-            buf_end, actual_size, pool.size, surface_id
+            "Buffer exceeds actual file size: end={} file_size={} pool_size={} surface={:?}",
+            buf_end, actual_size, pool.size, surface_key
         );
         return;
     }
@@ -150,7 +154,7 @@ fn blit_surface_buffer(
         )
     };
     if ptr == libc::MAP_FAILED {
-        debug!("Failed to mmap pool for surface {}", surface_id);
+        debug!("Failed to mmap pool for surface {:?}", surface_key);
         return;
     }
 

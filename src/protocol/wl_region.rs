@@ -30,7 +30,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let region_id = msg.message.object_id;
     debug!("wl_region.destroy: region_id={}", region_id);
-    state.destroy_region(region_id);
+    state.destroy_region(msg.client_id, region_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(region_id);
 }
@@ -42,7 +42,7 @@ fn handle_add(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         return;
     };
     let region_id = msg.message.object_id;
-    if let Some(region) = state.regions.get_mut(&region_id) {
+    if let Some(region) = state.regions.get_mut(&(msg.client_id, region_id)) {
         region.rects.push((x, y, w, h));
     }
 }
@@ -54,7 +54,7 @@ fn handle_subtract(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
         return;
     };
     let region_id = msg.message.object_id;
-    if let Some(region) = state.regions.get_mut(&region_id) {
+    if let Some(region) = state.regions.get_mut(&(msg.client_id, region_id)) {
         region.subtracts.push((x, y, w, h));
     }
 }

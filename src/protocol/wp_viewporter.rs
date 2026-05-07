@@ -45,7 +45,7 @@ async fn handle_get_viewport(
     );
 
     // Check that the surface doesn't already have a viewport
-    if state.viewports.values().any(|v| v.surface_id == surface_id) {
+    if state.viewports.values().any(|v| v.client_id == msg.client_id && v.surface_id == surface_id) {
         let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
@@ -60,5 +60,5 @@ async fn handle_get_viewport(
     let client = state.clients.get_or_create(msg.client_id);
     client.register(viewport_id, ObjectType::WpViewport);
 
-    state.create_viewport(viewport_id, msg.client_id, surface_id);
+    state.create_viewport(msg.client_id, viewport_id, surface_id);
 }

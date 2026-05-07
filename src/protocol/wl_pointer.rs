@@ -29,7 +29,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         }
         RELEASE => {
             let pointer_id = msg.message.object_id;
-            state.pointers.retain(|p| p.object_id != pointer_id);
+            state.pointers.retain(|p| !(p.client_id == msg.client_id && p.object_id == pointer_id));
             let client = state.clients.get_or_create(msg.client_id);
             client.unregister(pointer_id);
         }

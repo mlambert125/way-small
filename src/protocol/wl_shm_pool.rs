@@ -60,13 +60,13 @@ async fn handle_create_buffer(
 
     let client = state.clients.get_or_create(msg.client_id);
     client.register(buffer_id, ObjectType::WlBuffer);
-    state.register_buffer(buffer_id, msg.client_id, msg.message.object_id, offset, width, height, stride, format);
+    state.register_buffer(msg.client_id, buffer_id, msg.message.object_id, offset, width, height, stride, format);
 }
 
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let pool_id = msg.message.object_id;
     debug!("wl_shm_pool.destroy: pool_id={}", pool_id);
-    state.destroy_shm_pool(pool_id);
+    state.destroy_shm_pool(msg.client_id, pool_id);
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(pool_id);
 }
@@ -78,5 +78,5 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     };
     let pool_id = msg.message.object_id;
     debug!("wl_shm_pool.resize: pool_id={} new_size={}", pool_id, new_size);
-    state.resize_shm_pool(pool_id, new_size as u32);
+    state.resize_shm_pool(msg.client_id, pool_id, new_size as u32);
 }

@@ -34,27 +34,28 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
 
 fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let subsurface_id = msg.message.object_id;
+    let client_id = msg.client_id;
     debug!("wl_subsurface.destroy: subsurface_id={}", subsurface_id);
 
     // Remove from parent's children list
-    if let Some(&surface_id) = state.subsurface_map.get(&subsurface_id) {
-        if let Some(surface) = state.surfaces.get(&surface_id) {
+    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) {
+        if let Some(surface) = state.surfaces.get(&(client_id, surface_id)) {
             let parent_id = surface.parent;
             // Clear parent reference
-            if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+            if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
                 surface.parent = None;
             }
             // Remove from parent's children
             if let Some(parent_id) = parent_id {
-                if let Some(parent) = state.surfaces.get_mut(&parent_id) {
+                if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
                     parent.children.retain(|&id| id != surface_id);
                 }
             }
         }
-        state.subsurface_map.remove(&subsurface_id);
+        state.subsurface_map.remove(&(client_id, subsurface_id));
     }
 
-    let client = state.clients.get_or_create(msg.client_id);
+    let client = state.clients.get_or_create(client_id);
     client.unregister(subsurface_id);
 }
 
@@ -65,8 +66,9 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
     };
 
     let subsurface_id = msg.message.object_id;
-    if let Some(&surface_id) = state.subsurface_map.get(&subsurface_id) {
-        if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    let client_id = msg.client_id;
+    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) {
+        if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
             surface.subsurface_position = (x, y);
         }
     }
@@ -79,17 +81,18 @@ fn handle_place_above(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     };
 
     let subsurface_id = msg.message.object_id;
-    let Some(&surface_id) = state.subsurface_map.get(&subsurface_id) else {
+    let client_id = msg.client_id;
+    let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) else {
         return;
     };
-    let Some(surface) = state.surfaces.get(&surface_id) else {
+    let Some(surface) = state.surfaces.get(&(client_id, surface_id)) else {
         return;
     };
     let Some(parent_id) = surface.parent else {
         return;
     };
 
-    if let Some(parent) = state.surfaces.get_mut(&parent_id) {
+    if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
         parent.children.retain(|&id| id != surface_id);
         if let Some(pos) = parent.children.iter().position(|&id| id == sibling_id) {
             parent.children.insert(pos + 1, surface_id);
@@ -106,17 +109,18 @@ fn handle_place_below(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     };
 
     let subsurface_id = msg.message.object_id;
-    let Some(&surface_id) = state.subsurface_map.get(&subsurface_id) else {
+    let client_id = msg.client_id;
+    let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) else {
         return;
     };
-    let Some(surface) = state.surfaces.get(&surface_id) else {
+    let Some(surface) = state.surfaces.get(&(client_id, surface_id)) else {
         return;
     };
     let Some(parent_id) = surface.parent else {
         return;
     };
 
-    if let Some(parent) = state.surfaces.get_mut(&parent_id) {
+    if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
         parent.children.retain(|&id| id != surface_id);
         if let Some(pos) = parent.children.iter().position(|&id| id == sibling_id) {
             parent.children.insert(pos, surface_id);
@@ -128,8 +132,9 @@ fn handle_place_below(state: &mut CompositorState, msg: &WaylandProtocolMessageW
 
 fn handle_set_sync(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo, sync: bool) {
     let subsurface_id = msg.message.object_id;
-    if let Some(&surface_id) = state.subsurface_map.get(&subsurface_id) {
-        if let Some(surface) = state.surfaces.get_mut(&surface_id) {
+    let client_id = msg.client_id;
+    if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id)) {
+        if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
             surface.subsurface_sync = sync;
         }
     }

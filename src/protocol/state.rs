@@ -8,6 +8,9 @@ use std::os::unix::io::RawFd;
 
 use super::client::Clients;
 
+/// A (client_id, object_id) pair that uniquely identifies a Wayland object across all clients.
+pub type ClientObjectId = (u32, u32);
+
 /// Tracked state for a wl_shm_pool.
 #[derive(Debug)]
 pub struct ShmPool {
@@ -178,27 +181,27 @@ pub struct OutputState {
 /// Global compositor state shared across all clients.
 pub struct CompositorState {
     pub clients: Clients,
-    pub shm_pools: HashMap<u32, ShmPool>,
-    pub shm_buffers: HashMap<u32, ShmBuffer>,
-    pub surfaces: HashMap<u32, Surface>,
-    pub regions: HashMap<u32, Region>,
-    pub xdg_surfaces: HashMap<u32, XdgSurfaceState>,
-    pub xdg_toplevels: HashMap<u32, XdgToplevelState>,
-    pub xdg_popups: HashMap<u32, XdgPopupState>,
-    pub xdg_positioners: HashMap<u32, XdgPositionerState>,
+    pub shm_pools: HashMap<ClientObjectId, ShmPool>,
+    pub shm_buffers: HashMap<ClientObjectId, ShmBuffer>,
+    pub surfaces: HashMap<ClientObjectId, Surface>,
+    pub regions: HashMap<ClientObjectId, Region>,
+    pub xdg_surfaces: HashMap<ClientObjectId, XdgSurfaceState>,
+    pub xdg_toplevels: HashMap<ClientObjectId, XdgToplevelState>,
+    pub xdg_popups: HashMap<ClientObjectId, XdgPopupState>,
+    pub xdg_positioners: HashMap<ClientObjectId, XdgPositionerState>,
     pub seat: SeatState,
     pub output: Option<OutputState>,
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
-    pub focused_surface: Option<u32>,
+    pub focused_surface: Option<ClientObjectId>,
     pub cursor_x: f64,
     pub cursor_y: f64,
-    /// Maps wl_subsurface object id -> the wl_surface id it controls.
-    pub subsurface_map: HashMap<u32, u32>,
-    /// wp_viewport objects keyed by viewport object id.
-    pub viewports: HashMap<u32, ViewportState>,
+    /// Maps wl_subsurface (client_id, object_id) -> the wl_surface object id it controls.
+    pub subsurface_map: HashMap<ClientObjectId, u32>,
+    /// wp_viewport objects keyed by (client_id, viewport_object_id).
+    pub viewports: HashMap<ClientObjectId, ViewportState>,
     /// Buffers to release on the next render (old buffers replaced by commit).
-    pub buffers_pending_release: Vec<(u32, u32)>,
+    pub buffers_pending_release: Vec<ClientObjectId>,
 }
 
 impl CompositorState {
@@ -226,9 +229,9 @@ impl CompositorState {
         }
     }
 
-    pub fn register_shm_pool(&mut self, pool_id: u32, client_id: u32, fd: RawFd, size: u32) {
+    pub fn register_shm_pool(&mut self, client_id: u32, pool_id: u32, fd: RawFd, size: u32) {
         self.shm_pools.insert(
-            pool_id,
+            (client_id, pool_id),
             ShmPool {
                 client_id,
                 fd,
@@ -237,14 +240,14 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_shm_pool(&mut self, pool_id: u32) {
-        if let Some(pool) = self.shm_pools.remove(&pool_id) {
+    pub fn destroy_shm_pool(&mut self, client_id: u32, pool_id: u32) {
+        if let Some(pool) = self.shm_pools.remove(&(client_id, pool_id)) {
             unsafe { libc::close(pool.fd) };
         }
     }
 
-    pub fn resize_shm_pool(&mut self, pool_id: u32, new_size: u32) {
-        if let Some(pool) = self.shm_pools.get_mut(&pool_id) {
+    pub fn resize_shm_pool(&mut self, client_id: u32, pool_id: u32, new_size: u32) {
+        if let Some(pool) = self.shm_pools.get_mut(&(client_id, pool_id)) {
             pool.size = new_size;
         }
     }
@@ -252,8 +255,8 @@ impl CompositorState {
     #[allow(clippy::too_many_arguments)]
     pub fn register_buffer(
         &mut self,
-        buffer_id: u32,
         client_id: u32,
+        buffer_id: u32,
         pool_id: u32,
         offset: i32,
         width: i32,
@@ -262,7 +265,7 @@ impl CompositorState {
         format: u32,
     ) {
         self.shm_buffers.insert(
-            buffer_id,
+            (client_id, buffer_id),
             ShmBuffer {
                 client_id,
                 pool_id,
@@ -275,13 +278,13 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_buffer(&mut self, buffer_id: u32) {
-        self.shm_buffers.remove(&buffer_id);
+    pub fn destroy_buffer(&mut self, client_id: u32, buffer_id: u32) {
+        self.shm_buffers.remove(&(client_id, buffer_id));
     }
 
-    pub fn create_surface(&mut self, surface_id: u32, client_id: u32) {
+    pub fn create_surface(&mut self, client_id: u32, surface_id: u32) {
         self.surfaces.insert(
-            surface_id,
+            (client_id, surface_id),
             Surface {
                 client_id,
                 buffer_id: None,
@@ -296,13 +299,13 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_surface(&mut self, surface_id: u32) {
-        self.surfaces.remove(&surface_id);
+    pub fn destroy_surface(&mut self, client_id: u32, surface_id: u32) {
+        self.surfaces.remove(&(client_id, surface_id));
     }
 
-    pub fn create_region(&mut self, region_id: u32, client_id: u32) {
+    pub fn create_region(&mut self, client_id: u32, region_id: u32) {
         self.regions.insert(
-            region_id,
+            (client_id, region_id),
             Region {
                 client_id,
                 ..Default::default()
@@ -310,13 +313,13 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_region(&mut self, region_id: u32) {
-        self.regions.remove(&region_id);
+    pub fn destroy_region(&mut self, client_id: u32, region_id: u32) {
+        self.regions.remove(&(client_id, region_id));
     }
 
-    pub fn create_xdg_surface(&mut self, xdg_surface_id: u32, client_id: u32, wl_surface_id: u32) {
+    pub fn create_xdg_surface(&mut self, client_id: u32, xdg_surface_id: u32, wl_surface_id: u32) {
         self.xdg_surfaces.insert(
-            xdg_surface_id,
+            (client_id, xdg_surface_id),
             XdgSurfaceState {
                 client_id,
                 wl_surface_id,
@@ -327,13 +330,13 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_xdg_surface(&mut self, xdg_surface_id: u32) {
-        self.xdg_surfaces.remove(&xdg_surface_id);
+    pub fn destroy_xdg_surface(&mut self, client_id: u32, xdg_surface_id: u32) {
+        self.xdg_surfaces.remove(&(client_id, xdg_surface_id));
     }
 
-    pub fn create_xdg_toplevel(&mut self, toplevel_id: u32, client_id: u32, xdg_surface_id: u32) {
+    pub fn create_xdg_toplevel(&mut self, client_id: u32, toplevel_id: u32, xdg_surface_id: u32) {
         self.xdg_toplevels.insert(
-            toplevel_id,
+            (client_id, toplevel_id),
             XdgToplevelState {
                 client_id,
                 xdg_surface_id,
@@ -341,20 +344,20 @@ impl CompositorState {
                 app_id: None,
             },
         );
-        if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&xdg_surface_id) {
+        if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_surface_id)) {
             xdg_surface.role = Some(XdgRole::Toplevel(toplevel_id));
         }
     }
 
-    pub fn destroy_xdg_toplevel(&mut self, toplevel_id: u32) {
-        self.xdg_toplevels.remove(&toplevel_id);
+    pub fn destroy_xdg_toplevel(&mut self, client_id: u32, toplevel_id: u32) {
+        self.xdg_toplevels.remove(&(client_id, toplevel_id));
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn create_xdg_popup(
         &mut self,
-        popup_id: u32,
         client_id: u32,
+        popup_id: u32,
         xdg_surface_id: u32,
         parent_xdg_surface_id: u32,
         x: i32,
@@ -363,7 +366,7 @@ impl CompositorState {
         height: i32,
     ) {
         self.xdg_popups.insert(
-            popup_id,
+            (client_id, popup_id),
             XdgPopupState {
                 client_id,
                 xdg_surface_id,
@@ -374,18 +377,18 @@ impl CompositorState {
                 height,
             },
         );
-        if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&xdg_surface_id) {
+        if let Some(xdg_surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_surface_id)) {
             xdg_surface.role = Some(XdgRole::Popup(popup_id));
         }
     }
 
-    pub fn destroy_xdg_popup(&mut self, popup_id: u32) {
-        self.xdg_popups.remove(&popup_id);
+    pub fn destroy_xdg_popup(&mut self, client_id: u32, popup_id: u32) {
+        self.xdg_popups.remove(&(client_id, popup_id));
     }
 
-    pub fn create_xdg_positioner(&mut self, positioner_id: u32, client_id: u32) {
+    pub fn create_xdg_positioner(&mut self, client_id: u32, positioner_id: u32) {
         self.xdg_positioners.insert(
-            positioner_id,
+            (client_id, positioner_id),
             XdgPositionerState {
                 client_id,
                 ..Default::default()
@@ -393,13 +396,13 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_xdg_positioner(&mut self, positioner_id: u32) {
-        self.xdg_positioners.remove(&positioner_id);
+    pub fn destroy_xdg_positioner(&mut self, client_id: u32, positioner_id: u32) {
+        self.xdg_positioners.remove(&(client_id, positioner_id));
     }
 
-    pub fn create_viewport(&mut self, viewport_id: u32, client_id: u32, surface_id: u32) {
+    pub fn create_viewport(&mut self, client_id: u32, viewport_id: u32, surface_id: u32) {
         self.viewports.insert(
-            viewport_id,
+            (client_id, viewport_id),
             ViewportState {
                 client_id,
                 surface_id,
@@ -411,8 +414,8 @@ impl CompositorState {
         );
     }
 
-    pub fn destroy_viewport(&mut self, viewport_id: u32) {
-        self.viewports.remove(&viewport_id);
+    pub fn destroy_viewport(&mut self, client_id: u32, viewport_id: u32) {
+        self.viewports.remove(&(client_id, viewport_id));
     }
 
     /// Remove all pools, buffers, and surfaces belonging to a disconnecting client.
@@ -421,10 +424,10 @@ impl CompositorState {
             .shm_pools
             .iter()
             .filter(|(_, p)| p.client_id == client_id)
-            .map(|(&id, _)| id)
+            .map(|(&(_, obj_id), _)| obj_id)
             .collect();
         for id in pool_ids {
-            self.destroy_shm_pool(id);
+            self.destroy_shm_pool(client_id, id);
         }
         self.shm_buffers.retain(|_, b| b.client_id != client_id);
         self.surfaces.retain(|_, s| s.client_id != client_id);
@@ -436,13 +439,12 @@ impl CompositorState {
         self.viewports.retain(|_, v| v.client_id != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
-        self.subsurface_map
-            .retain(|_, surface_id| self.surfaces.contains_key(surface_id));
+        self.subsurface_map.retain(|(cid, _), _| *cid != client_id);
         // Clear focus if it pointed to a surface owned by this client
-        if let Some(surface_id) = self.focused_surface
-            && !self.surfaces.contains_key(&surface_id)
-        {
-            self.focused_surface = None;
+        if let Some((cid, _)) = self.focused_surface {
+            if cid == client_id {
+                self.focused_surface = None;
+            }
         }
     }
 }
