@@ -9,6 +9,7 @@ use tracing::debug;
 use crate::backend::{BACKGROUND_COLOR, RenderFrame};
 use crate::protocol;
 use crate::protocol::state::ClientObjectId;
+
 const BYTES_PER_PIXEL: u64 = 4;
 
 /// Composite all surfaces into a single framebuffer.
@@ -104,9 +105,13 @@ fn blit_surface_buffer(
     // This is optional, and will only be present if the client set a viewport
     // on this surface.  If there isn't one, we just use the entire buffer at 1:1 scale.
     let viewport = state
-        .viewports
-        .values()
-        .find(|v| v.client_id == client_id && v.surface_id == surface_key.1);
+        .surface_viewport
+        .get(&(client_id, surface_key.1))
+        .and_then(|&vp_id| state.viewports.get(&(client_id, vp_id)));
+
+    if shm_buffer.width <= 0 || shm_buffer.height <= 0 {
+        return;
+    }
 
     // Use the cached mmap pointer
     let ptr = pool.map_ptr;

@@ -71,6 +71,7 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
         && let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id))
     {
         surface.subsurface_position = (x, y);
+        state.dirty = true;
     }
 }
 
@@ -99,6 +100,7 @@ fn handle_place_above(state: &mut CompositorState, msg: &WaylandProtocolMessageW
         } else {
             parent.children.push(surface_id);
         }
+        state.dirty = true;
     }
 }
 
@@ -127,6 +129,7 @@ fn handle_place_below(state: &mut CompositorState, msg: &WaylandProtocolMessageW
         } else {
             parent.children.insert(0, surface_id);
         }
+        state.dirty = true;
     }
 }
 

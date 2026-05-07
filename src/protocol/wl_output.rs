@@ -6,6 +6,7 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::ObjectType;
 use super::state::CompositorState;
 use super::wire::{ArgWriter, message};
 
@@ -85,5 +86,44 @@ pub async fn send_output_info(state: &mut CompositorState, client_id: u32, outpu
     if version >= 2 {
         let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(output_id, DONE, Vec::new())).await;
+    }
+}
+
+/// Send updated mode + done to all clients that have a bound wl_output.
+pub async fn broadcast_mode(state: &mut CompositorState) {
+    let (width, height, refresh) = match &state.output {
+        Some(o) => (o.width as i32, o.height as i32, o.refresh_mhz as i32),
+        None => return,
+    };
+
+    // Collect (client_id, output_object_id, version) for all bound wl_output objects
+    let outputs: Vec<(u32, u32, u32)> = state
+        .clients
+        .iter()
+        .flat_map(|(client_id, client)| {
+            client
+                .objects
+                .iter()
+                .filter(|(_, obj_type)| **obj_type == ObjectType::WlOutput)
+                .map(move |(obj_id, _)| (*client_id, *obj_id, client.version(*obj_id)))
+        })
+        .collect();
+
+    for (client_id, output_id, version) in outputs {
+        // wl_output.mode
+        let args = ArgWriter::new()
+            .u32(MODE_CURRENT)
+            .i32(width)
+            .i32(height)
+            .i32(refresh)
+            .build();
+        let client = state.clients.get_or_create(client_id);
+        let _ = client.send(message(output_id, MODE, args)).await;
+
+        // wl_output.done (version 2+)
+        if version >= 2 {
+            let client = state.clients.get_or_create(client_id);
+            let _ = client.send(message(output_id, DONE, Vec::new())).await;
+        }
     }
 }

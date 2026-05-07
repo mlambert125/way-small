@@ -34,7 +34,6 @@ pub async fn run_compositor(
     let mut output_width: u32 = 800;
     let mut output_height: u32 = 600;
     let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
-    let mut dirty = true;
     let start_time = Instant::now();
 
     loop {
@@ -55,14 +54,13 @@ pub async fn run_compositor(
                                 msg.client_id, msg.message.object_id, msg.message.op_code
                             );
                             protocol::handle_message(&mut state, &msg).await;
-                            dirty = true;
                         }
                         WaylandSocketMessage::ClientDisconnected { client_id } => {
                             info!("Client {} disconnected", client_id);
                             let was_focused = state.focused_surface.map(|(cid, _)| cid) == Some(client_id);
                             state.remove_client_resources(client_id);
                             state.clients.remove(client_id);
-                            dirty = true;
+                            state.dirty = true;
 
                             // Focus the next surface down the stack
                             if was_focused && let Some(&new_key) = state.surface_stack.last() {
@@ -94,16 +92,27 @@ pub async fn run_compositor(
                         info!("Backend resized to {}x{}", w, h);
                         output_width = w;
                         output_height = h;
-                        dirty = true;
+                        if let Some(ref mut output) = state.output {
+                            output.width = w;
+                            output.height = h;
+                        }
+                        protocol::wl_output::broadcast_mode(&mut state).await;
+                        state.dirty = true;
                     }
                     BackendMessage::KeyInput { keycode, state: key_state, mods_depressed, mods_latched, mods_locked, mods_group } => {
                         let time_ms = start_time.elapsed().as_millis() as u32;
                         let pressed = matches!(key_state, KeyState::Pressed);
+                        let evdev_key = keycode.saturating_sub(8);
+                        if pressed {
+                            state.pressed_keys.insert(evdev_key);
+                        } else {
+                            state.pressed_keys.remove(&evdev_key);
+                        }
                         // Only send key events to the focused surface's client
                         let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for kb in state.keyboards.clone() {
                             if Some(kb.client_id) == focused_client {
-                                wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, keycode.saturating_sub(8), pressed).await;
+                                wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, evdev_key, pressed).await;
                                 wl_keyboard::send_modifiers(&mut state, kb.client_id, kb.object_id, mods_depressed, mods_latched, mods_locked, mods_group).await;
                             }
                         }
@@ -114,7 +123,7 @@ pub async fn run_compositor(
                     BackendMessage::MouseMove { x, y } => {
                         state.cursor_x = x;
                         state.cursor_y = y;
-                        dirty = true;
+                        state.dirty = true;
                         let time_ms = start_time.elapsed().as_millis() as u32;
 
                         // Auto-focus the top surface if nothing is focused yet
@@ -154,7 +163,7 @@ pub async fn run_compositor(
                             // Raise to top of stack
                             state.surface_stack.retain(|k| *k != clicked);
                             state.surface_stack.push(clicked);
-                            dirty = true;
+                            state.dirty = true;
 
                             switch_focus(&mut state, clicked).await;
                         }
@@ -195,14 +204,14 @@ pub async fn run_compositor(
                 }
             }
             _ = render_timer.tick() => {
-                if dirty {
+                if state.dirty {
                     let frame = Arc::new(renderer::render(&state, output_width, output_height));
                     let timestamp_ms = start_time.elapsed().as_millis() as u32;
                     fire_frame_callbacks(&mut state, timestamp_ms).await;
                     if frame_sender.send(frame).await.is_err() {
                         break;
                     }
-                    dirty = false;
+                    state.dirty = false;
                 }
             }
             _ = cancel_token.cancelled() => {
@@ -383,9 +392,9 @@ fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) ->
 
     // Check for viewport destination override
     if let Some(vp) = state
-        .viewports
-        .values()
-        .find(|v| v.client_id == client_id && v.surface_id == key.1)
+        .surface_viewport
+        .get(&(client_id, key.1))
+        .and_then(|&vp_id| state.viewports.get(&(client_id, vp_id)))
         && let Some((dw, dh)) = vp.destination
     {
         return (dw, dh);

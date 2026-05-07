@@ -48,6 +48,7 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     let surface_id = msg.message.object_id;
     debug!("wl_surface.destroy: surface_id={}", surface_id);
     state.destroy_surface(msg.client_id, surface_id);
+    state.dirty = true;
     let client = state.clients.get_or_create(msg.client_id);
     client.unregister(surface_id).await;
 }
@@ -113,7 +114,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             let new_buffer = surface.pending.buffer_id.take();
             surface.pending.buffer_attached = false;
             if let Some(old_buffer) = surface.buffer_id
-                && surface.buffer_id != new_buffer
+                && new_buffer != Some(old_buffer)
             {
                 state
                     .buffers_pending_release
@@ -135,6 +136,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         // Clear pending damage
         surface.pending.damage.clear();
 
+        state.dirty = true;
         debug!(
             "wl_surface.commit: surface_id={} buffer={:?}",
             surface_id, surface.buffer_id
@@ -142,15 +144,14 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     }
 
     // Apply pending viewport state
-    for vp in state.viewports.values_mut() {
-        if vp.surface_id == surface_id && vp.client_id == client_id {
+    if let Some(&vp_id) = state.surface_viewport.get(&(client_id, surface_id)) {
+        if let Some(vp) = state.viewports.get_mut(&(client_id, vp_id)) {
             if let Some(src) = vp.pending_source.take() {
                 vp.source = src;
             }
             if let Some(dst) = vp.pending_destination.take() {
                 vp.destination = dst;
             }
-            break;
         }
     }
 }

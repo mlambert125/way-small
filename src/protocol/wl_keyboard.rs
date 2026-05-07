@@ -43,24 +43,30 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-/// Generate the default XKB keymap string.
-fn generate_keymap() -> Option<String> {
-    let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-    let keymap = xkbcommon::xkb::Keymap::new_from_names(
-        &context,
-        "",
-        "",
-        "",
-        "",
-        None,
-        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )?;
-    Some(keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1))
+/// Cached XKB keymap string (generated once, reused for every client).
+static KEYMAP_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn get_keymap() -> Option<&'static str> {
+    let s = KEYMAP_CACHE.get_or_init(|| {
+        let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        xkbcommon::xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .map(|km| km.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1))
+        .unwrap_or_default()
+    });
+    if s.is_empty() { None } else { Some(s.as_str()) }
 }
 
 /// Send the XKB keymap to a client's keyboard object via an FD.
 pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32) {
-    let Some(keymap_str) = generate_keymap() else {
+    let Some(keymap_str) = get_keymap() else {
         tracing::warn!("Failed to create default xkb keymap");
         return;
     };
@@ -95,7 +101,10 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
     };
 
     let client = state.clients.get_or_create(client_id);
-    let _ = client.send(msg).await;
+    if client.send(msg).await.is_err() {
+        unsafe { libc::close(fd) };
+        return;
+    }
 
     // Send repeat_info (version 4+): rate=25 keys/sec, delay=600ms
     if client.version(keyboard_id) >= 4 {
@@ -114,14 +123,25 @@ pub async fn send_enter(
     surface_id: u32,
 ) {
     let serial = next_serial();
-    // keys array is empty (no keys currently pressed)
+    // Build wl_array of currently pressed evdev keycodes
+    let keys_data: Vec<u8> = state
+        .pressed_keys
+        .iter()
+        .flat_map(|k| k.to_le_bytes())
+        .collect();
     let args = ArgWriter::new()
         .u32(serial)
         .u32(surface_id)
-        .u32(0) // wl_array length = 0
+        .u32(keys_data.len() as u32)
         .build();
+    // Append raw key array after the wl_array length
+    let mut full_args = args;
+    full_args.extend_from_slice(&keys_data);
+    // Pad to 4-byte boundary
+    let padding = (4 - (keys_data.len() % 4)) % 4;
+    full_args.extend(std::iter::repeat_n(0u8, padding));
     let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(keyboard_id, ENTER, args)).await;
+    let _ = client.send(message(keyboard_id, ENTER, full_args)).await;
 }
 
 /// Send wl_keyboard.leave to a client's keyboard object.

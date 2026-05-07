@@ -102,4 +102,8 @@ impl Clients {
     pub fn remove(&mut self, client_id: u32) {
         self.states.remove(&client_id);
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u32, &ClientState)> {
+        self.states.iter()
+    }
 }

@@ -3,7 +3,7 @@
 //! CompositorState holds everything shared across all clients: the client
 //! collection, shm pools, buffers, surfaces, and (eventually) outputs, etc.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 
 use super::client::Clients;
@@ -214,16 +214,22 @@ pub struct CompositorState {
     pub focused_surface: Option<ClientObjectId>,
     pub cursor_x: f64,
     pub cursor_y: f64,
+    /// Currently pressed evdev keycodes (for wl_keyboard.enter keys array).
+    pub pressed_keys: HashSet<u32>,
     /// Maps wl_subsurface (client_id, object_id) -> the wl_surface object id it controls.
     pub subsurface_map: HashMap<ClientObjectId, u32>,
     /// wp_viewport objects keyed by (client_id, viewport_object_id).
     pub viewports: HashMap<ClientObjectId, ViewportState>,
+    /// Reverse map: (client_id, surface_id) -> viewport_object_id.
+    pub surface_viewport: HashMap<ClientObjectId, u32>,
     /// Buffers to release on the next render (old buffers replaced by commit).
     pub buffers_pending_release: Vec<ClientObjectId>,
     /// Next position for cascading toplevel placement.
     pub next_toplevel_position: (i32, i32),
     /// Toplevel surface draw order, bottom to top.
     pub surface_stack: Vec<ClientObjectId>,
+    /// Whether visual state has changed and a re-render is needed.
+    pub dirty: bool,
 }
 
 impl CompositorState {
@@ -245,11 +251,14 @@ impl CompositorState {
             focused_surface: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
+            pressed_keys: HashSet::new(),
             subsurface_map: HashMap::new(),
             viewports: HashMap::new(),
+            surface_viewport: HashMap::new(),
             buffers_pending_release: Vec::new(),
             next_toplevel_position: (50, 50),
             surface_stack: Vec::new(),
+            dirty: true,
         }
     }
 
@@ -421,6 +430,7 @@ impl CompositorState {
             let surface_key = (client_id, wl_surface_id);
             self.surface_stack.retain(|k| *k != surface_key);
             self.surface_stack.push(surface_key);
+            self.dirty = true;
         }
     }
 
@@ -433,6 +443,7 @@ impl CompositorState {
                 if self.focused_surface == Some(surface_key) {
                     self.focused_surface = None;
                 }
+                self.dirty = true;
             }
         }
     }
@@ -496,10 +507,14 @@ impl CompositorState {
                 pending_destination: None,
             },
         );
+        self.surface_viewport
+            .insert((client_id, surface_id), viewport_id);
     }
 
     pub fn destroy_viewport(&mut self, client_id: u32, viewport_id: u32) {
-        self.viewports.remove(&(client_id, viewport_id));
+        if let Some(vp) = self.viewports.remove(&(client_id, viewport_id)) {
+            self.surface_viewport.remove(&(client_id, vp.surface_id));
+        }
     }
 
     /// Remove all pools, buffers, and surfaces belonging to a disconnecting client.
@@ -521,10 +536,13 @@ impl CompositorState {
         self.xdg_surfaces.retain(|_, s| s.client_id != client_id);
         self.xdg_positioners.retain(|_, p| p.client_id != client_id);
         self.viewports.retain(|_, v| v.client_id != client_id);
+        self.surface_viewport.retain(|(cid, _), _| *cid != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
         self.subsurface_map.retain(|(cid, _), _| *cid != client_id);
         self.surface_stack.retain(|(cid, _)| *cid != client_id);
+        self.buffers_pending_release
+            .retain(|(cid, _)| *cid != client_id);
         // Clear focus if it pointed to a surface owned by this client
         if let Some((cid, _)) = self.focused_surface
             && cid == client_id

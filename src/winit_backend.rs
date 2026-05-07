@@ -123,9 +123,9 @@ impl ApplicationHandler<UserEvent> for App {
 
             // Present initial dark background
             let initial = RenderFrame {
-                pixels: vec![BACKGROUND_COLOR; 800 * 600],
-                width: 800,
-                height: 600,
+                pixels: vec![BACKGROUND_COLOR; (size.width * size.height) as usize],
+                width: size.width,
+                height: size.height,
             };
             self.present_frame(&initial);
         }
