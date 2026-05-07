@@ -12,7 +12,7 @@ const START_DRAG: u16 = 0;
 const SET_SELECTION: u16 = 1;
 const RELEASE: u16 = 2;
 
-pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         START_DRAG => {
             // Drag-and-drop not implemented yet
@@ -22,7 +22,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         }
         RELEASE => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         op => {
             tracing::warn!("wl_data_device: unhandled opcode {}", op);

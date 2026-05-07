@@ -24,7 +24,7 @@ pub const CONFIGURE: u16 = 0;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         GET_TOPLEVEL => handle_get_toplevel(state, msg).await,
         GET_POPUP => handle_get_popup(state, msg).await,
         SET_WINDOW_GEOMETRY => handle_set_window_geometry(state, msg),
@@ -35,12 +35,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let xdg_surface_id = msg.message.object_id;
     debug!("xdg_surface.destroy: xdg_surface_id={}", xdg_surface_id);
     state.destroy_xdg_surface(msg.client_id, xdg_surface_id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(xdg_surface_id);
+    client.unregister(xdg_surface_id).await;
 }
 
 async fn handle_get_toplevel(
@@ -76,45 +76,13 @@ async fn handle_get_toplevel(
     let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
 
-    // Take focus: send leave to old surface, enter to new
+    // Take focus on the new toplevel
     let wl_surface_id = state
         .xdg_surfaces
         .get(&(client_id, xdg_surface_id))
         .map(|s| s.wl_surface_id);
     if let Some(wl_surface_id) = wl_surface_id {
-        let new_key = (client_id, wl_surface_id);
-        if state.focused_surface != Some(new_key) {
-            if let Some(old_key) = state.focused_surface {
-                let old_client = old_key.0;
-                let old_surface = old_key.1;
-                for ptr in state.pointers.clone() {
-                    if ptr.client_id == old_client {
-                        super::wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_surface).await;
-                        super::wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
-                    }
-                }
-                for kb in state.keyboards.clone() {
-                    if kb.client_id == old_client {
-                        super::wl_keyboard::send_leave(state, kb.client_id, kb.object_id, old_surface).await;
-                    }
-                }
-            }
-
-            state.focused_surface = Some(new_key);
-            let cx = state.cursor_x;
-            let cy = state.cursor_y;
-            for ptr in state.pointers.clone() {
-                if ptr.client_id == client_id {
-                    super::wl_pointer::send_enter(state, ptr.client_id, ptr.object_id, wl_surface_id, cx, cy).await;
-                    super::wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
-                }
-            }
-            for kb in state.keyboards.clone() {
-                if kb.client_id == client_id {
-                    super::wl_keyboard::send_enter(state, kb.client_id, kb.object_id, wl_surface_id).await;
-                }
-            }
-        }
+        crate::compositor::switch_focus(state, (client_id, wl_surface_id)).await;
     }
 }
 

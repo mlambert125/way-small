@@ -14,13 +14,13 @@ const DESTROY: u16 = 0;
 // Event opcodes (sent by compositor)
 pub const RELEASE: u16 = 0;
 
-pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
             let buffer_id = msg.message.object_id;
             state.destroy_buffer(msg.client_id, buffer_id);
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(buffer_id);
+            client.unregister(buffer_id).await;
         }
         op => {
             tracing::warn!("wl_buffer: unhandled opcode {}", op);

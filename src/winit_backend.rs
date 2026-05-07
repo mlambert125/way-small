@@ -21,7 +21,7 @@ use winit::{
 };
 use xkbcommon::xkb;
 
-use crate::backend::{BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame};
+use crate::backend::{BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame};
 
 enum UserEvent {
     Shutdown,
@@ -72,7 +72,7 @@ impl App {
                     // Fill remaining columns with background
                     if dst_w > src_w {
                         for x in src_w..dst_w {
-                            buffer[dst_start + x] = 0xff1a_1a2e;
+                            buffer[dst_start + x] = BACKGROUND_COLOR;
                         }
                     }
                 }
@@ -80,7 +80,7 @@ impl App {
                 for y in src_h..dst_h {
                     let dst_start = y * dst_w;
                     for x in 0..dst_w {
-                        buffer[dst_start + x] = 0xff1a_1a2e;
+                        buffer[dst_start + x] = BACKGROUND_COLOR;
                     }
                 }
 
@@ -123,7 +123,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             // Present initial dark background
             let initial = RenderFrame {
-                pixels: vec![0xff1a_1a2e; 800 * 600],
+                pixels: vec![BACKGROUND_COLOR; 800 * 600],
                 width: 800,
                 height: 600,
             };

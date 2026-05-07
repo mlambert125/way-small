@@ -22,7 +22,10 @@
       "Bash(grep:*)",
       "Bash(wc -l /home/mikel/projects/way-small/src/protocol/*.rs)",
       "Bash(find /home/mikel/projects/way-small -type f -not -path '*/.git/*' -exec wc -l {} +)",
-      "Bash(find /home/mikel/projects/way-small/src -type f -exec wc -l {} +)"
+      "Bash(find /home/mikel/projects/way-small/src -type f -exec wc -l {} +)",
+      "Bash(wc -l /home/mikel/projects/way-small/src/*.rs /home/mikel/projects/way-small/src/protocol/*.rs)",
+      "Bash(find /home/mikel/projects/way-small/src -name \"*.rs\" -type f -exec wc -l {} +)",
+      "Bash(cargo metadata:*)"
     ]
   }
 }

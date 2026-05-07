@@ -45,9 +45,14 @@ impl ClientState {
         self.object_versions.get(&id).copied().unwrap_or(1)
     }
 
-    pub fn unregister(&mut self, id: u32) {
+    pub async fn unregister(&mut self, id: u32) {
         self.objects.remove(&id);
         self.object_versions.remove(&id);
+        // Notify the client so it can recycle this object id.
+        let args = ArgWriter::new().u32(id).build();
+        let _ = self
+            .send(message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args))
+            .await;
     }
 
     /// Send a message to this client. Returns Ok(()) or logs a warning on failure.

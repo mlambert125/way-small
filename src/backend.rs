@@ -61,6 +61,9 @@ pub enum BackendMessage {
     FocusOut,
 }
 
+/// Default background color used by the renderer and backends.
+pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
+
 /// A composited frame ready for the backend to present.
 pub struct RenderFrame {
     pub pixels: Vec<u32>,

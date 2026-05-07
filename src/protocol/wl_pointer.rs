@@ -31,7 +31,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
             let pointer_id = msg.message.object_id;
             state.pointers.retain(|p| !(p.client_id == msg.client_id && p.object_id == pointer_id));
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(pointer_id);
+            client.unregister(pointer_id).await;
         }
         op => {
             tracing::warn!("wl_pointer: unhandled opcode {}", op);
@@ -130,8 +130,10 @@ pub async fn send_axis(
     let _ = client.send(message(pointer_id, AXIS, args)).await;
 }
 
-/// Send wl_pointer.frame to indicate end of a group of events.
+/// Send wl_pointer.frame to indicate end of a group of events (version 5+).
 pub async fn send_frame(state: &mut CompositorState, client_id: u32, pointer_id: u32) {
     let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, FRAME, Vec::new())).await;
+    if client.version(pointer_id) >= 5 {
+        let _ = client.send(message(pointer_id, FRAME, Vec::new())).await;
+    }
 }

@@ -14,14 +14,14 @@ const DESTROY: u16 = 2;
 const FINISH: u16 = 3;
 const SET_ACTIONS: u16 = 4;
 
-pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         ACCEPT | RECEIVE | FINISH | SET_ACTIONS => {
             // Not yet implemented
         }
         DESTROY => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         op => {
             tracing::warn!("wl_data_offer: unhandled opcode {}", op);

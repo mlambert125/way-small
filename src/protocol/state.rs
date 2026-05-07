@@ -12,11 +12,25 @@ use super::client::Clients;
 pub type ClientObjectId = (u32, u32);
 
 /// Tracked state for a wl_shm_pool.
-#[derive(Debug)]
 pub struct ShmPool {
     pub client_id: u32,
     pub fd: RawFd,
     pub size: u32,
+    /// Cached mmap pointer for the pool. May be null if mmap failed.
+    pub map_ptr: *mut libc::c_void,
+}
+
+// SAFETY: map_ptr is only accessed from the single compositor task.
+unsafe impl Send for ShmPool {}
+
+impl std::fmt::Debug for ShmPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmPool")
+            .field("client_id", &self.client_id)
+            .field("fd", &self.fd)
+            .field("size", &self.size)
+            .finish()
+    }
 }
 
 /// Tracked state for a wl_buffer backed by a shm pool.
@@ -35,6 +49,8 @@ pub struct ShmBuffer {
 /// Pending state for a surface, applied on commit.
 #[derive(Debug, Default, Clone)]
 pub struct SurfacePending {
+    /// Whether attach was called since the last commit.
+    pub buffer_attached: bool,
     pub buffer_id: Option<u32>,
     pub damage: Vec<(i32, i32, i32, i32)>,
     pub frame_callback: Option<u32>,
@@ -238,25 +254,64 @@ impl CompositorState {
     }
 
     pub fn register_shm_pool(&mut self, client_id: u32, pool_id: u32, fd: RawFd, size: u32) {
+        let map_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        let map_ptr = if map_ptr == libc::MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            map_ptr
+        };
         self.shm_pools.insert(
             (client_id, pool_id),
             ShmPool {
                 client_id,
                 fd,
                 size,
+                map_ptr,
             },
         );
     }
 
     pub fn destroy_shm_pool(&mut self, client_id: u32, pool_id: u32) {
         if let Some(pool) = self.shm_pools.remove(&(client_id, pool_id)) {
+            if !pool.map_ptr.is_null() {
+                unsafe { libc::munmap(pool.map_ptr, pool.size as usize) };
+            }
             unsafe { libc::close(pool.fd) };
         }
     }
 
     pub fn resize_shm_pool(&mut self, client_id: u32, pool_id: u32, new_size: u32) {
         if let Some(pool) = self.shm_pools.get_mut(&(client_id, pool_id)) {
+            // Unmap old mapping
+            if !pool.map_ptr.is_null() {
+                unsafe { libc::munmap(pool.map_ptr, pool.size as usize) };
+            }
             pool.size = new_size;
+            // Remap with new size
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    new_size as usize,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    pool.fd,
+                    0,
+                )
+            };
+            pool.map_ptr = if ptr == libc::MAP_FAILED {
+                std::ptr::null_mut()
+            } else {
+                ptr
+            };
         }
     }
 
@@ -370,7 +425,16 @@ impl CompositorState {
     }
 
     pub fn destroy_xdg_toplevel(&mut self, client_id: u32, toplevel_id: u32) {
-        self.xdg_toplevels.remove(&(client_id, toplevel_id));
+        if let Some(toplevel) = self.xdg_toplevels.remove(&(client_id, toplevel_id)) {
+            // Remove the associated wl_surface from the stack and clear focus
+            if let Some(xdg_surface) = self.xdg_surfaces.get(&(client_id, toplevel.xdg_surface_id)) {
+                let surface_key = (client_id, xdg_surface.wl_surface_id);
+                self.surface_stack.retain(|k| *k != surface_key);
+                if self.focused_surface == Some(surface_key) {
+                    self.focused_surface = None;
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

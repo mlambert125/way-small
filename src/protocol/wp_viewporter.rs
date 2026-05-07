@@ -21,7 +21,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     match msg.message.op_code {
         DESTROY => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         GET_VIEWPORT => handle_get_viewport(state, msg).await,
         op => {

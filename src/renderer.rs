@@ -6,11 +6,9 @@
 
 use tracing::debug;
 
-use crate::backend::RenderFrame;
+use crate::backend::{BACKGROUND_COLOR, RenderFrame};
 use crate::protocol;
 use crate::protocol::state::ClientObjectId;
-
-const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
 const BYTES_PER_PIXEL: u64 = 4;
 
 /// Composite all surfaces into a single framebuffer.
@@ -110,45 +108,27 @@ fn blit_surface_buffer(
         .values()
         .find(|v| v.client_id == client_id && v.surface_id == surface_key.1);
 
-    // Validate the fd is still valid and large enough
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(pool.fd, &mut stat) } != 0 {
-        debug!("Pool fd {} is invalid for surface {:?}", pool.fd, surface_key);
+    // Use the cached mmap pointer
+    let ptr = pool.map_ptr;
+    if ptr.is_null() {
+        debug!("Pool has no valid mapping for surface {:?}", surface_key);
         return;
     }
-    // The actual size of the entire pool file
-    let actual_size = stat.st_size as u64;
 
     // The size of the last row of the buffer (this can be smaller than stride*bytes_per_pixel as
     // the last row doesn't require padding)
     let last_row_size = shm_buffer.width as u64 * BYTES_PER_PIXEL;
 
-    // The end offset of the buffer data in the pool file. This must be <= actual_size
-    // or it would be reading past the end of the fd
+    // The end offset of the buffer data in the pool. This must be <= pool.size
+    // or it would be reading past the end of the mapping
     let buf_end = shm_buffer.offset as u64
         + (shm_buffer.height as u64 - 1) * shm_buffer.stride as u64
         + last_row_size;
-    if buf_end > actual_size {
+    if buf_end > pool.size as u64 {
         debug!(
-            "Buffer exceeds actual file size: end={} file_size={} pool_size={} surface={:?}",
-            buf_end, actual_size, pool.size, surface_key
+            "Buffer exceeds pool size: end={} pool_size={} surface={:?}",
+            buf_end, pool.size, surface_key
         );
-        return;
-    }
-
-    // mmap the pool file to read pixel data. We only need PROT_READ since we're not modifying it.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            pool.size as usize,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            pool.fd,
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        debug!("Failed to mmap pool for surface {:?}", surface_key);
         return;
     }
 
@@ -247,9 +227,6 @@ fn blit_surface_buffer(
         }
     }
 
-    unsafe {
-        libc::munmap(ptr, pool.size as usize);
-    }
 }
 
 // 12x19 arrow cursor bitmap. Each row is a string:

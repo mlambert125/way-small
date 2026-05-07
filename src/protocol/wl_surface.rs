@@ -27,7 +27,7 @@ const OFFSET: u16 = 10;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         ATTACH => handle_attach(state, msg),
         DAMAGE | DAMAGE_BUFFER => handle_damage(state, msg),
         FRAME => handle_frame(state, msg),
@@ -44,12 +44,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let surface_id = msg.message.object_id;
     debug!("wl_surface.destroy: surface_id={}", surface_id);
     state.destroy_surface(msg.client_id, surface_id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(surface_id);
+    client.unregister(surface_id).await;
 }
 
 fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
@@ -61,6 +61,7 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 
     let surface_id = msg.message.object_id;
     if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
+        surface.pending.buffer_attached = true;
         // buffer_id 0 means detach
         surface.pending.buffer_id = if buffer_id == 0 {
             None
@@ -108,8 +109,9 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 
     if let Some(surface) = state.surfaces.get_mut(&key) {
         // Apply pending buffer, releasing the old one if it changed
-        if surface.pending.buffer_id.is_some() {
+        if surface.pending.buffer_attached {
             let new_buffer = surface.pending.buffer_id.take();
+            surface.pending.buffer_attached = false;
             if let Some(old_buffer) = surface.buffer_id
                 && surface.buffer_id != new_buffer
             {

@@ -19,7 +19,7 @@ const GET_REGISTRY: u16 = 1;
 
 // Event opcodes
 pub const ERROR: u16 = 0;
-const DELETE_ID: u16 = 1;
+pub const DELETE_ID: u16 = 1;
 
 // wl_callback event opcodes
 const WL_CALLBACK_DONE: u16 = 0;
@@ -55,10 +55,7 @@ async fn handle_sync(state: &mut ClientState, msg: &WaylandProtocolMessageWithCl
         return;
     }
 
-    state.unregister(callback_id);
-
-    let args = ArgWriter::new().u32(callback_id).build();
-    let _ = state.send(message(OBJECT_ID, DELETE_ID, args)).await;
+    state.unregister(callback_id).await;
 }
 
 async fn handle_get_registry(state: &mut ClientState, msg: &WaylandProtocolMessageWithClientInfo) {

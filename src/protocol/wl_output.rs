@@ -26,7 +26,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     match msg.message.op_code {
         RELEASE => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         op => {
             tracing::warn!("wl_output: unhandled opcode {}", op);

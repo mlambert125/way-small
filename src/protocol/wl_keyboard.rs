@@ -4,6 +4,7 @@
 //! key, and modifiers events.
 
 use std::io::Write;
+use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
@@ -23,6 +24,7 @@ pub const ENTER: u16 = 1;
 pub const LEAVE: u16 = 2;
 pub const KEY: u16 = 3;
 pub const MODIFIERS: u16 = 4;
+pub const REPEAT_INFO: u16 = 5;
 
 // Keymap format
 const KEYMAP_FORMAT_XKB_V1: u32 = 1;
@@ -33,7 +35,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
             let keyboard_id = msg.message.object_id;
             state.keyboards.retain(|k| !(k.client_id == msg.client_id && k.object_id == keyboard_id));
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(keyboard_id);
+            client.unregister(keyboard_id).await;
         }
         op => {
             tracing::warn!("wl_keyboard: unhandled opcode {}", op);
@@ -94,6 +96,14 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
 
     let client = state.clients.get_or_create(client_id);
     let _ = client.send(msg).await;
+
+    // Send repeat_info (version 4+): rate=25 keys/sec, delay=600ms
+    if client.version(keyboard_id) >= 4 {
+        let args = ArgWriter::new().i32(25).i32(600).build();
+        let _ = client
+            .send(message(keyboard_id, REPEAT_INFO, args))
+            .await;
+    }
 }
 
 /// Send wl_keyboard.enter to a client's keyboard object.
@@ -169,5 +179,3 @@ pub async fn send_modifiers(
     let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(keyboard_id, MODIFIERS, args)).await;
 }
-
-use std::os::unix::io::FromRawFd;

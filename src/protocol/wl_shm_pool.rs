@@ -20,7 +20,7 @@ const RESIZE: u16 = 2;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         CREATE_BUFFER => handle_create_buffer(state, msg).await,
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         RESIZE => handle_resize(state, msg),
         op => {
             tracing::warn!("wl_shm_pool: unhandled opcode {}", op);
@@ -63,12 +63,12 @@ async fn handle_create_buffer(
     state.register_buffer(msg.client_id, buffer_id, msg.message.object_id, offset, width, height, stride, format);
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let pool_id = msg.message.object_id;
     debug!("wl_shm_pool.destroy: pool_id={}", pool_id);
     state.destroy_shm_pool(msg.client_id, pool_id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(pool_id);
+    client.unregister(pool_id).await;
 }
 
 fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {

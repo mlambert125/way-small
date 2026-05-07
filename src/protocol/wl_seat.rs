@@ -35,7 +35,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         }
         RELEASE => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         op => {
             tracing::warn!("wl_seat: unhandled opcode {}", op);
@@ -77,7 +77,8 @@ async fn handle_get_pointer(
     debug!("wl_seat.get_pointer: pointer_id={}", pointer_id);
 
     let client = state.clients.get_or_create(msg.client_id);
-    client.register(pointer_id, ObjectType::WlPointer);
+    let seat_version = client.version(msg.message.object_id);
+    client.register_with_version(pointer_id, ObjectType::WlPointer, seat_version);
     state.pointers.push(super::state::PointerBinding {
         client_id: msg.client_id,
         object_id: pointer_id,
@@ -100,7 +101,8 @@ async fn handle_get_keyboard(
     debug!("wl_seat.get_keyboard: keyboard_id={}", keyboard_id);
 
     let client = state.clients.get_or_create(msg.client_id);
-    client.register(keyboard_id, ObjectType::WlKeyboard);
+    let seat_version = client.version(msg.message.object_id);
+    client.register_with_version(keyboard_id, ObjectType::WlKeyboard, seat_version);
     state.keyboards.push(super::state::KeyboardBinding {
         client_id: msg.client_id,
         object_id: keyboard_id,

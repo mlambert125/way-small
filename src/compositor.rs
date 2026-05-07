@@ -66,22 +66,7 @@ pub async fn run_compositor(
 
                             // Focus the next surface down the stack
                             if was_focused && let Some(&new_key) = state.surface_stack.last() {
-                                state.focused_surface = Some(new_key);
-                                let new_client = new_key.0;
-                                let new_surface = new_key.1;
-                                let cx = state.cursor_x;
-                                let cy = state.cursor_y;
-                                for ptr in state.pointers.clone() {
-                                    if ptr.client_id == new_client {
-                                        wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
-                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                    }
-                                }
-                                for kb in state.keyboards.clone() {
-                                    if kb.client_id == new_client {
-                                        wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
-                                    }
-                                }
+                                switch_focus(&mut state, new_key).await;
                             }
                         }
                     }
@@ -118,7 +103,7 @@ pub async fn run_compositor(
                         let focused_client = state.focused_surface.map(|(cid, _)| cid);
                         for kb in state.keyboards.clone() {
                             if Some(kb.client_id) == focused_client {
-                                wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, keycode - 8, pressed).await;
+                                wl_keyboard::send_key(&mut state, kb.client_id, kb.object_id, time_ms, keycode.saturating_sub(8), pressed).await;
                                 wl_keyboard::send_modifiers(&mut state, kb.client_id, kb.object_id, mods_depressed, mods_latched, mods_locked, mods_group).await;
                             }
                         }
@@ -135,28 +120,19 @@ pub async fn run_compositor(
                         // Auto-focus the top surface if nothing is focused yet
                         if state.focused_surface.is_none() &&
                            let Some(&top_key) = state.surface_stack.last() &&
-                           let Some(surface) = state.surfaces.get(&top_key) {
-
-                            let client_id = surface.client_id;
-                            let surface_obj_id = top_key.1;
-                            state.focused_surface = Some(top_key);
-                            for ptr in state.pointers.clone() {
-                                if ptr.client_id == client_id {
-                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, surface_obj_id, x, y).await;
-                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                }
-                            }
-                            for kb in state.keyboards.clone() {
-                                if kb.client_id == client_id {
-                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, surface_obj_id).await;
-                                }
-                            }
+                           state.surfaces.contains_key(&top_key) {
+                            switch_focus(&mut state, top_key).await;
                         }
 
-                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
+                        let (focused_client, local_x, local_y) = if let Some(focused_key) = state.focused_surface {
+                            let (sx, sy) = state.surfaces.get(&focused_key).map(|s| s.position).unwrap_or((0, 0));
+                            (Some(focused_key.0), x - sx as f64, y - sy as f64)
+                        } else {
+                            (None, x, y)
+                        };
                         for ptr in state.pointers.clone() {
                             if Some(ptr.client_id) == focused_client {
-                                wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, x, y).await;
+                                wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, local_x, local_y).await;
                                 wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
                             }
                         }
@@ -180,38 +156,7 @@ pub async fn run_compositor(
                             state.surface_stack.push(clicked);
                             dirty = true;
 
-                            // Send leave events to old focused surface
-                            if let Some(old_key) = state.focused_surface {
-                                let old_client = old_key.0;
-                                let old_surface = old_key.1;
-                                for ptr in state.pointers.clone() {
-                                    if ptr.client_id == old_client {
-                                        wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_surface).await;
-                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                    }
-                                }
-                                for kb in state.keyboards.clone() {
-                                    if kb.client_id == old_client {
-                                        wl_keyboard::send_leave(&mut state, kb.client_id, kb.object_id, old_surface).await;
-                                    }
-                                }
-                            }
-
-                            // Send enter events to new focused surface
-                            let new_client = clicked.0;
-                            let new_surface = clicked.1;
-                            state.focused_surface = Some(clicked);
-                            for ptr in state.pointers.clone() {
-                                if ptr.client_id == new_client {
-                                    wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, new_surface, cx, cy).await;
-                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
-                                }
-                            }
-                            for kb in state.keyboards.clone() {
-                                if kb.client_id == new_client {
-                                    wl_keyboard::send_enter(&mut state, kb.client_id, kb.object_id, new_surface).await;
-                                }
-                            }
+                            switch_focus(&mut state, clicked).await;
                         }
 
                         // Send button event to focused client
@@ -303,7 +248,7 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
         let client = state.clients.get_or_create(client_id);
         let args = ArgWriter::new().u32(timestamp_ms).build();
         let _ = client.send(message(callback_id, 0, args)).await;
-        client.unregister(callback_id);
+        client.unregister(callback_id).await;
     }
 
     // Fire wp_presentation_feedback.presented events
@@ -322,7 +267,10 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
         let refresh_nsec = state
             .output
             .as_ref()
-            .map(|o| 1_000_000_000u32 / (o.refresh_mhz / 1000))
+            .and_then(|o| {
+                let hz = o.refresh_mhz / 1000;
+                if hz > 0 { Some(1_000_000_000u32 / hz) } else { None }
+            })
             .unwrap_or(16_666_666); // fallback ~60Hz
 
         // wp_presentation_feedback.presented event (opcode 0)
@@ -340,7 +288,7 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
                 .build();
             let client = state.clients.get_or_create(client_id);
             let _ = client.send(message(feedback_id, 0, args)).await;
-            client.unregister(feedback_id);
+            client.unregister(feedback_id).await;
         }
     }
 
@@ -348,6 +296,55 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
     for (client_id, buffer_id) in buffers_to_release {
         let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(buffer_id, 0, Vec::new())).await;
+    }
+}
+
+/// Send leave events to the old focused surface (if any) and enter events to
+/// the new one, then update `state.focused_surface`. Coordinates are converted
+/// to surface-local automatically.
+pub async fn switch_focus(
+    state: &mut protocol::CompositorState,
+    new_key: ClientObjectId,
+) {
+    let old_key = state.focused_surface;
+    if old_key == Some(new_key) {
+        return;
+    }
+
+    // Send leave events to old focused surface
+    if let Some(old_key) = old_key {
+        let old_client = old_key.0;
+        let old_surface = old_key.1;
+        for ptr in state.pointers.clone() {
+            if ptr.client_id == old_client {
+                wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_surface).await;
+                wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
+            }
+        }
+        for kb in state.keyboards.clone() {
+            if kb.client_id == old_client {
+                wl_keyboard::send_leave(state, kb.client_id, kb.object_id, old_surface).await;
+            }
+        }
+    }
+
+    // Send enter events to new focused surface
+    state.focused_surface = Some(new_key);
+    let new_client = new_key.0;
+    let new_surface = new_key.1;
+    let (sx, sy) = state.surfaces.get(&new_key).map(|s| s.position).unwrap_or((0, 0));
+    let local_x = state.cursor_x - sx as f64;
+    let local_y = state.cursor_y - sy as f64;
+    for ptr in state.pointers.clone() {
+        if ptr.client_id == new_client {
+            wl_pointer::send_enter(state, ptr.client_id, ptr.object_id, new_surface, local_x, local_y).await;
+            wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
+        }
+    }
+    for kb in state.keyboards.clone() {
+        if kb.client_id == new_client {
+            wl_keyboard::send_enter(state, kb.client_id, kb.object_id, new_surface).await;
+        }
     }
 }
 

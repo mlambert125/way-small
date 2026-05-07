@@ -23,7 +23,7 @@ const POPUP_DONE: u16 = 1;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         GRAB => handle_grab(msg),
         REPOSITION => {
             debug!("xdg_popup.reposition: not yet implemented");
@@ -34,7 +34,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let popup_id = msg.message.object_id;
     let client_id = msg.client_id;
     debug!("xdg_popup.destroy: popup_id={}", popup_id);
@@ -61,7 +61,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 
     state.destroy_xdg_popup(client_id, popup_id);
     let client = state.clients.get_or_create(client_id);
-    client.unregister(popup_id);
+    client.unregister(popup_id).await;
 }
 
 fn handle_grab(msg: &WaylandProtocolMessageWithClientInfo) {

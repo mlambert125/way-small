@@ -24,7 +24,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     match msg.message.op_code {
         DESTROY => {
             let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id);
+            client.unregister(msg.message.object_id).await;
         }
         CREATE_POSITIONER => handle_create_positioner(state, msg).await,
         GET_XDG_SURFACE => handle_get_xdg_surface(state, msg).await,

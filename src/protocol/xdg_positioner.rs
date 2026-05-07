@@ -20,7 +20,7 @@ const SET_OFFSET: u16 = 6;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         SET_SIZE => handle_set_size(state, msg),
         SET_ANCHOR_RECT => handle_set_anchor_rect(state, msg),
         SET_ANCHOR => handle_set_anchor(state, msg),
@@ -33,11 +33,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let id = msg.message.object_id;
     state.destroy_xdg_positioner(msg.client_id, id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(id);
+    client.unregister(id).await;
 }
 
 fn handle_set_size(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {

@@ -34,7 +34,7 @@ const CLOSE: u16 = 1;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         SET_TITLE => handle_set_title(state, msg),
         SET_APP_ID => handle_set_app_id(state, msg),
         SET_PARENT | SHOW_WINDOW_MENU | MOVE | RESIZE => {
@@ -52,12 +52,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.destroy: toplevel_id={}", toplevel_id);
     state.destroy_xdg_toplevel(msg.client_id, toplevel_id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(toplevel_id);
+    client.unregister(toplevel_id).await;
 }
 
 fn handle_set_title(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {

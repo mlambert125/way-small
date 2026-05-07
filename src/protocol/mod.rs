@@ -187,19 +187,19 @@ pub async fn handle_message(
             wl_subcompositor::handle(state, message).await;
         }
         Some(ObjectType::WlSubsurface) => {
-            wl_subsurface::handle(state, message);
+            wl_subsurface::handle(state, message).await;
         }
         Some(ObjectType::WlDataDeviceManager) => {
             wl_data_device_manager::handle(state, message).await;
         }
         Some(ObjectType::WlDataDevice) => {
-            wl_data_device::handle(state, message);
+            wl_data_device::handle(state, message).await;
         }
         Some(ObjectType::WlDataSource) => {
-            wl_data_source::handle(state, message);
+            wl_data_source::handle(state, message).await;
         }
         Some(ObjectType::WlDataOffer) => {
-            wl_data_offer::handle(state, message);
+            wl_data_offer::handle(state, message).await;
         }
         Some(ObjectType::WlSeat) => {
             wl_seat::handle(state, message).await;
@@ -232,7 +232,7 @@ pub async fn handle_message(
             xdg_positioner::handle(state, message).await;
         }
         Some(ObjectType::WlBuffer) => {
-            wl_buffer::handle(state, message);
+            wl_buffer::handle(state, message).await;
         }
         Some(ObjectType::WpPresentation) => {
             wp_presentation::handle(state, message).await;
@@ -253,6 +253,11 @@ pub async fn handle_message(
                 object_id,
                 message.message.op_code,
             );
+            // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
+            let client = state.clients.get_or_create(message.client_id);
+            client
+                .send_error(object_id, 0, &format!("invalid object {}", object_id))
+                .await;
         }
     }
 }

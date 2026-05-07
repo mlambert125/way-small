@@ -18,7 +18,7 @@ const SET_DESTINATION: u16 = 2;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg),
+        DESTROY => handle_destroy(state, msg).await,
         SET_SOURCE => handle_set_source(state, msg),
         SET_DESTINATION => handle_set_destination(state, msg),
         op => {
@@ -27,12 +27,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let viewport_id = msg.message.object_id;
     debug!("wp_viewport.destroy: viewport_id={}", viewport_id);
     state.destroy_viewport(msg.client_id, viewport_id);
     let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(viewport_id);
+    client.unregister(viewport_id).await;
 }
 
 fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
