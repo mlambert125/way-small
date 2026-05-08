@@ -10,7 +10,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
 use super::state::CompositorState;
-use super::wire::ArgReader;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -49,8 +49,9 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     debug!("wl_surface.destroy: surface_id={}", surface_id);
     state.destroy_surface(msg.client_id, surface_id);
     state.dirty = true;
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(surface_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(surface_id).await;
+    }
 }
 
 fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
@@ -87,6 +88,12 @@ fn handle_damage(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 }
 
 fn handle_frame(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     // frame args: new_id callback
     let Some(callback_id) = args.new_id() else {
@@ -95,7 +102,6 @@ fn handle_frame(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCli
 
     let surface_id = msg.message.object_id;
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(callback_id, ObjectType::WlCallback);
 
     if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {

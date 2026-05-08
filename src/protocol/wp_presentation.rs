@@ -11,7 +11,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
 use super::state::CompositorState;
-use super::wire::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // wp_presentation request opcodes
 const DESTROY: u16 = 0;
@@ -23,8 +23,11 @@ const CLOCK_ID: u16 = 0;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         FEEDBACK => handle_feedback(state, msg),
         op => {
@@ -33,15 +36,13 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-/// Send the clock_id event to tell the client which clock we use.
-pub async fn send_clock_id(state: &mut CompositorState, client_id: u32, object_id: u32) {
-    // CLOCK_MONOTONIC = 1 on Linux
-    let args = ArgWriter::new().u32(1).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(object_id, CLOCK_ID, args)).await;
-}
-
 fn handle_feedback(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(surface_id), Some(callback_id)) = (args.u32(), args.new_id()) else {
         return;
@@ -52,11 +53,21 @@ fn handle_feedback(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
         surface_id, callback_id
     );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(callback_id, ObjectType::WpPresentationFeedback);
 
     // Store as pending; moved to committed list on wl_surface.commit
     if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
         surface.pending.presentation_feedbacks.push(callback_id);
+    }
+}
+
+/// Send the clock_id event to tell the client which clock we use.
+pub async fn send_clock_id(state: &mut CompositorState, client_id: u32, object_id: u32) {
+    // CLOCK_MONOTONIC = 1 on Linux
+    let args = ArgWriter::new().u32(1).build();
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(object_id, CLOCK_ID, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
     }
 }

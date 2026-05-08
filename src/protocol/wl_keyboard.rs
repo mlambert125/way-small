@@ -5,15 +5,13 @@
 
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
-use std::sync::{Arc, Mutex};
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::next_serial;
 use super::state::CompositorState;
-use super::wire::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, message};
 use crate::wayland_socket::WaylandProtocolMessage;
-use std::collections::VecDeque;
 
 // Request opcodes
 const RELEASE: u16 = 0;
@@ -29,22 +27,25 @@ pub const REPEAT_INFO: u16 = 5;
 // Keymap format
 const KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
+/// Cached XKB keymap string (generated once, reused for every client).
+static KEYMAP_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         RELEASE => {
             let keyboard_id = msg.message.object_id;
-            state.keyboards.retain(|k| !(k.client_id == msg.client_id && k.object_id == keyboard_id));
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(keyboard_id).await;
+            state
+                .keyboards
+                .retain(|k| !(k.client_id == msg.client_id && k.object_id == keyboard_id));
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(keyboard_id).await;
+            }
         }
         op => {
             tracing::warn!("wl_keyboard: unhandled opcode {}", op);
         }
     }
 }
-
-/// Cached XKB keymap string (generated once, reused for every client).
-static KEYMAP_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn get_keymap() -> Option<&'static str> {
     let s = KEYMAP_CACHE.get_or_init(|| {
@@ -66,6 +67,13 @@ fn get_keymap() -> Option<&'static str> {
 
 /// Send the XKB keymap to a client's keyboard object via an FD.
 pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32) {
+    let client = state.clients.get(client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let Some(keymap_str) = get_keymap() else {
         tracing::warn!("Failed to create default xkb keymap");
         return;
@@ -97,10 +105,9 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
         object_id: keyboard_id,
         op_code: KEYMAP,
         args,
-        fd_queue: Arc::new(Mutex::new(VecDeque::from([fd]))),
+        fds: vec![fd],
     };
 
-    let client = state.clients.get_or_create(client_id);
     if client.send(msg).await.is_err() {
         unsafe { libc::close(fd) };
         return;
@@ -109,9 +116,7 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
     // Send repeat_info (version 4+): rate=25 keys/sec, delay=600ms
     if client.version(keyboard_id) >= 4 {
         let args = ArgWriter::new().i32(25).i32(600).build();
-        let _ = client
-            .send(message(keyboard_id, REPEAT_INFO, args))
-            .await;
+        let _ = client.send(message(keyboard_id, REPEAT_INFO, args)).await;
     }
 }
 
@@ -140,8 +145,11 @@ pub async fn send_enter(
     // Pad to 4-byte boundary
     let padding = (4 - (keys_data.len() % 4)) % 4;
     full_args.extend(std::iter::repeat_n(0u8, padding));
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(keyboard_id, ENTER, full_args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(keyboard_id, ENTER, full_args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_keyboard.leave to a client's keyboard object.
@@ -153,8 +161,11 @@ pub async fn send_leave(
 ) {
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).u32(surface_id).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(keyboard_id, LEAVE, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(keyboard_id, LEAVE, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_keyboard.key to a client's keyboard object.
@@ -174,8 +185,11 @@ pub async fn send_key(
         .u32(key)
         .u32(key_state)
         .build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(keyboard_id, KEY, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(keyboard_id, KEY, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_keyboard.modifiers to a client's keyboard object.
@@ -196,6 +210,9 @@ pub async fn send_modifiers(
         .u32(mods_locked)
         .u32(group)
         .build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(keyboard_id, MODIFIERS, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(keyboard_id, MODIFIERS, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }

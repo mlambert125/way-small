@@ -7,7 +7,7 @@
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
-use super::wire::ArgReader;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -36,8 +36,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let id = msg.message.object_id;
     state.destroy_xdg_positioner(msg.client_id, id);
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(id).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+    }
 }
 
 fn handle_set_size(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {

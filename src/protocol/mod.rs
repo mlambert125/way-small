@@ -6,7 +6,7 @@
 
 pub mod client;
 pub mod state;
-pub mod wire;
+pub mod wire_utils;
 pub mod wl_buffer;
 pub mod wl_callback;
 pub mod wl_compositor;
@@ -44,7 +44,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 // Re-export key types for convenience
 pub use client::ClientState;
 pub use state::CompositorState;
-pub use wire::{ArgReader, ArgWriter, message};
+pub use wire_utils::{ArgReader, ArgWriter, message};
 
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 
@@ -141,25 +141,19 @@ pub async fn handle_message(
     message: &WaylandProtocolMessageWithClientInfo,
 ) {
     let object_id = message.message.object_id;
+    let client_id = message.client_id;
+    let client = state.clients.get(client_id);
 
-    // Ensure the client state has a sender (set on first message)
-    {
-        let client = state.clients.get_or_create(message.client_id);
-        if client.sender.is_none() {
-            client.sender = Some(message.socket_sender.clone());
-        }
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", message.client_id);
+        return;
     }
+    let client = client.unwrap();
 
-    let obj_type = state
-        .clients
-        .get_or_create(message.client_id)
-        .objects
-        .get(&object_id)
-        .copied();
+    let obj_type = client.objects.get(&object_id).copied();
 
     match obj_type {
         Some(ObjectType::WlDisplay) => {
-            let client = state.clients.get_or_create(message.client_id);
             wl_display::handle(client, message).await;
         }
         Some(ObjectType::WlRegistry) => {
@@ -254,7 +248,6 @@ pub async fn handle_message(
                 message.message.op_code,
             );
             // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
-            let client = state.clients.get_or_create(message.client_id);
             client
                 .send_error(object_id, 0, &format!("invalid object {}", object_id))
                 .await;

@@ -4,11 +4,6 @@
 //! protocol: ArgWriter (builder for outgoing message args), ArgReader
 //! (cursor-based parser for incoming args), and the message() constructor.
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
-
 use crate::wayland_socket::WaylandProtocolMessage;
 
 /// Read a u32 from a byte slice at the given offset.
@@ -135,6 +130,6 @@ pub fn message(object_id: u32, op_code: u16, args: Vec<u8>) -> WaylandProtocolMe
         object_id,
         op_code,
         args,
-        fd_queue: Arc::new(Mutex::new(VecDeque::new())),
+        fds: Vec::new(),
     }
 }

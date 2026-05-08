@@ -8,7 +8,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::next_serial;
 use super::state::CompositorState;
-use super::wire::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, message};
 
 // Request opcodes
 const SET_CURSOR: u16 = 0;
@@ -29,9 +29,14 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         }
         RELEASE => {
             let pointer_id = msg.message.object_id;
-            state.pointers.retain(|p| !(p.client_id == msg.client_id && p.object_id == pointer_id));
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(pointer_id).await;
+            state
+                .pointers
+                .retain(|p| !(p.client_id == msg.client_id && p.object_id == pointer_id));
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(pointer_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         op => {
             tracing::warn!("wl_pointer: unhandled opcode {}", op);
@@ -64,8 +69,11 @@ pub async fn send_enter(
         .fixed(x)
         .fixed(y)
         .build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, ENTER, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, ENTER, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_pointer.leave to a client's pointer object.
@@ -77,8 +85,11 @@ pub async fn send_leave(
 ) {
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).u32(surface_id).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, LEAVE, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, LEAVE, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_pointer.motion to a client's pointer object.
@@ -91,8 +102,11 @@ pub async fn send_motion(
     y: f64,
 ) {
     let args = ArgWriter::new().u32(time_ms).fixed(x).fixed(y).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, MOTION, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, MOTION, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_pointer.button to a client's pointer object.
@@ -112,8 +126,11 @@ pub async fn send_button(
         .u32(button)
         .u32(btn_state)
         .build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, BUTTON, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, BUTTON, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send wl_pointer.axis to a client's pointer object.
@@ -126,14 +143,16 @@ pub async fn send_axis(
     value: f64,
 ) {
     let args = ArgWriter::new().u32(time_ms).u32(axis).fixed(value).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(pointer_id, AXIS, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, AXIS, args)).await;
+    }
 }
 
 /// Send wl_pointer.frame to indicate end of a group of events (version 5+).
 pub async fn send_frame(state: &mut CompositorState, client_id: u32, pointer_id: u32) {
-    let client = state.clients.get_or_create(client_id);
-    if client.version(pointer_id) >= 5 {
+    if let Some(client) = state.clients.get(client_id)
+        && client.version(pointer_id) >= 5
+    {
         let _ = client.send(message(pointer_id, FRAME, Vec::new())).await;
     }
 }

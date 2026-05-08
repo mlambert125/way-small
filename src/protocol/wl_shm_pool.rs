@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::wire::ArgReader;
-use super::state::CompositorState;
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const CREATE_BUFFER: u16 = 0;
@@ -32,6 +32,13 @@ async fn handle_create_buffer(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     // create_buffer args: new_id, int32 offset, int32 width, int32 height, int32 stride, uint32 format
     let (Some(buffer_id), Some(offset), Some(width), Some(height), Some(stride), Some(format)) = (
@@ -42,7 +49,6 @@ async fn handle_create_buffer(
         args.i32(),
         args.u32(),
     ) else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
                 msg.message.object_id,
@@ -58,17 +64,28 @@ async fn handle_create_buffer(
         buffer_id, offset, width, height, stride, format
     );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(buffer_id, ObjectType::WlBuffer);
-    state.register_buffer(msg.client_id, buffer_id, msg.message.object_id, offset, width, height, stride, format);
+    state.register_buffer(
+        msg.client_id,
+        buffer_id,
+        msg.message.object_id,
+        offset,
+        width,
+        height,
+        stride,
+        format,
+    );
 }
 
 async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let pool_id = msg.message.object_id;
     debug!("wl_shm_pool.destroy: pool_id={}", pool_id);
     state.destroy_shm_pool(msg.client_id, pool_id);
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(pool_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(pool_id).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+    }
 }
 
 fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
@@ -77,6 +94,9 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         return;
     };
     let pool_id = msg.message.object_id;
-    debug!("wl_shm_pool.resize: pool_id={} new_size={}", pool_id, new_size);
+    debug!(
+        "wl_shm_pool.resize: pool_id={} new_size={}",
+        pool_id, new_size
+    );
     state.resize_shm_pool(msg.client_id, pool_id, new_size as u32);
 }

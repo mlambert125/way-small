@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
-use super::wire::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -60,8 +60,9 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     }
 
     state.destroy_xdg_popup(client_id, popup_id);
-    let client = state.clients.get_or_create(client_id);
-    client.unregister(popup_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(popup_id).await;
+    }
 }
 
 fn handle_grab(msg: &WaylandProtocolMessageWithClientInfo) {
@@ -89,13 +90,19 @@ pub async fn send_configure(
         .i32(width)
         .i32(height)
         .build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(popup_id, CONFIGURE, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(popup_id, CONFIGURE, args)).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }
 
 /// Send xdg_popup.popup_done to dismiss the popup.
 #[allow(dead_code)]
 pub async fn send_popup_done(state: &mut CompositorState, client_id: u32, popup_id: u32) {
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(popup_id, POPUP_DONE, Vec::new())).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(popup_id, POPUP_DONE, Vec::new())).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", client_id);
+    }
 }

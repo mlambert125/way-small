@@ -15,7 +15,7 @@ use tracing::{debug, info};
 use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol;
 use crate::protocol::state::{ClientObjectId, OutputState};
-use crate::protocol::wire::{ArgWriter, message};
+use crate::protocol::wire_utils::{ArgWriter, message};
 use crate::protocol::{wl_keyboard, wl_pointer, xdg_toplevel};
 use crate::renderer;
 use crate::wayland_socket::WaylandSocketMessage;
@@ -48,6 +48,10 @@ pub async fn run_compositor(
                 }
                 for message in pending {
                     match message {
+                        WaylandSocketMessage::NewClient(msg)  => {
+                            info!("New client connected: {}", msg.client_id);
+                            state.clients.create(msg.client_id, msg.socket_sender, msg.fd_queue);
+                        }
                         WaylandSocketMessage::Message(msg) => {
                             debug!(
                                 "client {}: object_id={} op_code={}",
@@ -293,10 +297,16 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
 
     // Fire wl_callback.done events with timestamp
     for (client_id, callback_id) in callbacks {
-        let client = state.clients.get_or_create(client_id);
-        let args = ArgWriter::new().u32(timestamp_ms).build();
-        let _ = client.send(message(callback_id, 0, args)).await;
-        client.unregister(callback_id).await;
+        if let Some(client) = state.clients.get(client_id) {
+            let args = ArgWriter::new().u32(timestamp_ms).build();
+            let _ = client.send(message(callback_id, 0, args)).await;
+            client.unregister(callback_id).await;
+        } else {
+            debug!(
+                "Client {} disappeared before frame callback could be fired",
+                client_id
+            );
+        }
     }
 
     // Fire wp_presentation_feedback.presented events
@@ -338,16 +348,28 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
                 .u32(0) // seq_lo
                 .u32(flags)
                 .build();
-            let client = state.clients.get_or_create(client_id);
-            let _ = client.send(message(feedback_id, 0, args)).await;
-            client.unregister(feedback_id).await;
+            if let Some(client) = state.clients.get(client_id) {
+                let _ = client.send(message(feedback_id, 0, args)).await;
+                client.unregister(feedback_id).await;
+            } else {
+                debug!(
+                    "Client {} disappeared before presentation feedback could be fired",
+                    client_id
+                );
+            }
         }
     }
 
     // Send wl_buffer.release (opcode 0, no args)
     for (client_id, buffer_id) in buffers_to_release {
-        let client = state.clients.get_or_create(client_id);
-        let _ = client.send(message(buffer_id, 0, Vec::new())).await;
+        if let Some(client) = state.clients.get(client_id) {
+            let _ = client.send(message(buffer_id, 0, Vec::new())).await;
+        } else {
+            debug!(
+                "Client {} disappeared before buffer release could be sent",
+                client_id
+            );
+        }
     }
 }
 
@@ -366,7 +388,7 @@ pub async fn switch_focus(state: &mut protocol::CompositorState, new_key: Client
         let old_surface = old_key.1;
         for kb in state.keyboards.clone() {
             if kb.client_id == old_client {
-                wl_keyboard::send_leave(state, kb.client_id, kb.object_id, old_surface).await;
+                wl_keyboard::send_leave(state, old_client, kb.object_id, old_surface).await;
             }
         }
         xdg_toplevel::send_activated(state, old_client, old_surface, false).await;
@@ -378,7 +400,7 @@ pub async fn switch_focus(state: &mut protocol::CompositorState, new_key: Client
     let new_surface = new_key.1;
     for kb in state.keyboards.clone() {
         if kb.client_id == new_client {
-            wl_keyboard::send_enter(state, kb.client_id, kb.object_id, new_surface).await;
+            wl_keyboard::send_enter(state, new_client, kb.object_id, new_surface).await;
         }
     }
     xdg_toplevel::send_activated(state, new_client, new_surface, true).await;

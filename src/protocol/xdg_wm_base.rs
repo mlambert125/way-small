@@ -9,7 +9,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
 use super::state::CompositorState;
-use super::wire::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -23,8 +23,9 @@ pub const PING: u16 = 0;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            }
         }
         CREATE_POSITIONER => handle_create_positioner(state, msg).await,
         GET_XDG_SURFACE => handle_get_xdg_surface(state, msg).await,
@@ -39,9 +40,14 @@ async fn handle_create_positioner(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     let Some(positioner_id) = args.new_id() else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
                 msg.message.object_id,
@@ -57,7 +63,6 @@ async fn handle_create_positioner(
         positioner_id
     );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(positioner_id, ObjectType::XdgPositioner);
     state.create_xdg_positioner(msg.client_id, positioner_id);
 }
@@ -66,10 +71,15 @@ async fn handle_get_xdg_surface(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     // get_xdg_surface args: new_id, object surface
     let (Some(xdg_surface_id), Some(wl_surface_id)) = (args.new_id(), args.u32()) else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
                 msg.message.object_id,
@@ -85,7 +95,6 @@ async fn handle_get_xdg_surface(
         xdg_surface_id, wl_surface_id
     );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(xdg_surface_id, ObjectType::XdgSurface);
     state.create_xdg_surface(msg.client_id, xdg_surface_id, wl_surface_id);
 }
@@ -99,7 +108,12 @@ fn handle_pong(msg: &WaylandProtocolMessageWithClientInfo) {
 /// Send a ping event to a client's xdg_wm_base object.
 #[allow(dead_code)]
 pub async fn send_ping(state: &mut CompositorState, client_id: u32, wm_base_id: u32, serial: u32) {
+    let client = state.clients.get(client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", client_id);
+        return;
+    }
+    let client = client.unwrap();
     let args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(wm_base_id, PING, args)).await;
 }

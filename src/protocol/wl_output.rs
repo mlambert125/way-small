@@ -8,7 +8,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
 use super::state::CompositorState;
-use super::wire::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, message};
 
 // Request opcodes
 const RELEASE: u16 = 0;
@@ -26,8 +26,11 @@ const MODE_CURRENT: u32 = 1;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         RELEASE => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         op => {
             tracing::warn!("wl_output: unhandled opcode {}", op);
@@ -37,6 +40,13 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 
 /// Send output info events after a client binds wl_output.
 pub async fn send_output_info(state: &mut CompositorState, client_id: u32, output_id: u32) {
+    let client = state.clients.get(client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let (width, height, refresh) = match &state.output {
         Some(o) => (o.width as i32, o.height as i32, o.refresh_mhz as i32),
         None => (800, 600, 60000),
@@ -53,7 +63,6 @@ pub async fn send_output_info(state: &mut CompositorState, client_id: u32, outpu
         .string("virtual-output")
         .i32(0) // transform: normal
         .build();
-    let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(output_id, GEOMETRY, args)).await;
 
     // wl_output.mode: flags, width, height, refresh (mHz)
@@ -63,28 +72,23 @@ pub async fn send_output_info(state: &mut CompositorState, client_id: u32, outpu
         .i32(height)
         .i32(refresh)
         .build();
-    let client = state.clients.get_or_create(client_id);
     let _ = client.send(message(output_id, MODE, args)).await;
 
     // wl_output.scale (version 2+)
-    let client = state.clients.get_or_create(client_id);
     let version = client.version(output_id);
     if version >= 2 {
         let args = ArgWriter::new().i32(1).build();
-        let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(output_id, SCALE, args)).await;
     }
 
     // wl_output.name (version 4+)
     if version >= 4 {
         let args = ArgWriter::new().string("WAY-SMALL-1").build();
-        let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(output_id, NAME, args)).await;
     }
 
     // wl_output.done (version 2+)
     if version >= 2 {
-        let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(output_id, DONE, Vec::new())).await;
     }
 }
@@ -110,6 +114,12 @@ pub async fn broadcast_mode(state: &mut CompositorState) {
         .collect();
 
     for (client_id, output_id, version) in outputs {
+        let client = state.clients.get(client_id);
+        if client.is_none() {
+            continue;
+        }
+        let client = client.unwrap();
+
         // wl_output.mode
         let args = ArgWriter::new()
             .u32(MODE_CURRENT)
@@ -117,12 +127,10 @@ pub async fn broadcast_mode(state: &mut CompositorState) {
             .i32(height)
             .i32(refresh)
             .build();
-        let client = state.clients.get_or_create(client_id);
         let _ = client.send(message(output_id, MODE, args)).await;
 
         // wl_output.done (version 2+)
         if version >= 2 {
-            let client = state.clients.get_or_create(client_id);
             let _ = client.send(message(output_id, DONE, Vec::new())).await;
         }
     }

@@ -21,8 +21,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
             // Clipboard selection not implemented yet
         }
         RELEASE => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         op => {
             tracing::warn!("wl_data_device: unhandled opcode {}", op);

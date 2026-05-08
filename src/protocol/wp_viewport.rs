@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
-use super::wire::ArgReader;
+use super::wire_utils::ArgReader;
 
 // wp_viewport request opcodes
 const DESTROY: u16 = 0;
@@ -31,8 +31,11 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     let viewport_id = msg.message.object_id;
     debug!("wp_viewport.destroy: viewport_id={}", viewport_id);
     state.destroy_viewport(msg.client_id, viewport_id);
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(viewport_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(viewport_id).await;
+    } else {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+    }
 }
 
 fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
@@ -60,10 +63,7 @@ fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     }
 }
 
-fn handle_set_destination(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_set_destination(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(width), Some(height)) = (args.i32(), args.i32()) else {
         return;

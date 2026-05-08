@@ -9,9 +9,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire::ArgReader;
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::ArgReader;
 
 // wp_viewporter request opcodes
 const DESTROY: u16 = 0;
@@ -20,8 +20,11 @@ const GET_VIEWPORT: u16 = 1;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         GET_VIEWPORT => handle_get_viewport(state, msg).await,
         op => {
@@ -34,6 +37,13 @@ async fn handle_get_viewport(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(viewport_id), Some(surface_id)) = (args.new_id(), args.u32()) else {
         return;
@@ -45,8 +55,10 @@ async fn handle_get_viewport(
     );
 
     // Check that the surface doesn't already have a viewport
-    if state.surface_viewport.contains_key(&(msg.client_id, surface_id)) {
-        let client = state.clients.get_or_create(msg.client_id);
+    if state
+        .surface_viewport
+        .contains_key(&(msg.client_id, surface_id))
+    {
         client
             .send_error(
                 msg.message.object_id,
@@ -57,7 +69,6 @@ async fn handle_get_viewport(
         return;
     }
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(viewport_id, ObjectType::WpViewport);
 
     state.create_viewport(msg.client_id, viewport_id, surface_id);

@@ -7,9 +7,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire::ArgReader;
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -18,8 +18,11 @@ const GET_SUBSURFACE: u16 = 1;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         GET_SUBSURFACE => handle_get_subsurface(state, msg).await,
         op => {
@@ -32,12 +35,18 @@ async fn handle_get_subsurface(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     // get_subsurface args: new_id, object surface, object parent
     let (Some(subsurface_id), Some(surface_id), Some(parent_id)) =
         (args.new_id(), args.u32(), args.u32())
     else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
                 msg.message.object_id,
@@ -62,9 +71,10 @@ async fn handle_get_subsurface(
         parent.children.push(surface_id);
     }
 
-    let client = state.clients.get_or_create(client_id);
     client.register(subsurface_id, ObjectType::WlSubsurface);
 
     // Store the mapping from subsurface object id to the wl_surface id it controls
-    state.subsurface_map.insert((client_id, subsurface_id), surface_id);
+    state
+        .subsurface_map
+        .insert((client_id, subsurface_id), surface_id);
 }

@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire::ArgReader;
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const CREATE_SURFACE: u16 = 0;
@@ -30,18 +30,27 @@ async fn handle_create_surface(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     let Some(surface_id) = args.new_id() else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "wl_compositor.create_surface: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_compositor.create_surface: malformed args",
+            )
             .await;
         return;
     };
 
     debug!("wl_compositor.create_surface: surface_id={}", surface_id);
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(surface_id, ObjectType::WlSurface);
     state.create_surface(msg.client_id, surface_id);
 }
@@ -50,18 +59,27 @@ async fn handle_create_region(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     let Some(region_id) = args.new_id() else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "wl_compositor.create_region: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_compositor.create_region: malformed args",
+            )
             .await;
         return;
     };
 
     debug!("wl_compositor.create_region: region_id={}", region_id);
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(region_id, ObjectType::WlRegion);
     state.create_region(msg.client_id, region_id);
 }

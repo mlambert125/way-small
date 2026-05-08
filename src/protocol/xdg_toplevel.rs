@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
-use super::wire::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -38,13 +38,19 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         SET_TITLE => handle_set_title(state, msg),
         SET_APP_ID => handle_set_app_id(state, msg),
         SET_PARENT | SHOW_WINDOW_MENU | MOVE | RESIZE => {
-            debug!("xdg_toplevel: interactive op {} (not yet implemented)", msg.message.op_code);
+            debug!(
+                "xdg_toplevel: interactive op {} (not yet implemented)",
+                msg.message.op_code
+            );
         }
         SET_MAX_SIZE | SET_MIN_SIZE => {
             // Acknowledge but don't enforce yet
         }
         SET_MAXIMIZED | UNSET_MAXIMIZED | SET_FULLSCREEN | UNSET_FULLSCREEN | SET_MINIMIZED => {
-            debug!("xdg_toplevel: state change op {} (not yet implemented)", msg.message.op_code);
+            debug!(
+                "xdg_toplevel: state change op {} (not yet implemented)",
+                msg.message.op_code
+            );
         }
         op => {
             tracing::warn!("xdg_toplevel: unhandled opcode {}", op);
@@ -56,8 +62,9 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.destroy: toplevel_id={}", toplevel_id);
     state.destroy_xdg_toplevel(msg.client_id, toplevel_id);
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(toplevel_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(toplevel_id).await;
+    }
 }
 
 fn handle_set_title(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
@@ -109,12 +116,18 @@ async fn send_configure_with_states(
 ) {
     // Build args: i32 width, i32 height, wl_array(states)
     // wl_array = u32 byte-length + raw u32 values (already 4-byte aligned)
-    let mut args = ArgWriter::new().i32(width).i32(height).u32((states.len() * 4) as u32);
+    let mut args = ArgWriter::new()
+        .i32(width)
+        .i32(height)
+        .u32((states.len() * 4) as u32);
     for &s in states {
         args = args.u32(s);
     }
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(toplevel_id, CONFIGURE, args.build())).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client
+            .send(message(toplevel_id, CONFIGURE, args.build()))
+            .await;
+    }
 }
 
 /// Send a configure sequence to set or clear the activated state on a toplevel.
@@ -126,6 +139,11 @@ pub async fn send_activated(
     wl_surface_id: u32,
     activated: bool,
 ) {
+    let client = state.clients.get(client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", client_id);
+        return;
+    }
     // Find the xdg_surface and toplevel for this wl_surface
     let mut found = None;
     for (key, xdg_surface) in &state.xdg_surfaces {
@@ -146,15 +164,18 @@ pub async fn send_activated(
     // Send xdg_surface.configure with a serial
     let serial = super::next_serial();
     let args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client
-        .send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args))
-        .await;
+
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client
+            .send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args))
+            .await;
+    }
 }
 
 /// Send xdg_toplevel.close event to request the client closes.
 #[allow(dead_code)]
 pub async fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32) {
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(toplevel_id, CLOSE, Vec::new())).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(toplevel_id, CLOSE, Vec::new())).await;
+    }
 }

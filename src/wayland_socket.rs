@@ -29,22 +29,24 @@ pub struct WaylandProtocolMessage {
     pub op_code: u16,
     pub args: Vec<u8>,
 
-    // This is a bit strange, but this is a shared queue of fds for a client
-    // that the compositor should pop_front on if the specific object/op code expects an fd.
-    // We can not calculate which message an fd belongs to at socket
-    // level because doing so requires finding the type of the message
-    // which requires looking up the id in the registry and then
-    // decoding the message arguments to find the op code
-    pub fd_queue: Arc<Mutex<VecDeque<i32>>>,
+    // Note that on incoming messages, this is empty as the
+    // compositor is expected to read FDs from the pending_fds queue in the WaylandNewClientMessage.
+    pub fds: Vec<i32>,
 }
 
 pub struct WaylandProtocolMessageWithClientInfo {
     pub client_id: u32,
     pub message: WaylandProtocolMessage,
+}
+
+pub struct WaylandNewClientMessage {
+    pub client_id: u32,
     pub socket_sender: Sender<WaylandProtocolMessage>,
+    pub fd_queue: Arc<Mutex<VecDeque<i32>>>,
 }
 
 pub enum WaylandSocketMessage {
+    NewClient(WaylandNewClientMessage),
     Message(WaylandProtocolMessageWithClientInfo),
     ClientDisconnected { client_id: u32 },
 }
@@ -116,6 +118,15 @@ fn handle_client(
         let pending_fds_arc = Arc::new(Mutex::new(VecDeque::<i32>::new()));
         let (socket_send_tx, socket_send_rx) = channel::<WaylandProtocolMessage>(64);
 
+        compositor_message_channel
+            .send(WaylandSocketMessage::NewClient(WaylandNewClientMessage {
+                client_id,
+                socket_sender: socket_send_tx.clone(),
+                fd_queue: pending_fds_arc.clone(),
+            }))
+            .await
+            .unwrap();
+
         let sender_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
             let mut socket_send_rx = socket_send_rx;
@@ -133,8 +144,6 @@ fn handle_client(
                             buffer.extend_from_slice(&message_length_and_opcode.to_le_bytes());
                             buffer.extend_from_slice(&message.args);
 
-                            let fds_vec: Vec<i32> = message.fd_queue.lock().unwrap()
-                                .iter().cloned().collect();
                             let mut bytes_sent = 0;
                             let mut fds_sent = false;
                             while bytes_sent < buffer.len() {
@@ -142,7 +151,7 @@ fn handle_client(
                                     debug!("Error waiting for writable: {}", e);
                                     return;
                                 }
-                                let fds_to_send = if fds_sent { &[][..] } else { &fds_vec[..] };
+                                let fds_to_send = if fds_sent { &[][..] } else { &message.fds[..] };
                                 match sender_stream.try_io(tokio::io::Interest::WRITABLE, || {
                                     sender_stream.send_with_fd(&buffer[bytes_sent..], fds_to_send)
                                 }) {
@@ -250,7 +259,9 @@ fn handle_client(
                             object_id,
                             op_code: op_code as u16,
                             args: args_buffer,
-                            fd_queue: pending_fds_arc.clone(),
+                            fds: vec![], // FDs are not included in the message struct, they are
+                                         // read separately and accessed via the pending_fds queue
+                                         // in the WaylandNewClientMessage
                         };
 
                         if let Err(e) = compositor_message_channel
@@ -258,7 +269,6 @@ fn handle_client(
                                 WaylandProtocolMessageWithClientInfo {
                                     client_id,
                                     message: msg,
-                                    socket_sender: socket_send_tx.clone(),
                                 },
                             ))
                             .await

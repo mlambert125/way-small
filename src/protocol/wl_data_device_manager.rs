@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire::ArgReader;
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::ArgReader;
 
 // Request opcodes
 const CREATE_DATA_SOURCE: u16 = 0;
@@ -30,18 +30,30 @@ async fn handle_create_data_source(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     let Some(source_id) = args.new_id() else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "wl_data_device_manager.create_data_source: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_data_device_manager.create_data_source: malformed args",
+            )
             .await;
         return;
     };
 
-    debug!("wl_data_device_manager.create_data_source: source_id={}", source_id);
+    debug!(
+        "wl_data_device_manager.create_data_source: source_id={}",
+        source_id
+    );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(source_id, ObjectType::WlDataSource);
 }
 
@@ -49,18 +61,30 @@ async fn handle_get_data_device(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
+
     let mut args = ArgReader::new(&msg.message.args);
     // get_data_device args: new_id, object seat
     let (Some(device_id), Some(_seat_id)) = (args.new_id(), args.u32()) else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "wl_data_device_manager.get_data_device: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_data_device_manager.get_data_device: malformed args",
+            )
             .await;
         return;
     };
 
-    debug!("wl_data_device_manager.get_data_device: device_id={}", device_id);
+    debug!(
+        "wl_data_device_manager.get_data_device: device_id={}",
+        device_id
+    );
 
-    let client = state.clients.get_or_create(msg.client_id);
     client.register(device_id, ObjectType::WlDataDevice);
 }

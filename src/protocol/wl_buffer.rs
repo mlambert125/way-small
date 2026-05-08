@@ -19,8 +19,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         DESTROY => {
             let buffer_id = msg.message.object_id;
             state.destroy_buffer(msg.client_id, buffer_id);
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(buffer_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(buffer_id).await;
+            } else {
+                tracing::warn!("Received message from unknown client {}", msg.client_id);
+            }
         }
         op => {
             tracing::warn!("wl_buffer: unhandled opcode {}", op);
@@ -30,6 +33,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 
 #[allow(dead_code)]
 pub async fn send_release(state: &mut CompositorState, client_id: u32, buffer_id: u32) {
-    let client = state.clients.get_or_create(client_id);
+    let client = state.clients.get(client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", client_id);
+        return;
+    }
+    let client = client.unwrap();
     let _ = client.send(message(buffer_id, RELEASE, vec![])).await;
 }

@@ -4,11 +4,12 @@
 //! ObjectType) and a channel sender for pushing events back to the client.
 //! The Clients struct manages the collection of all active client states.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::Sender;
 
-use super::wire::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, message};
 use super::{ObjectType, wl_display};
 use crate::wayland_socket::WaylandProtocolMessage;
 
@@ -18,17 +19,23 @@ pub struct ClientState {
     /// Maps object id -> bound interface version for version-gated events.
     pub object_versions: HashMap<u32, u32>,
     /// Sender for writing messages back to this client's socket.
-    pub sender: Option<Sender<WaylandProtocolMessage>>,
+    pub sender: Sender<WaylandProtocolMessage>,
+    // File descriptor queue shared between this client and the socket task
+    pub fd_queue: Arc<Mutex<VecDeque<i32>>>,
 }
 
 impl ClientState {
-    pub fn new() -> Self {
+    pub fn new(
+        sender: Sender<WaylandProtocolMessage>,
+        fd_queue: Arc<Mutex<VecDeque<i32>>>,
+    ) -> Self {
         let mut objects = HashMap::new();
         objects.insert(wl_display::OBJECT_ID, ObjectType::WlDisplay);
         Self {
             objects,
             object_versions: HashMap::new(),
-            sender: None,
+            sender,
+            fd_queue,
         }
     }
 
@@ -57,16 +64,11 @@ impl ClientState {
 
     /// Send a message to this client. Returns Ok(()) or logs a warning on failure.
     pub async fn send(&self, msg: WaylandProtocolMessage) -> Result<(), ()> {
-        if let Some(sender) = &self.sender {
-            if let Err(e) = sender.send(msg).await {
-                tracing::warn!("Failed to send message to client: {}", e);
-                return Err(());
-            }
-            Ok(())
-        } else {
-            tracing::warn!("No sender for client");
-            Err(())
+        if let Err(e) = self.sender.send(msg).await {
+            tracing::warn!("Failed to send message to client: {}", e);
+            return Err(());
         }
+        Ok(())
     }
 
     /// Send a wl_display.error to this client.
@@ -93,10 +95,19 @@ impl Clients {
         }
     }
 
-    pub fn get_or_create(&mut self, client_id: u32) -> &mut ClientState {
-        self.states
-            .entry(client_id)
-            .or_insert_with(ClientState::new)
+    pub fn create(
+        &mut self,
+        client_id: u32,
+        sender: Sender<WaylandProtocolMessage>,
+        fd_queue: Arc<Mutex<VecDeque<i32>>>,
+    ) {
+        let client_state = ClientState::new(sender, fd_queue);
+
+        self.states.insert(client_id, client_state);
+    }
+
+    pub fn get(&mut self, client_id: u32) -> Option<&mut ClientState> {
+        self.states.get_mut(&client_id)
     }
 
     pub fn remove(&mut self, client_id: u32) {

@@ -18,8 +18,9 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
             // Client is advertising a mime type it can provide — ignored for now
         }
         DESTROY => {
-            let client = state.clients.get_or_create(msg.client_id);
-            client.unregister(msg.message.object_id).await;
+            if let Some(client) = state.clients.get(msg.client_id) {
+                client.unregister(msg.message.object_id).await;
+            }
         }
         SET_ACTIONS => {
             // DnD actions — ignored for now

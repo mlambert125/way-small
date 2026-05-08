@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire::{ArgReader, ArgWriter, message};
 use super::ObjectType;
+use super::state::CompositorState;
+use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -39,19 +39,29 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     let xdg_surface_id = msg.message.object_id;
     debug!("xdg_surface.destroy: xdg_surface_id={}", xdg_surface_id);
     state.destroy_xdg_surface(msg.client_id, xdg_surface_id);
-    let client = state.clients.get_or_create(msg.client_id);
-    client.unregister(xdg_surface_id).await;
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.unregister(xdg_surface_id).await;
+    }
 }
 
 async fn handle_get_toplevel(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     let Some(toplevel_id) = args.new_id() else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
-            .send_error(msg.message.object_id, 0, "xdg_surface.get_toplevel: malformed args")
+            .send_error(
+                msg.message.object_id,
+                0,
+                "xdg_surface.get_toplevel: malformed args",
+            )
             .await;
         return;
     };
@@ -63,7 +73,6 @@ async fn handle_get_toplevel(
     );
 
     let client_id = msg.client_id;
-    let client = state.clients.get_or_create(client_id);
     client.register(toplevel_id, ObjectType::XdgToplevel);
     state.create_xdg_toplevel(client_id, toplevel_id, xdg_surface_id);
 
@@ -73,7 +82,13 @@ async fn handle_get_toplevel(
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
     let args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(client_id);
+
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
 
     // Take focus on the new toplevel
@@ -86,16 +101,18 @@ async fn handle_get_toplevel(
     }
 }
 
-async fn handle_get_popup(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let mut args = ArgReader::new(&msg.message.args);
     // get_popup args: new_id popup, object parent (xdg_surface), object positioner
     let (Some(popup_id), Some(parent_xdg_surface_id), Some(positioner_id)) =
         (args.new_id(), args.u32(), args.u32())
     else {
-        let client = state.clients.get_or_create(msg.client_id);
         client
             .send_error(
                 msg.message.object_id,
@@ -114,13 +131,13 @@ async fn handle_get_popup(
     );
 
     // Compute position from positioner
-    let (x, y, width, height) = if let Some(pos) = state.xdg_positioners.get(&(client_id, positioner_id)) {
-        compute_popup_position(pos)
-    } else {
-        (0, 0, 1, 1)
-    };
+    let (x, y, width, height) =
+        if let Some(pos) = state.xdg_positioners.get(&(client_id, positioner_id)) {
+            compute_popup_position(pos)
+        } else {
+            (0, 0, 1, 1)
+        };
 
-    let client = state.clients.get_or_create(client_id);
     client.register(popup_id, ObjectType::XdgPopup);
     state.create_xdg_popup(
         client_id,
@@ -159,56 +176,21 @@ async fn handle_get_popup(
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
     let configure_args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(client_id);
+    let client = state.clients.get(msg.client_id);
+    if client.is_none() {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    }
+    let client = client.unwrap();
     let _ = client
         .send(message(xdg_surface_id, CONFIGURE, configure_args))
         .await;
 }
 
-/// Compute popup position from a positioner.
-///
-/// The anchor point is derived from the anchor_rect + anchor edge.
-/// The popup is placed so that the gravity edge of the popup aligns
-/// with the anchor point, then offset is applied.
-fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, i32, i32) {
-    let (ar_x, ar_y, ar_w, ar_h) = pos.anchor_rect;
-
-    // Anchor point within the anchor rect
-    // Anchor edges: 0=none(center), 1=top, 2=bottom, 3=left, 4=right,
-    //               5=top_left, 6=bottom_left, 7=top_right, 8=bottom_right
-    let anchor_x = match pos.anchor {
-        3 | 5 | 6 => ar_x,             // left edge
-        4 | 7 | 8 => ar_x + ar_w,      // right edge
-        _ => ar_x + ar_w / 2,          // center
-    };
-    let anchor_y = match pos.anchor {
-        1 | 5 | 7 => ar_y,             // top edge
-        2 | 6 | 8 => ar_y + ar_h,      // bottom edge
-        _ => ar_y + ar_h / 2,          // center
-    };
-
-    // Gravity determines which part of the popup is placed at the anchor point
-    // Same enum values as anchor
-    let popup_x = match pos.gravity {
-        3 | 5 | 6 => anchor_x - pos.width,   // popup extends left
-        4 | 7 | 8 => anchor_x,               // popup extends right
-        _ => anchor_x - pos.width / 2,        // centered
-    };
-    let popup_y = match pos.gravity {
-        1 | 5 | 7 => anchor_y - pos.height,  // popup extends up
-        2 | 6 | 8 => anchor_y,               // popup extends down
-        _ => anchor_y - pos.height / 2,       // centered
-    };
-
-    (
-        popup_x + pos.offset.0,
-        popup_y + pos.offset.1,
-        pos.width,
-        pos.height,
-    )
-}
-
-fn handle_set_window_geometry(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_set_window_geometry(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(x), Some(y), Some(w), Some(h)) = (args.i32(), args.i32(), args.i32(), args.i32())
     else {
@@ -241,8 +223,57 @@ fn handle_ack_configure(state: &mut CompositorState, msg: &WaylandProtocolMessag
 
 /// Send an xdg_surface.configure event.
 #[allow(dead_code)]
-pub async fn send_configure(state: &mut CompositorState, client_id: u32, xdg_surface_id: u32, serial: u32) {
+pub async fn send_configure(
+    state: &mut CompositorState,
+    client_id: u32,
+    xdg_surface_id: u32,
+    serial: u32,
+) {
     let args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
+    }
+}
+
+/// Compute popup position from a positioner.
+///
+/// The anchor point is derived from the anchor_rect + anchor edge.
+/// The popup is placed so that the gravity edge of the popup aligns
+/// with the anchor point, then offset is applied.
+fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, i32, i32) {
+    let (ar_x, ar_y, ar_w, ar_h) = pos.anchor_rect;
+
+    // Anchor point within the anchor rect
+    // Anchor edges: 0=none(center), 1=top, 2=bottom, 3=left, 4=right,
+    //               5=top_left, 6=bottom_left, 7=top_right, 8=bottom_right
+    let anchor_x = match pos.anchor {
+        3 | 5 | 6 => ar_x,        // left edge
+        4 | 7 | 8 => ar_x + ar_w, // right edge
+        _ => ar_x + ar_w / 2,     // center
+    };
+    let anchor_y = match pos.anchor {
+        1 | 5 | 7 => ar_y,        // top edge
+        2 | 6 | 8 => ar_y + ar_h, // bottom edge
+        _ => ar_y + ar_h / 2,     // center
+    };
+
+    // Gravity determines which part of the popup is placed at the anchor point
+    // Same enum values as anchor
+    let popup_x = match pos.gravity {
+        3 | 5 | 6 => anchor_x - pos.width, // popup extends left
+        4 | 7 | 8 => anchor_x,             // popup extends right
+        _ => anchor_x - pos.width / 2,     // centered
+    };
+    let popup_y = match pos.gravity {
+        1 | 5 | 7 => anchor_y - pos.height, // popup extends up
+        2 | 6 | 8 => anchor_y,              // popup extends down
+        _ => anchor_y - pos.height / 2,     // centered
+    };
+
+    (
+        popup_x + pos.offset.0,
+        popup_y + pos.offset.1,
+        pos.width,
+        pos.height,
+    )
 }
