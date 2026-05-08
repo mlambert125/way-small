@@ -84,6 +84,9 @@ fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     }
 }
 
+// xdg_toplevel state values
+const STATE_ACTIVATED: u32 = 4;
+
 /// Send xdg_toplevel.configure event (width, height, states array).
 pub async fn send_configure(
     state: &mut CompositorState,
@@ -92,15 +95,61 @@ pub async fn send_configure(
     width: i32,
     height: i32,
 ) {
-    // states is an array of u32 enum values (empty = no special state)
-    let states: Vec<u8> = Vec::new();
-    let args = ArgWriter::new()
-        .i32(width)
-        .i32(height)
-        .u32(states.len() as u32) // wl_array length
-        .build();
+    send_configure_with_states(state, client_id, toplevel_id, width, height, &[]).await;
+}
+
+/// Send xdg_toplevel.configure with explicit states.
+async fn send_configure_with_states(
+    state: &mut CompositorState,
+    client_id: u32,
+    toplevel_id: u32,
+    width: i32,
+    height: i32,
+    states: &[u32],
+) {
+    // Build args: i32 width, i32 height, wl_array(states)
+    // wl_array = u32 byte-length + raw u32 values (already 4-byte aligned)
+    let mut args = ArgWriter::new().i32(width).i32(height).u32((states.len() * 4) as u32);
+    for &s in states {
+        args = args.u32(s);
+    }
     let client = state.clients.get_or_create(client_id);
-    let _ = client.send(message(toplevel_id, CONFIGURE, args)).await;
+    let _ = client.send(message(toplevel_id, CONFIGURE, args.build())).await;
+}
+
+/// Send a configure sequence to set or clear the activated state on a toplevel.
+/// Looks up the toplevel from a wl_surface id and sends toplevel.configure +
+/// xdg_surface.configure(serial).
+pub async fn send_activated(
+    state: &mut CompositorState,
+    client_id: u32,
+    wl_surface_id: u32,
+    activated: bool,
+) {
+    // Find the xdg_surface and toplevel for this wl_surface
+    let mut found = None;
+    for (key, xdg_surface) in &state.xdg_surfaces {
+        if key.0 == client_id && xdg_surface.wl_surface_id == wl_surface_id {
+            if let Some(super::state::XdgRole::Toplevel(tid)) = &xdg_surface.role {
+                found = Some((key.1, *tid));
+            }
+            break;
+        }
+    }
+    let Some((xdg_surface_id, toplevel_id)) = found else {
+        return;
+    };
+
+    let states: &[u32] = if activated { &[STATE_ACTIVATED] } else { &[] };
+    send_configure_with_states(state, client_id, toplevel_id, 0, 0, states).await;
+
+    // Send xdg_surface.configure with a serial
+    let serial = super::next_serial();
+    let args = ArgWriter::new().u32(serial).build();
+    let client = state.clients.get_or_create(client_id);
+    let _ = client
+        .send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args))
+        .await;
 }
 
 /// Send xdg_toplevel.close event to request the client closes.

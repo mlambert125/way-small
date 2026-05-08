@@ -198,14 +198,12 @@ fn handle_client(
                     break;
                 }
                 Ok((data_read, fds_read)) => {
-                    // Append the received data to the buffer
                     for byte in &buffer[..data_read] {
                         data.push_back(*byte);
                     }
 
                     {
                         let mut pending_fds = pending_fds_arc.lock().unwrap();
-                        // Append the received file descriptors to the pending_fds queue
                         for &fd in &fds[..fds_read] {
                             pending_fds.push_back(fd);
                         }

@@ -16,7 +16,7 @@ use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol;
 use crate::protocol::state::{ClientObjectId, OutputState};
 use crate::protocol::wire::{ArgWriter, message};
-use crate::protocol::{wl_keyboard, wl_pointer};
+use crate::protocol::{wl_keyboard, wl_pointer, xdg_toplevel};
 use crate::renderer;
 use crate::wayland_socket::WaylandSocketMessage;
 
@@ -118,8 +118,6 @@ pub async fn run_compositor(
                         }
                     }
 
-                    // TODO: Mouse Events aren't really grouped/framed at this point, and probably should be.
-                    // (See wl_pointer::frame event)
                     BackendMessage::MouseMove { x, y } => {
                         state.cursor_x = x;
                         state.cursor_y = y;
@@ -133,16 +131,43 @@ pub async fn run_compositor(
                             switch_focus(&mut state, top_key).await;
                         }
 
-                        let (focused_client, local_x, local_y) = if let Some(focused_key) = state.focused_surface {
-                            let (sx, sy) = state.surfaces.get(&focused_key).map(|s| s.position).unwrap_or((0, 0));
-                            (Some(focused_key.0), x - sx as f64, y - sy as f64)
-                        } else {
-                            (None, x, y)
-                        };
-                        for ptr in state.pointers.clone() {
-                            if Some(ptr.client_id) == focused_client {
-                                wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, local_x, local_y).await;
-                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                        // Determine which specific surface the pointer is over
+                        let hit = hit_test(&state, x, y);
+                        let new_pointer_surface = hit.as_ref().map(|h| h.surface);
+                        let old_pointer_surface = state.pointer_surface;
+
+                        // Send pointer enter/leave when the surface under the cursor changes
+                        if new_pointer_surface != old_pointer_surface {
+                            if let Some(old_ps) = old_pointer_surface {
+                                for ptr in state.pointers.clone() {
+                                    if ptr.client_id == old_ps.0 {
+                                        wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_ps.1).await;
+                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                    }
+                                }
+                            }
+                            state.pointer_surface = new_pointer_surface;
+                            if let Some(ref h) = hit {
+                                let local_x = x - h.surface_x as f64;
+                                let local_y = y - h.surface_y as f64;
+                                for ptr in state.pointers.clone() {
+                                    if ptr.client_id == h.surface.0 {
+                                        wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, h.surface.1, local_x, local_y).await;
+                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send motion to the current pointer surface
+                        if let Some(ref h) = hit {
+                            let local_x = x - h.surface_x as f64;
+                            let local_y = y - h.surface_y as f64;
+                            for ptr in state.pointers.clone() {
+                                if ptr.client_id == h.surface.0 {
+                                    wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, local_x, local_y).await;
+                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                }
                             }
                         }
                     }
@@ -159,29 +184,43 @@ pub async fn run_compositor(
                         // On press, hit-test and raise/focus the clicked surface
                         let cx = state.cursor_x;
                         let cy = state.cursor_y;
-                        if pressed && let Some(clicked) = hit_test(&state, cx, cy) && state.focused_surface != Some(clicked) {
+                        if pressed && let Some(hit) = hit_test(&state, cx, cy) && state.focused_surface != Some(hit.toplevel) {
                             // Raise to top of stack
-                            state.surface_stack.retain(|k| *k != clicked);
-                            state.surface_stack.push(clicked);
+                            state.surface_stack.retain(|k| *k != hit.toplevel);
+                            state.surface_stack.push(hit.toplevel);
                             state.dirty = true;
 
-                            switch_focus(&mut state, clicked).await;
+                            switch_focus(&mut state, hit.toplevel).await;
+
+                            // Update pointer surface to the specific surface under cursor
+                            if state.pointer_surface != Some(hit.surface) {
+                                state.pointer_surface = Some(hit.surface);
+                                let local_x = cx - hit.surface_x as f64;
+                                let local_y = cy - hit.surface_y as f64;
+                                for ptr in state.pointers.clone() {
+                                    if ptr.client_id == hit.surface.0 {
+                                        wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, hit.surface.1, local_x, local_y).await;
+                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                    }
+                                }
+                            }
                         }
 
-                        // Send button event to focused client
-                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
-                        for ptr in state.pointers.clone() {
-                            if Some(ptr.client_id) == focused_client {
-                                wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed).await;
-                                wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                        // Send button event to the pointer surface
+                        if let Some(ps) = state.pointer_surface {
+                            for ptr in state.pointers.clone() {
+                                if ptr.client_id == ps.0 {
+                                    wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed).await;
+                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id).await;
+                                }
                             }
                         }
                     }
                     BackendMessage::MouseScroll { dx, dy } => {
                         let time_ms = start_time.elapsed().as_millis() as u32;
-                        let focused_client = state.focused_surface.map(|(cid, _)| cid);
+                        let pointer_client = state.pointer_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
-                            if Some(ptr.client_id) != focused_client {
+                            if Some(ptr.client_id) != pointer_client {
                                 continue;
                             }
                             if dy != 0.0 {
@@ -278,7 +317,11 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
             .as_ref()
             .and_then(|o| {
                 let hz = o.refresh_mhz / 1000;
-                if hz > 0 { Some(1_000_000_000u32 / hz) } else { None }
+                if hz > 0 {
+                    Some(1_000_000_000u32 / hz)
+                } else {
+                    None
+                }
             })
             .unwrap_or(16_666_666); // fallback ~60Hz
 
@@ -308,79 +351,113 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
     }
 }
 
-/// Send leave events to the old focused surface (if any) and enter events to
-/// the new one, then update `state.focused_surface`. Coordinates are converted
-/// to surface-local automatically.
-pub async fn switch_focus(
-    state: &mut protocol::CompositorState,
-    new_key: ClientObjectId,
-) {
+/// Switch keyboard focus to a new toplevel surface. Sends keyboard enter/leave
+/// and xdg_toplevel activated/deactivated configure events. Pointer focus is
+/// tracked separately via `state.pointer_surface`.
+pub async fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObjectId) {
     let old_key = state.focused_surface;
     if old_key == Some(new_key) {
         return;
     }
 
-    // Send leave events to old focused surface
+    // Send keyboard leave and deactivate the old focused surface
     if let Some(old_key) = old_key {
         let old_client = old_key.0;
         let old_surface = old_key.1;
-        for ptr in state.pointers.clone() {
-            if ptr.client_id == old_client {
-                wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_surface).await;
-                wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
-            }
-        }
         for kb in state.keyboards.clone() {
             if kb.client_id == old_client {
                 wl_keyboard::send_leave(state, kb.client_id, kb.object_id, old_surface).await;
             }
         }
+        xdg_toplevel::send_activated(state, old_client, old_surface, false).await;
     }
 
-    // Send enter events to new focused surface
+    // Send keyboard enter and activate the new focused surface
     state.focused_surface = Some(new_key);
     let new_client = new_key.0;
     let new_surface = new_key.1;
-    let (sx, sy) = state.surfaces.get(&new_key).map(|s| s.position).unwrap_or((0, 0));
-    let local_x = state.cursor_x - sx as f64;
-    let local_y = state.cursor_y - sy as f64;
-    for ptr in state.pointers.clone() {
-        if ptr.client_id == new_client {
-            wl_pointer::send_enter(state, ptr.client_id, ptr.object_id, new_surface, local_x, local_y).await;
-            wl_pointer::send_frame(state, ptr.client_id, ptr.object_id).await;
-        }
-    }
     for kb in state.keyboards.clone() {
         if kb.client_id == new_client {
             wl_keyboard::send_enter(state, kb.client_id, kb.object_id, new_surface).await;
         }
     }
+    xdg_toplevel::send_activated(state, new_client, new_surface, true).await;
 }
 
-/// Hit-test the surface stack from top to bottom, returning the first surface
-/// that contains the given point. Uses the buffer dimensions as the surface size.
-fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<ClientObjectId> {
+/// Result of a hit test: which toplevel was hit, and which specific surface
+/// (possibly a subsurface) the pointer is actually over.
+struct HitResult {
+    /// The toplevel surface key (in surface_stack) — used for stacking/keyboard focus.
+    toplevel: ClientObjectId,
+    /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
+    surface: ClientObjectId,
+    /// Global position of the specific surface, for computing local coordinates.
+    surface_x: i32,
+    surface_y: i32,
+}
+
+/// Hit-test the surface stack from top to bottom. Returns the toplevel and the
+/// specific surface (possibly a subsurface) under the pointer.
+fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<HitResult> {
     let px = x as i32;
     let py = y as i32;
 
-    // Iterate from top (last) to bottom (first)
     for &key in state.surface_stack.iter().rev() {
         let Some(surface) = state.surfaces.get(&key) else {
             continue;
         };
-        let (sx, sy) = surface.position;
+        let (ox, oy) = surface.position;
 
-        // Get surface dimensions from its attached buffer
-        let (w, h) = surface_dimensions(state, key);
-        if w == 0 || h == 0 {
-            continue;
-        }
-
-        if px >= sx && py >= sy && px < sx + w && py < sy + h {
-            return Some(key);
+        if let Some((surface_key, sx, sy)) = hit_test_surface_tree(state, key, ox, oy, px, py) {
+            return Some(HitResult {
+                toplevel: key,
+                surface: surface_key,
+                surface_x: sx,
+                surface_y: sy,
+            });
         }
     }
     None
+}
+
+/// Recursively hit-test a surface and its children at the given offset.
+/// Returns the specific surface key and its global offset if hit.
+fn hit_test_surface_tree(
+    state: &protocol::CompositorState,
+    surface_key: ClientObjectId,
+    offset_x: i32,
+    offset_y: i32,
+    px: i32,
+    py: i32,
+) -> Option<(ClientObjectId, i32, i32)> {
+    let surface = state.surfaces.get(&surface_key)?;
+    let client_id = surface.client_id;
+    let children = surface.children.clone();
+
+    // Check children first (they render on top of the parent)
+    for &child_id in children.iter().rev() {
+        let child_key = (client_id, child_id);
+        let Some(child) = state.surfaces.get(&child_key) else {
+            continue;
+        };
+        let (cx, cy) = child.subsurface_position;
+        if let Some(result) =
+            hit_test_surface_tree(state, child_key, offset_x + cx, offset_y + cy, px, py)
+        {
+            return Some(result);
+        }
+    }
+
+    // Check this surface's own bounds
+    let (w, h) = surface_dimensions(state, surface_key);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if px >= offset_x && py >= offset_y && px < offset_x + w && py < offset_y + h {
+        Some((surface_key, offset_x, offset_y))
+    } else {
+        None
+    }
 }
 
 /// Get the pixel dimensions of a surface from its buffer (or viewport destination).

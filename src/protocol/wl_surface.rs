@@ -116,9 +116,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             if let Some(old_buffer) = surface.buffer_id
                 && new_buffer != Some(old_buffer)
             {
-                state
-                    .buffers_pending_release
-                    .push((client_id, old_buffer));
+                state.buffers_pending_release.push((client_id, old_buffer));
             }
             surface.buffer_id = new_buffer;
         }
@@ -144,14 +142,14 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     }
 
     // Apply pending viewport state
-    if let Some(&vp_id) = state.surface_viewport.get(&(client_id, surface_id)) {
-        if let Some(vp) = state.viewports.get_mut(&(client_id, vp_id)) {
-            if let Some(src) = vp.pending_source.take() {
-                vp.source = src;
-            }
-            if let Some(dst) = vp.pending_destination.take() {
-                vp.destination = dst;
-            }
+    if let Some(&vp_id) = state.surface_viewport.get(&(client_id, surface_id))
+        && let Some(vp) = state.viewports.get_mut(&(client_id, vp_id))
+    {
+        if let Some(src) = vp.pending_source.take() {
+            vp.source = src;
+        }
+        if let Some(dst) = vp.pending_destination.take() {
+            vp.destination = dst;
         }
     }
 }

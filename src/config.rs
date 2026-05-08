@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
@@ -16,24 +16,21 @@ pub struct ConfigFile {
 
 impl ConfigFile {
     pub fn load() -> Self {
-        // Check ./config.toml first (development), then XDG config dir
-        let candidates = [
+        let config_paths = [
             Some(PathBuf::from("config.toml")),
             dirs::config_dir().map(|d| d.join("way-small/config.toml")),
         ];
 
-        for path in candidates.into_iter().flatten() {
+        debug!("Looking for config in: {:?}", config_paths);
+
+        for path in config_paths.into_iter().flatten() {
             if path.exists() {
                 info!("Loading config from {}", path.display());
                 match std::fs::read_to_string(&path) {
                     Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
                         Ok(config) => return config,
                         Err(e) => {
-                            tracing::warn!(
-                                "Failed to parse {}: {}",
-                                path.display(),
-                                e,
-                            );
+                            tracing::warn!("Failed to parse {}: {}", path.display(), e,);
                         }
                     },
                     Err(e) => {

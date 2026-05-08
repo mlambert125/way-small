@@ -4,13 +4,14 @@
 //! the Wayland socket listener, compositor loop, and display backend, then
 //! waits for shutdown.
 
+use crate::{
+    backend::{BackendMessage, RenderFrame},
+    wayland_socket::WaylandSocketMessage,
+};
 use clap::{Parser, ValueEnum};
-use tokio::sync::mpsc::channel;
-use tracing::info;
-
 use std::sync::Arc;
-
-use crate::backend::{BackendMessage, RenderFrame};
+use tokio::sync::mpsc::channel;
+use tracing::{debug, info};
 
 mod backend;
 mod compositor;
@@ -79,17 +80,17 @@ async fn main() -> anyhow::Result<()> {
         socket_path, socket_name
     );
 
-    // Channels
-    let (wayland_message_tx, wayland_message_rx) =
-        channel::<wayland_socket::WaylandSocketMessage>(10000);
-    let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(10000);
-    let (frame_tx, frame_rx) = channel::<Arc<RenderFrame>>(2); // double-buffer: only 2 in flight
+    debug!("Creating channels");
+
+    let (wayland_message_tx, wayland_message_rx) = channel::<WaylandSocketMessage>(1000);
+    let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(1000);
+    let (frame_tx, frame_rx) = channel::<Arc<RenderFrame>>(2);
     let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    debug!("Spawning subsystem tasks");
 
     let backend_handle = match backend {
         Backend::Winit => {
-            // Winit needs the real WAYLAND_DISPLAY to connect to the host compositor.
-            // We set our override only after winit signals it has built its event loop.
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
             let handle = tokio::task::spawn_blocking({
                 let cancel_token = cancel_token.clone();
@@ -103,17 +104,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
             let _ = ready_rx.await;
-            // SAFETY: winit has connected to the host compositor; override for child processes
+
             unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
             Some(handle)
         }
         Backend::None => {
-            // SAFETY: no windowing backend needs the real WAYLAND_DISPLAY
             unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-            // Keep frame_rx alive so the compositor's frame_sender doesn't error.
-            // Frames are just dropped (no display).
             let cancel = cancel_token.clone();
             tokio::spawn(async move {
+                // Keep the frame_rx alive
                 let _frame_rx = frame_rx;
                 null_backend::run_null_backend(backend_message_tx, cancel).await
             });
@@ -134,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
         cancel_token.clone(),
     ));
 
+    debug!("Subsystems running, waiting for shutdown signal");
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down...");
@@ -144,9 +145,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    debug!("Waiting for subsystem tasks to finish");
+
     let (_, _) = tokio::join!(socket_handle, compositor_handle);
     if let Some(handle) = backend_handle {
         let _ = handle.await;
     }
+
     Ok(())
 }

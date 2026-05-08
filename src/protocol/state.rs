@@ -212,6 +212,9 @@ pub struct CompositorState {
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
     pub focused_surface: Option<ClientObjectId>,
+    /// The specific surface (possibly a subsurface) currently under the pointer.
+    /// Used for delivering pointer enter/leave/motion/button to the correct surface.
+    pub pointer_surface: Option<ClientObjectId>,
     pub cursor_x: f64,
     pub cursor_y: f64,
     /// Currently pressed evdev keycodes (for wl_keyboard.enter keys array).
@@ -249,6 +252,7 @@ impl CompositorState {
             pointers: Vec::new(),
             keyboards: Vec::new(),
             focused_surface: None,
+            pointer_surface: None,
             cursor_x: 0.0,
             cursor_y: 0.0,
             pressed_keys: HashSet::new(),
@@ -437,7 +441,8 @@ impl CompositorState {
     pub fn destroy_xdg_toplevel(&mut self, client_id: u32, toplevel_id: u32) {
         if let Some(toplevel) = self.xdg_toplevels.remove(&(client_id, toplevel_id)) {
             // Remove the associated wl_surface from the stack and clear focus
-            if let Some(xdg_surface) = self.xdg_surfaces.get(&(client_id, toplevel.xdg_surface_id)) {
+            if let Some(xdg_surface) = self.xdg_surfaces.get(&(client_id, toplevel.xdg_surface_id))
+            {
                 let surface_key = (client_id, xdg_surface.wl_surface_id);
                 self.surface_stack.retain(|k| *k != surface_key);
                 if self.focused_surface == Some(surface_key) {
@@ -536,7 +541,8 @@ impl CompositorState {
         self.xdg_surfaces.retain(|_, s| s.client_id != client_id);
         self.xdg_positioners.retain(|_, p| p.client_id != client_id);
         self.viewports.retain(|_, v| v.client_id != client_id);
-        self.surface_viewport.retain(|(cid, _), _| *cid != client_id);
+        self.surface_viewport
+            .retain(|(cid, _), _| *cid != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
         self.subsurface_map.retain(|(cid, _), _| *cid != client_id);

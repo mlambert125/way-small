@@ -3,6 +3,14 @@
 //! Defines BackendMessage (backend→compositor) for input events and lifecycle,
 //! and RenderFrame (compositor→backend) for presenting composited output.
 
+pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
+
+pub struct RenderFrame {
+    pub pixels: Vec<u32>,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum MouseButton {
     Left,
@@ -24,16 +32,14 @@ pub enum KeyState {
 
 #[derive(Debug)]
 pub enum BackendMessage {
-    /// Backend has a seat with these input capabilities.
     SeatCapabilities {
         pointer: bool,
         keyboard: bool,
     },
-    /// Backend has an output (monitor/display) with these properties.
     OutputInfo {
         width: u32,
         height: u32,
-        refresh_mhz: u32, // refresh rate in millihertz (e.g. 60000 = 60Hz)
+        refresh_mhz: u32,
     },
     Closed,
     Resized(u32, u32),
@@ -59,14 +65,4 @@ pub enum BackendMessage {
     },
     FocusIn,
     FocusOut,
-}
-
-/// Default background color used by the renderer and backends.
-pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
-
-/// A composited frame ready for the backend to present.
-pub struct RenderFrame {
-    pub pixels: Vec<u32>,
-    pub width: u32,
-    pub height: u32,
 }

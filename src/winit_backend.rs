@@ -21,7 +21,9 @@ use winit::{
 };
 use xkbcommon::xkb;
 
-use crate::backend::{BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame};
+use crate::backend::{
+    BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame,
+};
 
 enum UserEvent {
     Shutdown,
@@ -108,20 +110,23 @@ impl ApplicationHandler<UserEvent> for App {
 
             // Report hardware capabilities
             let size = window.inner_size();
-            let _ = self.backend_sender.blocking_send(BackendMessage::SeatCapabilities {
-                pointer: true,
-                keyboard: true,
-            });
-            let _ = self.backend_sender.blocking_send(BackendMessage::OutputInfo {
-                width: size.width,
-                height: size.height,
-                refresh_mhz: 60000,
-            });
+            let _ = self
+                .backend_sender
+                .blocking_send(BackendMessage::SeatCapabilities {
+                    pointer: true,
+                    keyboard: true,
+                });
+            let _ = self
+                .backend_sender
+                .blocking_send(BackendMessage::OutputInfo {
+                    width: size.width,
+                    height: size.height,
+                    refresh_mhz: 60000,
+                });
 
             window.set_cursor_visible(false);
             self.window = Some(window);
 
-            // Present initial dark background
             let initial = RenderFrame {
                 pixels: vec![BACKGROUND_COLOR; (size.width * size.height) as usize],
                 width: size.width,
@@ -142,7 +147,6 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = self
                     .backend_sender
                     .blocking_send(BackendMessage::Resized(size.width, size.height));
-                // Repaint with last frame if we have one
                 if let Some(frame) = self.last_frame.clone() {
                     self.present_frame(&frame);
                 }
@@ -154,7 +158,6 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(scancode) = event.physical_key.to_scancode() {
-                    // scancode is evdev keycode on Linux; xkb keycode = evdev + 8
                     let xkb_keycode: xkb::Keycode = (scancode + 8).into();
                     let key_state = if event.state.is_pressed() {
                         KeyState::Pressed
@@ -183,10 +186,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let _ = self.backend_sender.blocking_send(BackendMessage::MouseMove {
-                    x: position.x,
-                    y: position.y,
-                });
+                let _ = self
+                    .backend_sender
+                    .blocking_send(BackendMessage::MouseMove {
+                        x: position.x,
+                        y: position.y,
+                    });
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 let btn = match button {
@@ -200,10 +205,12 @@ impl ApplicationHandler<UserEvent> for App {
                 } else {
                     ButtonState::Released
                 };
-                let _ = self.backend_sender.blocking_send(BackendMessage::MouseButton {
-                    button: btn,
-                    state: st,
-                });
+                let _ = self
+                    .backend_sender
+                    .blocking_send(BackendMessage::MouseButton {
+                        button: btn,
+                        state: st,
+                    });
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -249,13 +256,11 @@ pub fn run_winit_backend(
         .with_any_thread(true)
         .build()?;
 
-    // Signal that the event loop is built and has connected to the host compositor
     let _ = ready_tx.send(());
 
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
     let rt = tokio::runtime::Handle::current();
 
-    // Spawn task to forward shutdown signal
     let shutdown_proxy = proxy.clone();
     let cancel_token_for_shutdown = cancel_token.clone();
     rt.spawn(async move {
@@ -263,7 +268,6 @@ pub fn run_winit_backend(
         let _ = shutdown_proxy.send_event(UserEvent::Shutdown);
     });
 
-    // Spawn task to forward frames from compositor to the event loop
     let frame_proxy = proxy.clone();
     rt.spawn(async move {
         let mut frame_rx = frame_rx;

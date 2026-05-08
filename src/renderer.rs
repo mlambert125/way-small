@@ -11,19 +11,46 @@ use crate::protocol;
 use crate::protocol::state::ClientObjectId;
 
 const BYTES_PER_PIXEL: u64 = 4;
+const CURSOR_W: usize = 12;
+const CURSOR_H: usize = 19;
+const CURSOR_BITMAP: [&[u8; CURSOR_W]; CURSOR_H] = [
+    b"B...........",
+    b"BB..........",
+    b"BWB.........",
+    b"BWWB........",
+    b"BWWWB.......",
+    b"BWWWWB......",
+    b"BWWWWWB.....",
+    b"BWWWWWWB....",
+    b"BWWWWWWWB...",
+    b"BWWWWWWWWB..",
+    b"BWWWWWWWWWB.",
+    b"BWWWWWWWWWWB",
+    b"BWWWWWWBBBBB",
+    b"BWWBWWWB....",
+    b"BWBB.BWWB...",
+    b"BB...BWWB...",
+    b"B.....BWWB..",
+    b"......BWWB..",
+    b".......BB...",
+];
 
-/// Composite all surfaces into a single framebuffer.
+const CURSOR_BLACK: u32 = 0xff000000;
+const CURSOR_WHITE: u32 = 0xffffffff;
+
 pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> RenderFrame {
     let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
 
-    // Draw surfaces in stack order (bottom to top)
     for &key in &state.surface_stack {
-        let (ox, oy) = state.surfaces.get(&key).map(|s| s.position).unwrap_or((0, 0));
+        let (ox, oy) = state
+            .surfaces
+            .get(&key)
+            .map(|s| s.position)
+            .unwrap_or((0, 0));
         blit_surface_tree(state, &mut pixels, width, height, key, ox, oy);
     }
 
-    // Draw the hardware cursor last so that it's on top
-    blit_cursor(
+    blit_mouse_cursor(
         &mut pixels,
         width,
         height,
@@ -38,7 +65,6 @@ pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> Ren
     }
 }
 
-/// Recursively blit a surface and its subsurfaces at the given offset.
 fn blit_surface_tree(
     state: &protocol::CompositorState,
     pixels: &mut [u32],
@@ -55,10 +81,16 @@ fn blit_surface_tree(
     let client_id = surface.client_id;
     let children = surface.children.clone();
 
-    // Blit this surface's buffer
-    blit_surface_buffer(state, pixels, width, height, surface_key, offset_x, offset_y);
+    blit_surface_buffer(
+        state,
+        pixels,
+        width,
+        height,
+        surface_key,
+        offset_x,
+        offset_y,
+    );
 
-    // Blit children at their positions
     for child_id in children {
         let child_key = (client_id, child_id);
         let Some(child) = state.surfaces.get(&child_key) else {
@@ -77,7 +109,6 @@ fn blit_surface_tree(
     }
 }
 
-/// Blit a single surface's buffer into the framebuffer at the given offset.
 fn blit_surface_buffer(
     state: &protocol::CompositorState,
     pixels: &mut [u32],
@@ -101,9 +132,6 @@ fn blit_surface_buffer(
         return;
     };
 
-    // Look up viewport for this surface (crop + scale)
-    // This is optional, and will only be present if the client set a viewport
-    // on this surface.  If there isn't one, we just use the entire buffer at 1:1 scale.
     let viewport = state
         .surface_viewport
         .get(&(client_id, surface_key.1))
@@ -113,7 +141,6 @@ fn blit_surface_buffer(
         return;
     }
 
-    // Use the cached mmap pointer
     let ptr = pool.map_ptr;
     if ptr.is_null() {
         debug!("Pool has no valid mapping for surface {:?}", surface_key);
@@ -231,40 +258,9 @@ fn blit_surface_buffer(
             }
         }
     }
-
 }
 
-// 12x19 arrow cursor bitmap. Each row is a string:
-//   'B' = black (outline), 'W' = white (fill), '.' = transparent
-const CURSOR_W: usize = 12;
-const CURSOR_H: usize = 19;
-// TODO: we need to eventually implement client-set cursors.
-const CURSOR_BITMAP: [&[u8; CURSOR_W]; CURSOR_H] = [
-    b"B...........",
-    b"BB..........",
-    b"BWB.........",
-    b"BWWB........",
-    b"BWWWB.......",
-    b"BWWWWB......",
-    b"BWWWWWB.....",
-    b"BWWWWWWB....",
-    b"BWWWWWWWB...",
-    b"BWWWWWWWWB..",
-    b"BWWWWWWWWWB.",
-    b"BWWWWWWWWWWB",
-    b"BWWWWWWBBBBB",
-    b"BWWBWWWB....",
-    b"BWBB.BWWB...",
-    b"BB...BWWB...",
-    b"B.....BWWB..",
-    b"......BWWB..",
-    b".......BB...",
-];
-
-const CURSOR_BLACK: u32 = 0xff000000;
-const CURSOR_WHITE: u32 = 0xffffffff;
-
-fn blit_cursor(pixels: &mut [u32], width: u32, height: u32, cx: i32, cy: i32) {
+fn blit_mouse_cursor(pixels: &mut [u32], width: u32, height: u32, cx: i32, cy: i32) {
     let w = width as i32;
     let h = height as i32;
 
