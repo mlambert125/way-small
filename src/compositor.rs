@@ -14,7 +14,6 @@ use tracing::{debug, info};
 
 use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol::state::ClientObjectId;
-use crate::protocol::state::Output;
 use crate::protocol::wire_utils::{ArgWriter, message};
 use crate::protocol::{self, CompositorState};
 use crate::protocol::{wl_keyboard, wl_pointer, xdg_toplevel};
@@ -83,7 +82,7 @@ pub async fn run_compositor(
                     BackendMessage::OutputInfo { outputs } => {
                         state.outputs = outputs.clone();
                     }
-                    BackendMessage::Closed(_) => {
+                    BackendMessage::Closed => {
                         info!("Backend requested shutdown");
                         cancel_token.cancel();
                         break;
@@ -249,14 +248,12 @@ pub async fn run_compositor(
             }
             _ = render_timer.tick() => {
                 if state.dirty {
-                    for output in state.outputs {
-                        let frame = Arc::new(renderer::render(&output, &state));
-                        let timestamp_ms = start_time.elapsed().as_millis() as u32;
-                        fire_frame_callbacks(&mut state, timestamp_ms).await;
-                        if frame_sender.send(frame).await.is_err() {
-                            break;
-                        }
+                    for output in &state.outputs {
+                        let frame = Arc::new(renderer::render(output, &state));
+                        let _ = frame_sender.send(frame).await;
                     }
+                    let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                    fire_frame_callbacks(&mut state, timestamp_ms).await;
                     state.dirty = false;
                 }
             }

@@ -163,9 +163,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self
-                    .backend_sender
-                    .blocking_send(BackendMessage::Closed(String::from("winit")));
+                let _ = self.backend_sender.blocking_send(BackendMessage::Closed);
                 self.cancel_token.cancel();
                 event_loop.exit();
             }

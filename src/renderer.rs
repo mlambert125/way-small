@@ -270,17 +270,14 @@ fn blit_surface_buffer(
 }
 
 fn blit_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i32, cy: i32) {
-    let w = width as i32;
-    let h = height as i32;
-
     for (row_idx, row) in CURSOR_BITMAP.iter().enumerate() {
         let dy = cy + row_idx as i32;
-        if dy < 0 || dy >= h {
+        if dy < 0 || dy >= height {
             continue;
         }
         for (col_idx, &ch) in row.iter().enumerate() {
             let dx = cx + col_idx as i32;
-            if dx < 0 || dx >= w {
+            if dx < 0 || dx >= width {
                 continue;
             }
             let color = match ch {

@@ -42,7 +42,9 @@ pub enum BackendMessage {
     OutputInfo {
         outputs: Vec<Output>,
     },
-    Closed(String),
+    // This is only applicable to the winit backend and should not be re-used for monitor
+    // connect/disconnect when we add the linux DMA backend.
+    Closed,
     Resized(String, i32, i32),
     KeyInput {
         keycode: u32,
