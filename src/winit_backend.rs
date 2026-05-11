@@ -25,6 +25,8 @@ use crate::backend::{
     BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame,
 };
 
+use crate::protocol::state::Output;
+
 enum UserEvent {
     Shutdown,
     Frame(Arc<RenderFrame>),
@@ -49,6 +51,9 @@ struct App {
 
 impl App {
     fn present_frame(&mut self, frame: &RenderFrame) {
+        if frame.output_name != "winit" {
+            return;
+        }
         if let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) {
             let size = window.inner_size();
             if let (Some(width), Some(height)) =
@@ -119,18 +124,37 @@ impl ApplicationHandler<UserEvent> for App {
             let _ = self
                 .backend_sender
                 .blocking_send(BackendMessage::OutputInfo {
-                    width: size.width,
-                    height: size.height,
-                    refresh_mhz: 60000,
+                    outputs: vec![Output {
+                        name: String::from("winit"),
+                        description: String::from("winit display backend"),
+                        geometry: crate::protocol::state::OutputGeometry {
+                            x: 0,
+                            y: 0,
+                            physical_width: size.width as i32,
+                            physical_height: size.height as i32,
+                            subpixel: crate::protocol::state::OutputSubpixel::None,
+                            make: String::from("winit"),
+                            model: String::from("winit"),
+                            transform: crate::protocol::state::OutputTransform::Normal,
+                        },
+                        modes: vec![crate::protocol::state::OutputMode {
+                            flags: crate::protocol::state::OutputModeFlags::Current,
+                            width: size.width as i32,
+                            height: size.height as i32,
+                            refresh_mhz: 60000,
+                        }],
+                        scale: 1,
+                    }],
                 });
 
             window.set_cursor_visible(false);
             self.window = Some(window);
 
             let initial = RenderFrame {
+                output_name: String::from("winit"),
                 pixels: vec![BACKGROUND_COLOR; (size.width * size.height) as usize],
-                width: size.width,
-                height: size.height,
+                width: size.width as i32,
+                height: size.height as i32,
             };
             self.present_frame(&initial);
         }
@@ -139,14 +163,18 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                let _ = self.backend_sender.blocking_send(BackendMessage::Closed);
+                let _ = self
+                    .backend_sender
+                    .blocking_send(BackendMessage::Closed(String::from("winit")));
                 self.cancel_token.cancel();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                let _ = self
-                    .backend_sender
-                    .blocking_send(BackendMessage::Resized(size.width, size.height));
+                let _ = self.backend_sender.blocking_send(BackendMessage::Resized(
+                    String::from("winit"),
+                    size.width as i32,
+                    size.height as i32,
+                ));
                 if let Some(frame) = self.last_frame.clone() {
                     self.present_frame(&frame);
                 }

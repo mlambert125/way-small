@@ -188,12 +188,61 @@ pub struct SeatState {
     pub has_keyboard: bool,
 }
 
-/// Output information reported by the backend.
-#[derive(Debug)]
-pub struct OutputState {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_mhz: u32,
+#[derive(Debug, Clone, Copy)]
+pub enum OutputTransform {
+    Normal = 0,
+    Rotate90 = 1,
+    Rotate180 = 2,
+    Rotate270 = 3,
+    Flipped = 4,
+    Flipped90 = 5,
+    Flipped180 = 6,
+    Flipped270 = 7,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OutputSubpixel {
+    Unknown = 0,
+    None = 1,
+    HorizontalRgb = 2,
+    HorizontalBgr = 3,
+    VerticalRgb = 4,
+    VerticalBgr = 5,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputGeometry {
+    pub x: i32,
+    pub y: i32,
+    pub physical_width: i32,
+    pub physical_height: i32,
+    pub subpixel: OutputSubpixel,
+    pub make: String,
+    pub model: String,
+    pub transform: OutputTransform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputModeFlags {
+    Current = 1,
+    Preferred = 2,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputMode {
+    pub flags: OutputModeFlags,
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Output {
+    pub geometry: OutputGeometry,
+    pub modes: Vec<OutputMode>,
+    pub scale: i32,
+    pub name: String,
+    pub description: String,
 }
 
 /// Global compositor state shared across all clients.
@@ -208,7 +257,7 @@ pub struct CompositorState {
     pub xdg_popups: HashMap<ClientObjectId, XdgPopupState>,
     pub xdg_positioners: HashMap<ClientObjectId, XdgPositionerState>,
     pub seat: SeatState,
-    pub output: Option<OutputState>,
+    pub outputs: Vec<Output>,
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
     pub focused_surface: Option<ClientObjectId>,
@@ -248,7 +297,7 @@ impl CompositorState {
             xdg_popups: HashMap::new(),
             xdg_positioners: HashMap::new(),
             seat: SeatState::default(),
-            output: None,
+            outputs: Vec::new(),
             pointers: Vec::new(),
             keyboards: Vec::new(),
             focused_surface: None,

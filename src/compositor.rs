@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
-use crate::protocol;
-use crate::protocol::state::{ClientObjectId, OutputState};
+use crate::protocol::state::ClientObjectId;
+use crate::protocol::state::Output;
 use crate::protocol::wire_utils::{ArgWriter, message};
+use crate::protocol::{self, CompositorState};
 use crate::protocol::{wl_keyboard, wl_pointer, xdg_toplevel};
 use crate::renderer;
 use crate::wayland_socket::WaylandSocketMessage;
@@ -31,8 +32,6 @@ pub async fn run_compositor(
     info!("Running compositor...");
 
     let mut state = protocol::CompositorState::new();
-    let mut output_width: u32 = 800;
-    let mut output_height: u32 = 600;
     let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
     let start_time = Instant::now();
 
@@ -81,25 +80,27 @@ pub async fn run_compositor(
                         state.seat.has_pointer = pointer;
                         state.seat.has_keyboard = keyboard;
                     }
-                    BackendMessage::OutputInfo { width, height, refresh_mhz } => {
-                        info!("Output: {}x{} @{}mHz", width, height, refresh_mhz);
-                        output_width = width;
-                        output_height = height;
-                        state.output = Some(OutputState { width, height, refresh_mhz });
+                    BackendMessage::OutputInfo { outputs } => {
+                        state.outputs = outputs.clone();
                     }
-                    BackendMessage::Closed => {
+                    BackendMessage::Closed(_) => {
                         info!("Backend requested shutdown");
                         cancel_token.cancel();
                         break;
                     }
-                    BackendMessage::Resized(w, h) => {
+                    BackendMessage::Resized(name, w, h) => {
                         info!("Backend resized to {}x{}", w, h);
-                        output_width = w;
-                        output_height = h;
-                        if let Some(ref mut output) = state.output {
-                            output.width = w;
-                            output.height = h;
+
+                        if let Some(output) = state.outputs.iter_mut().find(|o| o.name == name) {
+                            output.geometry.physical_width = w;
+                            output.geometry.physical_height = h;
+
+                            output.modes.iter_mut().for_each(|m| {
+                                m.width = w;
+                                m.height = h;
+                            });
                         }
+
                         protocol::wl_output::broadcast_mode(&mut state).await;
                         state.dirty = true;
                     }
@@ -248,11 +249,13 @@ pub async fn run_compositor(
             }
             _ = render_timer.tick() => {
                 if state.dirty {
-                    let frame = Arc::new(renderer::render(&state, output_width, output_height));
-                    let timestamp_ms = start_time.elapsed().as_millis() as u32;
-                    fire_frame_callbacks(&mut state, timestamp_ms).await;
-                    if frame_sender.send(frame).await.is_err() {
-                        break;
+                    for output in state.outputs {
+                        let frame = Arc::new(renderer::render(&output, &state));
+                        let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                        fire_frame_callbacks(&mut state, timestamp_ms).await;
+                        if frame_sender.send(frame).await.is_err() {
+                            break;
+                        }
                     }
                     state.dirty = false;
                 }
@@ -268,7 +271,7 @@ pub async fn run_compositor(
 }
 
 /// Fire all pending frame callbacks, presentation feedbacks, and release buffers.
-async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_ms: u32) {
+async fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
     let mut callbacks: Vec<(u32, u32)> = Vec::new(); // (client_id, callback_id)
     let mut presentation: Vec<(u32, u32)> = Vec::new(); // (client_id, feedback_id)
     let mut buffers_to_release: Vec<(u32, u32)> = Vec::new(); // (client_id, buffer_id)
@@ -321,20 +324,6 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
         let tv_sec_lo = ts.tv_sec as u32;
         let tv_nsec = ts.tv_nsec as u32;
 
-        // Refresh interval in nanoseconds (from output refresh rate)
-        let refresh_nsec = state
-            .output
-            .as_ref()
-            .and_then(|o| {
-                let hz = o.refresh_mhz / 1000;
-                if hz > 0 {
-                    Some(1_000_000_000u32 / hz)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(16_666_666); // fallback ~60Hz
-
         // wp_presentation_feedback.presented event (opcode 0)
         // flags: 0x1 = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
         let flags: u32 = 0x1;
@@ -343,7 +332,7 @@ async fn fire_frame_callbacks(state: &mut protocol::CompositorState, timestamp_m
                 .u32(tv_sec_hi)
                 .u32(tv_sec_lo)
                 .u32(tv_nsec)
-                .u32(refresh_nsec)
+                .u32(0) // refresh (unused at the moment since we're not doing adaptive sync)
                 .u32(0) // seq_hi
                 .u32(0) // seq_lo
                 .u32(flags)

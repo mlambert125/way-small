@@ -7,8 +7,8 @@
 use tracing::debug;
 
 use crate::backend::{BACKGROUND_COLOR, RenderFrame};
-use crate::protocol;
-use crate::protocol::state::ClientObjectId;
+use crate::protocol::state::{ClientObjectId, Output};
+use crate::protocol::{self, CompositorState};
 
 const BYTES_PER_PIXEL: u64 = 4;
 const CURSOR_W: usize = 12;
@@ -38,7 +38,15 @@ const CURSOR_BITMAP: [&[u8; CURSOR_W]; CURSOR_H] = [
 const CURSOR_BLACK: u32 = 0xff000000;
 const CURSOR_WHITE: u32 = 0xffffffff;
 
-pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> RenderFrame {
+pub fn render(output: &Output, state: &CompositorState) -> RenderFrame {
+    let mode = output
+        .modes
+        .iter()
+        .find(|m| (m.flags as u32 & protocol::wl_output::MODE_CURRENT) != 0)
+        .expect("Output has no current mode");
+    let width = mode.width;
+    let height = mode.height;
+
     let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
 
     for &key in &state.surface_stack {
@@ -59,6 +67,7 @@ pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> Ren
     );
 
     RenderFrame {
+        output_name: output.name.clone(),
         pixels,
         width,
         height,
@@ -68,8 +77,8 @@ pub fn render(state: &protocol::CompositorState, width: u32, height: u32) -> Ren
 fn blit_surface_tree(
     state: &protocol::CompositorState,
     pixels: &mut [u32],
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
     surface_key: ClientObjectId,
     offset_x: i32,
     offset_y: i32,
@@ -112,8 +121,8 @@ fn blit_surface_tree(
 fn blit_surface_buffer(
     state: &protocol::CompositorState,
     pixels: &mut [u32],
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
     surface_key: ClientObjectId,
     offset_x: i32,
     offset_y: i32,
@@ -260,7 +269,7 @@ fn blit_surface_buffer(
     }
 }
 
-fn blit_mouse_cursor(pixels: &mut [u32], width: u32, height: u32, cx: i32, cy: i32) {
+fn blit_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i32, cy: i32) {
     let w = width as i32;
     let h = height as i32;
 
