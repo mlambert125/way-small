@@ -25,7 +25,9 @@ use crate::backend::{
     BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame,
 };
 
-use crate::protocol::state::Output;
+use crate::protocol::state::{Output, OutputId, OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED};
+
+const WINIT_OUTPUT_ID: OutputId = OutputId(1);
 
 enum UserEvent {
     Shutdown,
@@ -51,7 +53,7 @@ struct App {
 
 impl App {
     fn present_frame(&mut self, frame: &RenderFrame) {
-        if frame.output_name != "winit" {
+        if frame.output_id != WINIT_OUTPUT_ID {
             return;
         }
         if let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) {
@@ -125,6 +127,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .backend_sender
                 .blocking_send(BackendMessage::OutputInfo {
                     outputs: vec![Output {
+                        id: WINIT_OUTPUT_ID,
                         name: String::from("winit"),
                         description: String::from("winit display backend"),
                         geometry: crate::protocol::state::OutputGeometry {
@@ -138,7 +141,7 @@ impl ApplicationHandler<UserEvent> for App {
                             transform: crate::protocol::state::OutputTransform::Normal,
                         },
                         modes: vec![crate::protocol::state::OutputMode {
-                            flags: crate::protocol::state::OutputModeFlags::Current,
+                            flags: OUTPUT_MODE_CURRENT | OUTPUT_MODE_PREFERRED,
                             width: size.width as i32,
                             height: size.height as i32,
                             refresh_mhz: 60000,
@@ -151,7 +154,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.window = Some(window);
 
             let initial = RenderFrame {
-                output_name: String::from("winit"),
+                output_id: WINIT_OUTPUT_ID,
                 pixels: vec![BACKGROUND_COLOR; (size.width * size.height) as usize],
                 width: size.width as i32,
                 height: size.height as i32,
@@ -169,7 +172,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Resized(size) => {
                 let _ = self.backend_sender.blocking_send(BackendMessage::Resized(
-                    String::from("winit"),
+                    WINIT_OUTPUT_ID,
                     size.width as i32,
                     size.height as i32,
                 ));

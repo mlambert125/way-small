@@ -37,12 +37,10 @@ async fn handle_get_viewport(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(viewport_id), Some(surface_id)) = (args.new_id(), args.u32()) else {

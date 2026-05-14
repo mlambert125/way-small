@@ -30,12 +30,10 @@ async fn handle_create_data_source(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(source_id) = args.new_id() else {
@@ -61,12 +59,10 @@ async fn handle_get_data_device(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     // get_data_device args: new_id, object seat

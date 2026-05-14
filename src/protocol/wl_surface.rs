@@ -88,12 +88,10 @@ fn handle_damage(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 }
 
 fn handle_frame(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let mut args = ArgReader::new(&msg.message.args);
     // frame args: new_id callback
     let Some(callback_id) = args.new_id() else {

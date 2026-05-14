@@ -44,13 +44,57 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-fn process_set_cursor(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn process_set_cursor(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
-    if let (Some(_serial), Some(_surface), Some(_hotspot_x), Some(_hotspot_y)) =
+    let (Some(serial), Some(surface_id), Some(hotspot_x), Some(hotspot_y)) =
         (args.u32(), args.u32(), args.i32(), args.i32())
-    {
-        // TODO: Process set cursor message
+    else {
+        return;
+    };
+
+    let client_id = msg.client_id;
+
+    // Validate serial matches the most recent enter serial for this client.
+    if state.pointer_enter_serial.get(&client_id) != Some(&serial) {
+        return;
     }
+
+    // surface_id == 0 means hide cursor.
+    if surface_id == 0 {
+        state.cursor_surfaces.insert(client_id, None);
+        state.dirty = true;
+        return;
+    }
+
+    let surface_key = (client_id, surface_id);
+
+    // Check the surface exists.
+    if !state.surfaces.contains_key(&surface_key) {
+        return;
+    }
+
+    // Role check: surface must not already have another role (subsurface or xdg_surface).
+    let is_subsurface = state
+        .surfaces
+        .get(&surface_key)
+        .map(|s| s.parent.is_some())
+        .unwrap_or(false);
+    let is_xdg = state
+        .xdg_surfaces
+        .values()
+        .any(|x| x.client_id == client_id && x.wl_surface_id == surface_id);
+
+    if is_subsurface || is_xdg {
+        return;
+    }
+
+    // Assign cursor role (permanent).
+    state.cursor_role_surfaces.insert(surface_key);
+
+    state
+        .cursor_surfaces
+        .insert(client_id, Some((surface_id, hotspot_x, hotspot_y)));
+    state.dirty = true;
 }
 
 /// Send wl_pointer.enter to a client's pointer object.
@@ -63,6 +107,7 @@ pub async fn send_enter(
     y: f64,
 ) {
     let serial = next_serial();
+    state.pointer_enter_serial.insert(client_id, serial);
     let args = ArgWriter::new()
         .u32(serial)
         .u32(surface_id)

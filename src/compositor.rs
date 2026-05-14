@@ -16,12 +16,13 @@ use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol::state::ClientObjectId;
 use crate::protocol::wire_utils::{ArgWriter, message};
 use crate::protocol::{self, CompositorState};
-use crate::protocol::{wl_keyboard, wl_pointer, xdg_toplevel};
+use crate::protocol::{wl_keyboard, wl_pointer, wl_registry, xdg_popup, xdg_toplevel};
 use crate::renderer;
 use crate::wayland_socket::WaylandSocketMessage;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16); // ~60fps
 
+#[allow(clippy::too_many_lines)]
 pub async fn run_compositor(
     mut wayland_message_receiver: Receiver<WaylandSocketMessage>,
     mut backend_message_receiver: Receiver<BackendMessage>,
@@ -31,6 +32,10 @@ pub async fn run_compositor(
     info!("Running compositor...");
 
     let mut state = protocol::CompositorState::new();
+    state.default_cursor = renderer::load_default_cursor();
+    if state.default_cursor.is_none() {
+        info!("No cursor theme found, using built-in cursor");
+    }
     let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
     let start_time = Instant::now();
 
@@ -80,17 +85,34 @@ pub async fn run_compositor(
                         state.seat.has_keyboard = keyboard;
                     }
                     BackendMessage::OutputInfo { outputs } => {
-                        state.outputs = outputs.clone();
+                        for new_output in outputs {
+                            if state.outputs.iter().any(|o| o.id == new_output.id) {
+                                // Update existing output (preserve global name mapping)
+                                if let Some(existing) = state.outputs.iter_mut().find(|o| o.id == new_output.id) {
+                                    existing.geometry = new_output.geometry;
+                                    existing.modes = new_output.modes;
+                                    existing.scale = new_output.scale;
+                                    existing.description = new_output.description;
+                                }
+                            } else {
+                                // New output — assign a global name and advertise
+                                let global_name = state.next_global_number;
+                                state.next_global_number += 1;
+                                state.output_global_names.insert(new_output.id, global_name);
+                                state.outputs.push(new_output);
+                                wl_registry::broadcast_output_global(&mut state, global_name).await;
+                            }
+                        }
                     }
                     BackendMessage::Closed => {
                         info!("Backend requested shutdown");
                         cancel_token.cancel();
                         break;
                     }
-                    BackendMessage::Resized(name, w, h) => {
+                    BackendMessage::Resized(output_id, w, h) => {
                         info!("Backend resized to {}x{}", w, h);
 
-                        if let Some(output) = state.outputs.iter_mut().find(|o| o.name == name) {
+                        if let Some(output) = state.outputs.iter_mut().find(|o| o.id == output_id) {
                             output.geometry.physical_width = w;
                             output.geometry.physical_height = h;
 
@@ -152,8 +174,8 @@ pub async fn run_compositor(
                             }
                             state.pointer_surface = new_pointer_surface;
                             if let Some(ref h) = hit {
-                                let local_x = x - h.surface_x as f64;
-                                let local_y = y - h.surface_y as f64;
+                                let local_x = x - f64::from(h.surface_x);
+                                let local_y = y - f64::from(h.surface_y);
                                 for ptr in state.pointers.clone() {
                                     if ptr.client_id == h.surface.0 {
                                         wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, h.surface.1, local_x, local_y).await;
@@ -165,8 +187,8 @@ pub async fn run_compositor(
 
                         // Send motion to the current pointer surface
                         if let Some(ref h) = hit {
-                            let local_x = x - h.surface_x as f64;
-                            let local_y = y - h.surface_y as f64;
+                            let local_x = x - f64::from(h.surface_x);
+                            let local_y = y - f64::from(h.surface_y);
                             for ptr in state.pointers.clone() {
                                 if ptr.client_id == h.surface.0 {
                                     wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, local_x, local_y).await;
@@ -185,6 +207,15 @@ pub async fn run_compositor(
                             MouseButton::Middle => 0x112,
                         };
 
+                        // Dismiss grabbed popups if click lands outside them
+                        if pressed && !state.grabbed_popups.is_empty() {
+                            let dismissed = dismiss_popups_outside_click(&mut state).await;
+                            if dismissed {
+                                // Don't process the click further — it was consumed by dismissal
+                                continue;
+                            }
+                        }
+
                         // On press, hit-test and raise/focus the clicked surface
                         let cx = state.cursor_x;
                         let cy = state.cursor_y;
@@ -199,8 +230,8 @@ pub async fn run_compositor(
                             // Update pointer surface to the specific surface under cursor
                             if state.pointer_surface != Some(hit.surface) {
                                 state.pointer_surface = Some(hit.surface);
-                                let local_x = cx - hit.surface_x as f64;
-                                let local_y = cy - hit.surface_y as f64;
+                                let local_x = cx - f64::from(hit.surface_x);
+                                let local_y = cy - f64::from(hit.surface_y);
                                 for ptr in state.pointers.clone() {
                                     if ptr.client_id == hit.surface.0 {
                                         wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, hit.surface.1, local_x, local_y).await;
@@ -248,6 +279,8 @@ pub async fn run_compositor(
             }
             _ = render_timer.tick() => {
                 if state.dirty {
+                    // TODO: track per-output dirty flags to avoid re-rendering
+                    // outputs that haven't changed.
                     for output in &state.outputs {
                         let frame = Arc::new(renderer::render(output, &state));
                         let _ = frame_sender.send(frame).await;
@@ -257,7 +290,7 @@ pub async fn run_compositor(
                     state.dirty = false;
                 }
             }
-            _ = cancel_token.cancelled() => {
+            () = cancel_token.cancelled() => {
                 info!("Compositor received shutdown signal");
                 break;
             }
@@ -316,7 +349,7 @@ async fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
         let tv_sec_hi = (ts.tv_sec as u64 >> 32) as u32;
         let tv_sec_lo = ts.tv_sec as u32;
         let tv_nsec = ts.tv_nsec as u32;
@@ -360,7 +393,7 @@ async fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
 }
 
 /// Switch keyboard focus to a new toplevel surface. Sends keyboard enter/leave
-/// and xdg_toplevel activated/deactivated configure events. Pointer focus is
+/// and `xdg_toplevel` activated/deactivated configure events. Pointer focus is
 /// tracked separately via `state.pointer_surface`.
 pub async fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObjectId) {
     let old_key = state.focused_surface;
@@ -395,7 +428,7 @@ pub async fn switch_focus(state: &mut protocol::CompositorState, new_key: Client
 /// Result of a hit test: which toplevel was hit, and which specific surface
 /// (possibly a subsurface) the pointer is actually over.
 struct HitResult {
-    /// The toplevel surface key (in surface_stack) — used for stacking/keyboard focus.
+    /// The toplevel surface key (in `surface_stack`) — used for stacking/keyboard focus.
     toplevel: ClientObjectId,
     /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
     surface: ClientObjectId,
@@ -493,4 +526,72 @@ fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) ->
         return (0, 0);
     };
     (buf.width, buf.height)
+}
+
+/// Check if the pointer is outside the topmost grabbed popup. If so, dismiss
+/// popups from the top of the grab stack until we reach one that contains the
+/// pointer (or the stack is empty). Returns true if any popup was dismissed.
+async fn dismiss_popups_outside_click(state: &mut CompositorState) -> bool {
+    let px = state.cursor_x as i32;
+    let py = state.cursor_y as i32;
+    let mut dismissed = false;
+
+    while let Some(&(client_id, popup_id)) = state.grabbed_popups.last() {
+        // Find the popup's wl_surface and compute its global position
+        let popup_surface = state
+            .xdg_popups
+            .get(&(client_id, popup_id))
+            .and_then(|p| state.xdg_surfaces.get(&(client_id, p.xdg_surface_id)))
+            .map(|xs| xs.wl_surface_id);
+
+        let Some(wl_surface_id) = popup_surface else {
+            state.grabbed_popups.pop();
+            continue;
+        };
+
+        // Walk up the parent chain to compute global position
+        let global_pos = surface_global_position(state, client_id, wl_surface_id);
+        let (w, h) = surface_dimensions(state, (client_id, wl_surface_id));
+
+        if px >= global_pos.0
+            && py >= global_pos.1
+            && px < global_pos.0 + w
+            && py < global_pos.1 + h
+        {
+            // Click is inside this popup — stop dismissing
+            break;
+        }
+
+        // Click is outside — dismiss this popup
+        state.grabbed_popups.pop();
+        xdg_popup::send_popup_done(state, client_id, popup_id).await;
+        dismissed = true;
+    }
+
+    dismissed
+}
+
+/// Compute the global position of a surface by walking up the parent chain.
+fn surface_global_position(state: &CompositorState, client_id: u32, surface_id: u32) -> (i32, i32) {
+    let mut x = 0i32;
+    let mut y = 0i32;
+    let mut current = surface_id;
+
+    loop {
+        let Some(surface) = state.surfaces.get(&(client_id, current)) else {
+            break;
+        };
+        x += surface.subsurface_position.0;
+        y += surface.subsurface_position.1;
+        if let Some(parent_id) = surface.parent {
+            current = parent_id;
+        } else {
+            // Root surface — add its global position
+            x += surface.position.0;
+            y += surface.position.1;
+            break;
+        }
+    }
+
+    (x, y)
 }

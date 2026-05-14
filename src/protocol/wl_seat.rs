@@ -48,12 +48,10 @@ async fn handle_get_pointer(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let mut args = ArgReader::new(&msg.message.args);
     let Some(pointer_id) = args.new_id() else {
         client
@@ -80,12 +78,10 @@ async fn handle_get_keyboard(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(keyboard_id) = args.new_id() else {
@@ -114,12 +110,10 @@ async fn handle_get_keyboard(
 
 /// Send wl_seat.capabilities and wl_seat.name after a client binds.
 pub async fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32) {
-    let client = state.clients.get(client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let mut caps: u32 = 0;
     if state.seat.has_pointer {
         caps |= CAP_POINTER;

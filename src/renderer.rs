@@ -4,16 +4,14 @@
 //! rendering. Reads pixel data from client shm pools via mmap, handles
 //! subsurface tree traversal, and performs pre-multiplied alpha blending.
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::backend::{BACKGROUND_COLOR, RenderFrame};
-use crate::protocol::state::{ClientObjectId, Output};
+use crate::protocol::state::{ClientObjectId, DefaultCursor, OUTPUT_MODE_CURRENT, Output};
 use crate::protocol::{self, CompositorState};
 
 const BYTES_PER_PIXEL: u64 = 4;
-const CURSOR_W: usize = 12;
-const CURSOR_H: usize = 19;
-const CURSOR_BITMAP: [&[u8; CURSOR_W]; CURSOR_H] = [
+const FALLBACK_CURSOR_BITMAP: [&[u8; 12]; 19] = [
     b"B...........",
     b"BB..........",
     b"BWB.........",
@@ -35,14 +33,25 @@ const CURSOR_BITMAP: [&[u8; CURSOR_W]; CURSOR_H] = [
     b".......BB...",
 ];
 
-const CURSOR_BLACK: u32 = 0xff000000;
-const CURSOR_WHITE: u32 = 0xffffffff;
+const CURSOR_BLACK: u32 = 0xff00_0000;
+const CURSOR_WHITE: u32 = 0xffff_ffff;
+
+/// Blend a premultiplied-alpha source pixel onto a destination pixel.
+#[inline]
+fn blend_premultiplied(dst: u32, src: u32, alpha: u32) -> u32 {
+    let inv_alpha = 255 - alpha;
+    let dst_rb = ((dst & 0x00ff_00ff) * inv_alpha) >> 8;
+    let rb = (src & 0x00ff_00ff) + (dst_rb & 0x00ff_00ff);
+    let dst_g = ((dst & 0x0000_ff00) * inv_alpha) >> 8;
+    let g = (src & 0x0000_ff00) + (dst_g & 0x0000_ff00);
+    0xff00_0000 | (rb & 0x00ff_00ff) | (g & 0x0000_ff00)
+}
 
 pub fn render(output: &Output, state: &CompositorState) -> RenderFrame {
     let mode = output
         .modes
         .iter()
-        .find(|m| (m.flags as u32 & protocol::wl_output::MODE_CURRENT) != 0)
+        .find(|m| m.flags & OUTPUT_MODE_CURRENT != 0)
         .expect("Output has no current mode");
     let width = mode.width;
     let height = mode.height;
@@ -50,24 +59,22 @@ pub fn render(output: &Output, state: &CompositorState) -> RenderFrame {
     let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
 
     for &key in &state.surface_stack {
-        let (ox, oy) = state
-            .surfaces
-            .get(&key)
-            .map(|s| s.position)
-            .unwrap_or((0, 0));
+        let (ox, oy) = state.surfaces.get(&key).map_or((0, 0), |s| s.position);
         blit_surface_tree(state, &mut pixels, width, height, key, ox, oy);
     }
 
-    blit_mouse_cursor(
-        &mut pixels,
-        width,
-        height,
-        state.cursor_x as i32,
-        state.cursor_y as i32,
-    );
+    let cx = state.cursor_x as i32;
+    let cy = state.cursor_y as i32;
+    if !blit_client_cursor(state, &mut pixels, width, height, cx, cy) {
+        if let Some(ref cursor) = state.default_cursor {
+            blit_default_cursor(cursor, &mut pixels, width, height, cx, cy);
+        } else {
+            blit_fallback_mouse_cursor(&mut pixels, width, height, cx, cy);
+        }
+    }
 
     RenderFrame {
-        output_name: output.name.clone(),
+        output_id: output.id,
         pixels,
         width,
         height,
@@ -118,6 +125,7 @@ fn blit_surface_tree(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn blit_surface_buffer(
     state: &protocol::CompositorState,
     pixels: &mut [u32],
@@ -246,31 +254,144 @@ fn blit_surface_buffer(
             // Destination index (calculated from loops)
             let dst_idx = dst_row_start + dst_x as usize;
 
-            // If the source pixel is fully opaque, just copy it.
             if alpha == 255 {
-                pixels[dst_idx] = src | 0xff000000;
-            // If the source pixel is fully transparent, skip it.
-            } else if alpha == 0 {
-                continue;
-            // Otherwise, blend the source pixel with the destination pixel using pre-multiplied alpha.
-            } else {
-                let dst = pixels[dst_idx];
-                let inv_alpha = 255 - alpha;
-
-                let dst_rb = ((dst & 0x00ff00ff) * inv_alpha) >> 8;
-                let rb = (src & 0x00ff00ff) + (dst_rb & 0x00ff00ff);
-
-                let dst_g = ((dst & 0x0000ff00) * inv_alpha) >> 8;
-                let g = (src & 0x0000ff00) + (dst_g & 0x0000ff00);
-
-                pixels[dst_idx] = 0xff000000 | (rb & 0x00ff00ff) | (g & 0x0000ff00);
+                pixels[dst_idx] = src | 0xff00_0000;
+            } else if alpha != 0 {
+                pixels[dst_idx] = blend_premultiplied(pixels[dst_idx], src, alpha);
             }
         }
     }
 }
 
-fn blit_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i32, cy: i32) {
-    for (row_idx, row) in CURSOR_BITMAP.iter().enumerate() {
+/// Try to render the focused client's cursor surface. Returns true if a client cursor
+/// was used (including hidden cursors), false to fall back to the hardcoded bitmap.
+fn blit_client_cursor(
+    state: &protocol::CompositorState,
+    pixels: &mut [u32],
+    width: i32,
+    height: i32,
+    cx: i32,
+    cy: i32,
+) -> bool {
+    // Determine which client currently has pointer focus.
+    let Some((pointer_client, _)) = state.pointer_surface else {
+        return false;
+    };
+
+    // Look up that client's cursor surface.
+    match state.cursor_surfaces.get(&pointer_client) {
+        Some(None) => true, // Client wants hidden cursor
+        Some(&Some((surface_id, hotspot_x, hotspot_y))) => {
+            let surface_key = (pointer_client, surface_id);
+            if state
+                .surfaces
+                .get(&surface_key)
+                .and_then(|s| s.buffer_id)
+                .is_none()
+            {
+                return false; // No buffer attached yet
+            }
+            blit_surface_buffer(
+                state,
+                pixels,
+                width,
+                height,
+                surface_key,
+                cx - hotspot_x,
+                cy - hotspot_y,
+            );
+            true
+        }
+        None => false, // Client hasn't set a cursor
+    }
+}
+
+/// Load the default cursor from the system cursor theme.
+///
+/// Reads `$XCURSOR_THEME` (default: "default") and `$XCURSOR_SIZE` (default: 24),
+/// loads the `left_ptr` cursor, and converts the pixel data to ARGB u32 format.
+pub fn load_default_cursor() -> Option<DefaultCursor> {
+    let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+    let target_size = std::env::var("XCURSOR_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(24);
+
+    let theme = xcursor::CursorTheme::load(&theme_name);
+    let cursor_path = theme.load_icon("left_ptr")?;
+    let content = std::fs::read(&cursor_path).ok()?;
+    let images = xcursor::parser::parse_xcursor(&content)?;
+
+    // Pick the image closest to the requested size.
+    let image = images
+        .iter()
+        .min_by_key(|img| (img.size as i32 - target_size as i32).unsigned_abs())?;
+
+    // The xcursor file stores pixels as little-endian 32-bit ARGB (premultiplied alpha).
+    // The crate's `pixels_rgba` is the raw file bytes: [B, G, R, A] per pixel on LE systems.
+    // Reading as LE u32 gives us 0xAARRGGBB directly, matching our framebuffer format.
+    let pixels: Vec<u32> = image
+        .pixels_rgba
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    info!(
+        "Loaded cursor theme '{}': {}x{} hotspot=({},{}) from {:?}",
+        theme_name, image.width, image.height, image.xhot, image.yhot, cursor_path
+    );
+
+    Some(DefaultCursor {
+        pixels,
+        width: image.width as i32,
+        height: image.height as i32,
+        hotspot_x: image.xhot as i32,
+        hotspot_y: image.yhot as i32,
+    })
+}
+
+/// Blit a pre-loaded theme cursor onto the framebuffer with premultiplied alpha blending.
+fn blit_default_cursor(
+    cursor: &DefaultCursor,
+    pixels: &mut [u32],
+    width: i32,
+    height: i32,
+    cx: i32,
+    cy: i32,
+) {
+    let draw_x = cx - cursor.hotspot_x;
+    let draw_y = cy - cursor.hotspot_y;
+
+    for sy in 0..cursor.height {
+        let dy = draw_y + sy;
+        if dy < 0 || dy >= height {
+            continue;
+        }
+        for sx in 0..cursor.width {
+            let dx = draw_x + sx;
+            if dx < 0 || dx >= width {
+                continue;
+            }
+
+            let src = cursor.pixels[(sy * cursor.width + sx) as usize];
+            let alpha = (src >> 24) & 0xff;
+
+            if alpha == 0 {
+                continue;
+            }
+
+            let dst_idx = (dy * width + dx) as usize;
+            if alpha == 255 {
+                pixels[dst_idx] = src;
+            } else {
+                pixels[dst_idx] = blend_premultiplied(pixels[dst_idx], src, alpha);
+            }
+        }
+    }
+}
+
+fn blit_fallback_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i32, cy: i32) {
+    for (row_idx, row) in FALLBACK_CURSOR_BITMAP.iter().enumerate() {
         let dy = cy + row_idx as i32;
         if dy < 0 || dy >= height {
             continue;

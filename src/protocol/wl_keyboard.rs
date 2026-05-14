@@ -67,12 +67,10 @@ fn get_keymap() -> Option<&'static str> {
 
 /// Send the XKB keymap to a client's keyboard object via an FD.
 pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32) {
-    let client = state.clients.get(client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let Some(keymap_str) = get_keymap() else {
         tracing::warn!("Failed to create default xkb keymap");

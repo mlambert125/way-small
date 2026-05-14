@@ -33,11 +33,9 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 
 #[allow(dead_code)]
 pub async fn send_release(state: &mut CompositorState, client_id: u32, buffer_id: u32) {
-    let client = state.clients.get(client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let _ = client.send(message(buffer_id, RELEASE, vec![])).await;
 }

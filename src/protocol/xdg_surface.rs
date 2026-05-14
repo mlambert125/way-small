@@ -48,12 +48,10 @@ async fn handle_get_toplevel(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let mut args = ArgReader::new(&msg.message.args);
     let Some(toplevel_id) = args.new_id() else {
         client
@@ -83,12 +81,10 @@ async fn handle_get_toplevel(
     let serial = super::next_serial();
     let args = ArgWriter::new().u32(serial).build();
 
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
 
     // Take focus on the new toplevel
@@ -102,12 +98,10 @@ async fn handle_get_toplevel(
 }
 
 async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let mut args = ArgReader::new(&msg.message.args);
     // get_popup args: new_id popup, object parent (xdg_surface), object positioner
     let (Some(popup_id), Some(parent_xdg_surface_id), Some(positioner_id)) =
@@ -176,12 +170,10 @@ async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMess
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
     let configure_args = ArgWriter::new().u32(serial).build();
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
     let _ = client
         .send(message(xdg_surface_id, CONFIGURE, configure_args))
         .await;

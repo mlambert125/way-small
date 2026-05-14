@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic)]
+
 //! Entry point for way-small.
 //!
 //! Parses CLI args and config, selects a backend, wires up channels between
@@ -71,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         socket_name.clone()
     } else {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is not set");
-        format!("{}/{}", runtime_dir, socket_name)
+        format!("{runtime_dir}/{socket_name}")
     };
 
     info!("Using backend: {:?}", backend);
@@ -140,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
             info!("Received Ctrl+C, shutting down...");
             cancel_token.cancel();
         }
-        _ = cancel_token.cancelled() => {
+        () = cancel_token.cancelled() => {
             info!("Shutdown triggered by a subsystem");
         }
     }

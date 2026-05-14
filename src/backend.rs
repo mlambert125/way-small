@@ -1,14 +1,14 @@
 //! Backend message types.
 //!
-//! Defines BackendMessage (backend→compositor) for input events and lifecycle,
-//! and RenderFrame (compositor→backend) for presenting composited output.
+//! Defines `BackendMessage` (backend→compositor) for input events and lifecycle,
+//! and `RenderFrame` (compositor→backend) for presenting composited output.
 
-use crate::protocol::state::Output;
+use crate::protocol::state::{Output, OutputId};
 
 pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
 
 pub struct RenderFrame {
-    pub output_name: String,
+    pub output_id: OutputId,
     pub pixels: Vec<u32>,
     pub width: i32,
     pub height: i32,
@@ -45,7 +45,7 @@ pub enum BackendMessage {
     // This is only applicable to the winit backend and should not be re-used for monitor
     // connect/disconnect when we add the linux DMA backend.
     Closed,
-    Resized(String, i32, i32),
+    Resized(OutputId, i32, i32),
     KeyInput {
         keycode: u32,
         state: KeyState,

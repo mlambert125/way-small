@@ -35,12 +35,10 @@ async fn handle_get_subsurface(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     // get_subsurface args: new_id, object surface, object parent
@@ -58,6 +56,21 @@ async fn handle_get_subsurface(
     };
 
     let client_id = msg.client_id;
+
+    if state
+        .cursor_role_surfaces
+        .contains(&(client_id, surface_id))
+    {
+        client
+            .send_error(
+                msg.message.object_id,
+                0,
+                "wl_subcompositor.get_subsurface: surface already has cursor role",
+            )
+            .await;
+        return;
+    }
+
     debug!(
         "wl_subcompositor.get_subsurface: subsurface_id={} surface_id={} parent_id={}",
         subsurface_id, surface_id, parent_id

@@ -36,12 +36,10 @@ async fn handle_create_pool(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let client = state.clients.get(msg.client_id);
-    if client.is_none() {
+    let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let mut args = ArgReader::new(&msg.message.args);
     // create_pool args: new_id, fd (passed out-of-band), int32 size

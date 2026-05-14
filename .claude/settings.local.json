@@ -25,7 +25,21 @@
       "Bash(find /home/mikel/projects/way-small/src -type f -exec wc -l {} +)",
       "Bash(wc -l /home/mikel/projects/way-small/src/*.rs /home/mikel/projects/way-small/src/protocol/*.rs)",
       "Bash(find /home/mikel/projects/way-small/src -name \"*.rs\" -type f -exec wc -l {} +)",
-      "Bash(cargo metadata:*)"
+      "Bash(cargo metadata:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.piston.rs)",
+      "Read(//home/mikel/.icons/default/cursors/**)",
+      "Read(//home/mikel/.icons/catppuccin-mocha-mauve-cursors/cursors/**)",
+      "Read(//usr/share/icons/catppuccin-mocha-mauve-cursors/cursors/**)",
+      "Read(//usr/share/**)",
+      "Read(//home/mikel/.local/share/icons/**)",
+      "Read(//home/mikel/.local/share/icons/catppuccin-mocha-mauve-cursors/cursors/**)",
+      "Bash(xargs cat:*)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(ls -la /home/mikel/projects/way-small/src/protocol/*.rs)",
+      "Bash(perl:*)"
     ]
   }
 }

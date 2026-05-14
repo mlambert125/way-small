@@ -1,8 +1,8 @@
 //! Protocol module root.
 //!
 //! Declares submodules, re-exports key types, defines shared protocol
-//! constants (ObjectType, globals table, serial generation), and provides
-//! the top-level handle_message() dispatch.
+//! constants (`ObjectType`, globals table, serial generation), and provides
+//! the top-level `handle_message()` dispatch.
 
 pub mod client;
 pub mod state;
@@ -87,11 +87,16 @@ pub enum ObjectType {
     WpViewport,
 }
 
-/// A global interface that clients can bind via wl_registry.
+/// A global interface that clients can bind via `wl_registry`.
 pub struct Global {
     pub interface: &'static str,
     pub version: u32,
 }
+
+/// The `wl_output` version we support. Defined here since `wl_output` globals
+/// are dynamically advertised (one per physical output) rather than being
+/// in the static GLOBALS array.
+pub const WL_OUTPUT_VERSION: u32 = 4;
 
 pub static GLOBALS: &[Global] = &[
     Global {
@@ -114,10 +119,8 @@ pub static GLOBALS: &[Global] = &[
         interface: "wl_seat",
         version: 8,
     },
-    Global {
-        interface: "wl_output",
-        version: 4,
-    },
+    // wl_output is not in this static list — each physical output gets its own
+    // dynamic global, managed via CompositorState::output_global_names.
     Global {
         interface: "xdg_wm_base",
         version: 5,
@@ -136,25 +139,23 @@ pub static GLOBALS: &[Global] = &[
     },
 ];
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_message(
     state: &mut CompositorState,
     message: &WaylandProtocolMessageWithClientInfo,
 ) {
     let object_id = message.message.object_id;
     let client_id = message.client_id;
-    let client = state.clients.get(client_id);
-
-    if client.is_none() {
+    let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", message.client_id);
         return;
-    }
-    let client = client.unwrap();
+    };
 
     let obj_type = client.objects.get(&object_id).copied();
 
     match obj_type {
         Some(ObjectType::WlDisplay) => {
-            wl_display::handle(client, message).await;
+            wl_display::handle(state, message).await;
         }
         Some(ObjectType::WlRegistry) => {
             wl_registry::handle(state, message).await;
@@ -249,7 +250,7 @@ pub async fn handle_message(
             );
             // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
             client
-                .send_error(object_id, 0, &format!("invalid object {}", object_id))
+                .send_error(object_id, 0, &format!("invalid object {object_id}"))
                 .await;
         }
     }

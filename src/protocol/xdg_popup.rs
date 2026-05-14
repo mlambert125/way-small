@@ -24,7 +24,7 @@ const POPUP_DONE: u16 = 1;
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => handle_destroy(state, msg).await,
-        GRAB => handle_grab(msg),
+        GRAB => handle_grab(state, msg),
         REPOSITION => {
             debug!("xdg_popup.reposition: not yet implemented");
         }
@@ -59,19 +59,18 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
         }
     }
 
+    state.grabbed_popups.retain(|k| *k != (client_id, popup_id));
     state.destroy_xdg_popup(client_id, popup_id);
     if let Some(client) = state.clients.get(msg.client_id) {
         client.unregister(popup_id).await;
     }
 }
 
-fn handle_grab(msg: &WaylandProtocolMessageWithClientInfo) {
-    // grab args: object seat, uint serial
-    // Acknowledged but not enforced — we don't do exclusive grabs yet
-    debug!(
-        "xdg_popup.grab: popup_id={} (acknowledged)",
-        msg.message.object_id
-    );
+fn handle_grab(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let popup_id = msg.message.object_id;
+    let client_id = msg.client_id;
+    debug!("xdg_popup.grab: popup_id={}", popup_id);
+    state.grabbed_popups.push((client_id, popup_id));
 }
 
 /// Send xdg_popup.configure event with the computed position and size.
