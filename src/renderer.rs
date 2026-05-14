@@ -173,7 +173,7 @@ fn blit_surface_buffer(
     let buf_end = shm_buffer.offset as u64
         + (shm_buffer.height as u64 - 1) * shm_buffer.stride as u64
         + last_row_size;
-    if buf_end > pool.size as u64 {
+    if buf_end > u64::from(pool.size) {
         debug!(
             "Buffer exceeds pool size: end={} pool_size={} surface={:?}",
             buf_end, pool.size, surface_key
@@ -204,11 +204,11 @@ fn blit_surface_buffer(
     };
 
     for dy in 0..dest_h {
-        let dst_y = offset_y as isize + dy as isize;
-        if dst_y < 0 || dst_y >= dst_h as isize {
+        let dst_y = offset_y as isize + dy.cast_signed();
+        if dst_y < 0 || dst_y >= dst_h.cast_signed() {
             continue;
         }
-        let dst_row_start = dst_y as usize * dst_w;
+        let dst_row_start = dst_y.cast_unsigned() * dst_w;
 
         // Map destination y back to source buffer y
         let sy = src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64;
@@ -225,8 +225,8 @@ fn blit_surface_buffer(
         };
 
         for dx in 0..dest_w {
-            let dst_x = offset_x as isize + dx as isize;
-            if dst_x < 0 || dst_x >= dst_w as isize {
+            let dst_x = offset_x as isize + dx.cast_signed();
+            if dst_x < 0 || dst_x >= dst_w.cast_signed() {
                 continue;
             }
 
@@ -252,7 +252,7 @@ fn blit_surface_buffer(
             };
 
             // Destination index (calculated from loops)
-            let dst_idx = dst_row_start + dst_x as usize;
+            let dst_idx = dst_row_start + dst_x.cast_unsigned();
 
             if alpha == 255 {
                 pixels[dst_idx] = src | 0xff00_0000;
@@ -325,7 +325,7 @@ pub fn load_default_cursor() -> Option<DefaultCursor> {
     // Pick the image closest to the requested size.
     let image = images
         .iter()
-        .min_by_key(|img| (img.size as i32 - target_size as i32).unsigned_abs())?;
+        .min_by_key(|img| (img.size.cast_signed() - target_size.cast_signed()).unsigned_abs())?;
 
     // The xcursor file stores pixels as little-endian 32-bit ARGB (premultiplied alpha).
     // The crate's `pixels_rgba` is the raw file bytes: [B, G, R, A] per pixel on LE systems.
@@ -343,10 +343,10 @@ pub fn load_default_cursor() -> Option<DefaultCursor> {
 
     Some(DefaultCursor {
         pixels,
-        width: image.width as i32,
-        height: image.height as i32,
-        hotspot_x: image.xhot as i32,
-        hotspot_y: image.yhot as i32,
+        width: image.width.cast_signed(),
+        height: image.height.cast_signed(),
+        hotspot_x: image.xhot.cast_signed(),
+        hotspot_y: image.yhot.cast_signed(),
     })
 }
 
@@ -392,12 +392,12 @@ fn blit_default_cursor(
 
 fn blit_fallback_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i32, cy: i32) {
     for (row_idx, row) in FALLBACK_CURSOR_BITMAP.iter().enumerate() {
-        let dy = cy + row_idx as i32;
+        let dy = cy + i32::try_from(row_idx).unwrap_or(i32::MAX);
         if dy < 0 || dy >= height {
             continue;
         }
         for (col_idx, &ch) in row.iter().enumerate() {
-            let dx = cx + col_idx as i32;
+            let dx = cx + i32::try_from(col_idx).unwrap_or(i32::MAX);
             if dx < 0 || dx >= width {
                 continue;
             }

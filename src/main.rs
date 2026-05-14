@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 move || {
                     winit_backend::run_winit_backend(
                         backend_message_tx,
-                        cancel_token,
+                        &cancel_token,
                         ready_tx,
                         frame_rx,
                     )

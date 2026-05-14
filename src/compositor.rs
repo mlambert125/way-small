@@ -126,7 +126,7 @@ pub async fn run_compositor(
                         state.dirty = true;
                     }
                     BackendMessage::KeyInput { keycode, state: key_state, mods_depressed, mods_latched, mods_locked, mods_group } => {
-                        let time_ms = start_time.elapsed().as_millis() as u32;
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
                         let pressed = matches!(key_state, KeyState::Pressed);
                         let evdev_key = keycode.saturating_sub(8);
                         if pressed {
@@ -148,7 +148,7 @@ pub async fn run_compositor(
                         state.cursor_x = x;
                         state.cursor_y = y;
                         state.dirty = true;
-                        let time_ms = start_time.elapsed().as_millis() as u32;
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
 
                         // Auto-focus the top surface if nothing is focused yet
                         if state.focused_surface.is_none() &&
@@ -198,7 +198,7 @@ pub async fn run_compositor(
                         }
                     }
                     BackendMessage::MouseButton { button, state: btn_state } => {
-                        let time_ms = start_time.elapsed().as_millis() as u32;
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
                         let pressed = matches!(btn_state, crate::backend::ButtonState::Pressed);
                         // Linux evdev button codes
                         let linux_button = match button {
@@ -252,7 +252,7 @@ pub async fn run_compositor(
                         }
                     }
                     BackendMessage::MouseScroll { dx, dy } => {
-                        let time_ms = start_time.elapsed().as_millis() as u32;
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
                         let pointer_client = state.pointer_surface.map(|(cid, _)| cid);
                         for ptr in state.pointers.clone() {
                             if Some(ptr.client_id) != pointer_client {
@@ -285,7 +285,7 @@ pub async fn run_compositor(
                         let frame = Arc::new(renderer::render(output, &state));
                         let _ = frame_sender.send(frame).await;
                     }
-                    let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                    let timestamp_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
                     fire_frame_callbacks(&mut state, timestamp_ms).await;
                     state.dirty = false;
                 }
@@ -350,9 +350,9 @@ async fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
             tv_nsec: 0,
         };
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
-        let tv_sec_hi = (ts.tv_sec as u64 >> 32) as u32;
-        let tv_sec_lo = ts.tv_sec as u32;
-        let tv_nsec = ts.tv_nsec as u32;
+        let tv_sec_hi = (ts.tv_sec.cast_unsigned() >> 32) as u32;
+        let tv_sec_lo = u32::try_from(ts.tv_sec).unwrap_or(0);
+        let tv_nsec = u32::try_from(ts.tv_nsec).unwrap_or(0);
 
         // wp_presentation_feedback.presented event (opcode 0)
         // flags: 0x1 = WP_PRESENTATION_FEEDBACK_KIND_VSYNC

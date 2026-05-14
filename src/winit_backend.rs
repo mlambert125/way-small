@@ -2,7 +2,7 @@
 //!
 //! Opens a window on the host compositor via winit, renders composited frames
 //! received from the compositor, and translates host input events (keyboard,
-//! mouse, focus) into BackendMessages sent to the compositor loop. Also manages
+//! mouse, focus) into `BackendMessages` sent to the compositor loop. Also manages
 //! XKB state for keycode-to-keysym resolution.
 
 use std::num::NonZeroU32;
@@ -25,7 +25,7 @@ use crate::backend::{
     BACKGROUND_COLOR, BackendMessage, ButtonState, KeyState, MouseButton, RenderFrame,
 };
 
-use crate::protocol::state::{Output, OutputId, OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED};
+use crate::protocol::state::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId};
 
 const WINIT_OUTPUT_ID: OutputId = OutputId(1);
 
@@ -133,8 +133,8 @@ impl ApplicationHandler<UserEvent> for App {
                         geometry: crate::protocol::state::OutputGeometry {
                             x: 0,
                             y: 0,
-                            physical_width: size.width as i32,
-                            physical_height: size.height as i32,
+                            physical_width: size.width.cast_signed(),
+                            physical_height: size.height.cast_signed(),
                             subpixel: crate::protocol::state::OutputSubpixel::None,
                             make: String::from("winit"),
                             model: String::from("winit"),
@@ -142,8 +142,8 @@ impl ApplicationHandler<UserEvent> for App {
                         },
                         modes: vec![crate::protocol::state::OutputMode {
                             flags: OUTPUT_MODE_CURRENT | OUTPUT_MODE_PREFERRED,
-                            width: size.width as i32,
-                            height: size.height as i32,
+                            width: size.width.cast_signed(),
+                            height: size.height.cast_signed(),
                             refresh_mhz: 60000,
                         }],
                         scale: 1,
@@ -156,8 +156,8 @@ impl ApplicationHandler<UserEvent> for App {
             let initial = RenderFrame {
                 output_id: WINIT_OUTPUT_ID,
                 pixels: vec![BACKGROUND_COLOR; (size.width * size.height) as usize],
-                width: size.width as i32,
-                height: size.height as i32,
+                width: size.width.cast_signed(),
+                height: size.height.cast_signed(),
             };
             self.present_frame(&initial);
         }
@@ -173,8 +173,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 let _ = self.backend_sender.blocking_send(BackendMessage::Resized(
                     WINIT_OUTPUT_ID,
-                    size.width as i32,
-                    size.height as i32,
+                    size.width.cast_signed(),
+                    size.height.cast_signed(),
                 ));
                 if let Some(frame) = self.last_frame.clone() {
                     self.present_frame(&frame);
@@ -243,7 +243,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
                 let _ = self
@@ -277,7 +277,7 @@ impl ApplicationHandler<UserEvent> for App {
 
 pub fn run_winit_backend(
     backend_sender: Sender<BackendMessage>,
-    cancel_token: CancellationToken,
+    cancel_token: &CancellationToken,
     ready_tx: tokio::sync::oneshot::Sender<()>,
     frame_rx: Receiver<Arc<RenderFrame>>,
 ) -> anyhow::Result<()> {

@@ -1,4 +1,4 @@
-//! wl_data_device protocol handler.
+//! `wl_data_device` protocol handler.
 //!
 //! A data device receives selection (clipboard) and drag-and-drop events.
 //! Stub implementation — accepts requests without acting on them.
@@ -14,10 +14,7 @@ const RELEASE: u16 = 2;
 
 pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        START_DRAG => {
-            // Drag-and-drop not implemented yet
-        }
-        SET_SELECTION => {
+        START_DRAG | SET_SELECTION => {
             // Clipboard selection not implemented yet
         }
         RELEASE => {
