@@ -20,3 +20,4 @@ dirs = "6.0.0"
 sendfd = { version = "0.4.4", features = ["tokio"] }
 softbuffer = "0.4.8"
 xcursor = "0.3.10"
+strum = { version ="0.28.0", features = ["derive"] }

@@ -4,6 +4,9 @@
 //! its parent. Clients set size, anchor rect, anchor edge, gravity, offset,
 //! and constraint adjustments before passing the positioner to `get_popup`.
 
+use crate::protocol::state::{
+    XdgPositionerAnchor, XdgPositionerConstraintAdjustment, XdgPositionerGravity,
+};
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
@@ -74,7 +77,7 @@ fn handle_set_anchor(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     };
     let id = msg.message.object_id;
     if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
-        p.anchor = anchor;
+        p.anchor = XdgPositionerAnchor::from_repr(anchor).expect("Anchor value should be valid");
     }
 }
 
@@ -85,7 +88,8 @@ fn handle_set_gravity(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     };
     let id = msg.message.object_id;
     if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
-        p.gravity = gravity;
+        p.gravity =
+            XdgPositionerGravity::from_repr(gravity).expect("Gravity value should be valid");
     }
 }
 
@@ -99,7 +103,8 @@ fn handle_set_constraint_adjustment(
     };
     let id = msg.message.object_id;
     if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
-        p.constraint_adjustment = adjustment;
+        p.constraint_adjustment = XdgPositionerConstraintAdjustment::from_repr(adjustment)
+            .expect("Constraint adjustment value should be valid");
     }
 }
 

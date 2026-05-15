@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 
+use strum::FromRepr;
+
 use super::client::Clients;
 
 pub const OUTPUT_MODE_CURRENT: u32 = 0x1;
@@ -125,16 +127,59 @@ pub struct XdgPopupState {
     pub height: i32,
 }
 
+#[derive(Debug, Default, Clone, Copy, FromRepr)]
+#[repr(u32)]
+pub enum XdgPositionerAnchor {
+    #[default]
+    None = 0,
+    Top = 1,
+    Bottom = 2,
+    Left = 3,
+    Right = 4,
+    TopLeft = 5,
+    BottomLeft = 6,
+    TopRight = 7,
+    BottomRight = 8,
+}
+
+#[derive(Debug, Default, Clone, Copy, FromRepr)]
+#[repr(u32)]
+pub enum XdgPositionerGravity {
+    #[default]
+    None = 0,
+    Top = 1,
+    Bottom = 2,
+    Left = 3,
+    Right = 4,
+    TopLeft = 5,
+    BottomLeft = 6,
+    TopRight = 7,
+    BottomRight = 8,
+}
+
+#[derive(Debug, Default, Clone, Copy, FromRepr)]
+#[repr(u32)]
+pub enum XdgPositionerConstraintAdjustment {
+    #[default]
+    None = 0,
+    SlideX = 1,
+    SlideY = 2,
+    FlipX = 4,
+    FlipY = 8,
+    ResizeX = 16,
+    ResizeY = 32,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct XdgPositionerState {
     pub client_id: u32,
     pub width: i32,
     pub height: i32,
     pub anchor_rect: (i32, i32, i32, i32),
-    pub anchor: u32,
-    pub gravity: u32,
+    pub anchor: XdgPositionerAnchor,
+    pub gravity: XdgPositionerGravity,
     pub offset: (i32, i32),
-    pub constraint_adjustment: u32,
+    pub constraint_adjustment: XdgPositionerConstraintAdjustment,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +200,8 @@ pub struct SeatState {
     pub has_keyboard: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromRepr)]
+#[repr(u32)]
 pub enum OutputTransform {
     Normal = 0,
     Rotate90 = 1,
@@ -167,7 +213,8 @@ pub enum OutputTransform {
     Flipped270 = 7,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromRepr)]
+#[repr(u32)]
 pub enum OutputSubpixel {
     Unknown = 0,
     None = 1,

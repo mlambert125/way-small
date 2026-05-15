@@ -238,12 +238,12 @@ fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, 
     // Anchor point within the anchor rect
     // Anchor edges: 0=none(center), 1=top, 2=bottom, 3=left, 4=right,
     //               5=top_left, 6=bottom_left, 7=top_right, 8=bottom_right
-    let anchor_x = match pos.anchor {
+    let anchor_x = match pos.anchor as u32 {
         3 | 5 | 6 => ar_x,        // left edge
         4 | 7 | 8 => ar_x + ar_w, // right edge
         _ => ar_x + ar_w / 2,     // center
     };
-    let anchor_y = match pos.anchor {
+    let anchor_y = match pos.anchor as u32 {
         1 | 5 | 7 => ar_y,        // top edge
         2 | 6 | 8 => ar_y + ar_h, // bottom edge
         _ => ar_y + ar_h / 2,     // center
@@ -251,12 +251,12 @@ fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, 
 
     // Gravity determines which part of the popup is placed at the anchor point
     // Same enum values as anchor
-    let popup_x = match pos.gravity {
+    let popup_x = match pos.gravity as u32 {
         3 | 5 | 6 => anchor_x - pos.width, // popup extends left
         4 | 7 | 8 => anchor_x,             // popup extends right
         _ => anchor_x - pos.width / 2,     // centered
     };
-    let popup_y = match pos.gravity {
+    let popup_y = match pos.gravity as u32 {
         1 | 5 | 7 => anchor_y - pos.height, // popup extends up
         2 | 6 | 8 => anchor_y,              // popup extends down
         _ => anchor_y - pos.height / 2,     // centered
