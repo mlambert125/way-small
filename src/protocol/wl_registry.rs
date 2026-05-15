@@ -1,8 +1,8 @@
-//! wl_registry protocol handler.
+//! `wl_registry` protocol handler.
 //!
 //! Advertises available globals to clients and handles bind requests,
-//! which create new protocol objects for specific interfaces (wl_shm,
-//! wl_compositor, xdg_wm_base, etc.).
+//! which create new protocol objects for specific interfaces (`wl_shm`,
+//! `wl_compositor`, `xdg_wm_base`, etc.).
 
 use tracing::debug;
 
@@ -73,8 +73,11 @@ async fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
                 client.register_with_version(new_id, ObjectType::WlSubcompositor, bound_version);
             }
             "wl_data_device_manager" => {
-                client
-                    .register_with_version(new_id, ObjectType::WlDataDeviceManager, bound_version);
+                client.register_with_version(
+                    new_id,
+                    ObjectType::WlDataDeviceManager,
+                    bound_version,
+                );
             }
             "xdg_wm_base" => {
                 client.register_with_version(new_id, ObjectType::XdgWmBase, bound_version);
@@ -102,9 +105,8 @@ async fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
                 );
             }
         }
-    } else if let Some(&(_, output_id)) = output_globals
-        .iter()
-        .find(|(name, _)| *name == global_name)
+    } else if let Some(&(_, output_id)) =
+        output_globals.iter().find(|(name, _)| *name == global_name)
     {
         // Dynamic output global — bind to the specific output.
         let bound_version = version.min(super::WL_OUTPUT_VERSION);
@@ -119,18 +121,14 @@ async fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
             .send_error(
                 msg.message.object_id,
                 0,
-                &format!("wl_registry.bind: unknown global name {}", global_name),
+                &format!("wl_registry.bind: unknown global name {global_name}"),
             )
             .await;
     }
 }
 
-/// Send wl_registry.global events for all static globals and dynamic output globals.
-pub async fn advertise_globals(
-    state: &mut CompositorState,
-    client_id: u32,
-    registry_id: u32,
-) {
+/// Send `wl_registry.global` events for all static globals and dynamic output globals.
+pub async fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_id: u32) {
     // Collect output global names before borrowing client.
     let output_globals: Vec<u32> = state.output_global_names.values().copied().collect();
 
@@ -139,9 +137,9 @@ pub async fn advertise_globals(
     };
 
     // Static globals
-    for (name, global) in GLOBALS.iter().enumerate() {
+    for (id, global) in (0u32..).zip(GLOBALS.iter()) {
         let args = ArgWriter::new()
-            .u32(name as u32)
+            .u32(id)
             .string(global.interface)
             .u32(global.version)
             .build();
@@ -174,7 +172,7 @@ pub async fn advertise_globals(
 /// Broadcast a new output global to all connected clients that have a registry.
 pub async fn broadcast_output_global(state: &mut CompositorState, global_name: u32) {
     for (_, client) in state.clients.iter() {
-        for (obj_id, obj_type) in client.objects.iter() {
+        for (obj_id, obj_type) in &client.objects {
             if *obj_type == ObjectType::WlRegistry {
                 let args = ArgWriter::new()
                     .u32(global_name)

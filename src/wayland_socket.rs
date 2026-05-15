@@ -82,11 +82,11 @@ pub async fn run_wayland_socket(
                     }
                     Err(e) => {
                         debug!("Error accepting client: {}", e);
-                        Err(anyhow::anyhow!("Error accepting client: {}", e))
+                        Err(anyhow::anyhow!("Error accepting client: {e}"))
                     }
                 }
             }
-            _ = cancel_token.cancelled() => {
+            () = cancel_token.cancelled() => {
                 Err(anyhow::anyhow!("Wayland socket received shutdown signal"))
             }
         };
@@ -105,6 +105,7 @@ pub async fn run_wayland_socket(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_client(
     client_id: u32,
     stream: Arc<UnixStream>,
@@ -140,7 +141,7 @@ fn handle_client(
                             let mut buffer = Vec::new();
                             buffer.extend_from_slice(&message.object_id.to_le_bytes());
                             let message_length_and_opcode =
-                                ((message.args.len() as u32 + 8) << 16) | (message.op_code as u32);
+                                ((u32::try_from(message.args.len()).expect("args should not be a length exceeds u32::MAX") + 8) << 16) | u32::from(message.op_code);
                             buffer.extend_from_slice(&message_length_and_opcode.to_le_bytes());
                             buffer.extend_from_slice(&message.args);
 
@@ -159,7 +160,7 @@ fn handle_client(
                                         bytes_sent += n;
                                         fds_sent = true;
                                     }
-                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
                                     Err(e) => {
                                         debug!("Error sending message to client: {}", e);
                                         return;
@@ -171,7 +172,7 @@ fn handle_client(
                             break;
                         }
                     }
-                    _ = sender_cancel_token.cancelled() => {
+                    () = sender_cancel_token.cancelled() => {
                         debug!("Wayland socket send task received shutdown signal");
                         break;
                     }
@@ -181,7 +182,7 @@ fn handle_client(
 
         'outer: loop {
             select! {
-                 _ = cancel_token.cancelled() => {
+                () = cancel_token.cancelled() => {
                     debug!("Wayland socket receive task received shutdown signal");
                     break;
                 }
@@ -241,7 +242,7 @@ fn handle_client(
                             data.pop_front().unwrap(),
                             data.pop_front().unwrap(),
                         ]);
-                        let op_code = (message_length_and_opcode & 0xFFFF) as usize;
+                        let op_code = (message_length_and_opcode & 0xFFFF) as u16;
 
                         // Now pop the length and opcode bytes, we already read them without
                         // popping, so we need to pop them now to move the buffer forward
@@ -257,7 +258,7 @@ fn handle_client(
 
                         let msg = WaylandProtocolMessage {
                             object_id,
-                            op_code: op_code as u16,
+                            op_code,
                             args: args_buffer,
                             fds: vec![], // FDs are not included in the message struct, they are
                                          // read separately and accessed via the pending_fds queue
@@ -278,9 +279,7 @@ fn handle_client(
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
                     debug!("Client disconnected: {}", e);
                     break;

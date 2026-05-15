@@ -1,4 +1,4 @@
-//! wl_surface protocol handler.
+//! `wl_surface` protocol handler.
 //!
 //! A surface is a rectangular area of pixels that can be displayed. Clients
 //! attach buffers, mark damage, request frame callbacks, and commit to make
@@ -31,10 +31,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         ATTACH => handle_attach(state, msg),
         DAMAGE | DAMAGE_BUFFER => handle_damage(state, msg),
         FRAME => handle_frame(state, msg),
-        SET_OPAQUE_REGION | SET_INPUT_REGION => {
-            // Ignored until wl_region is fully wired to clipping
-        }
-        SET_BUFFER_TRANSFORM | SET_BUFFER_SCALE | OFFSET => {
+        SET_OPAQUE_REGION | SET_INPUT_REGION | SET_BUFFER_TRANSFORM | SET_BUFFER_SCALE | OFFSET => {
             // Acknowledged but not acted upon yet
         }
         COMMIT => handle_commit(state, msg),
@@ -150,10 +147,10 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         && let Some(vp) = state.viewports.get_mut(&(client_id, vp_id))
     {
         if let Some(src) = vp.pending_source.take() {
-            vp.source = src;
+            vp.source = Some(src);
         }
         if let Some(dst) = vp.pending_destination.take() {
-            vp.destination = dst;
+            vp.destination = Some(dst);
         }
     }
 }

@@ -78,8 +78,8 @@ pub struct ViewportState {
     pub surface_id: u32,
     pub source: Option<(f64, f64, f64, f64)>,
     pub destination: Option<(i32, i32)>,
-    pub pending_source: Option<Option<(f64, f64, f64, f64)>>,
-    pub pending_destination: Option<Option<(i32, i32)>>,
+    pub pending_source: Option<(f64, f64, f64, f64)>,
+    pub pending_destination: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Default)]
@@ -268,7 +268,7 @@ pub struct CompositorState {
     pub cursor_role_surfaces: HashSet<ClientObjectId>,
     /// Pre-loaded cursor from the system cursor theme, used when no client cursor is set.
     pub default_cursor: Option<DefaultCursor>,
-    /// Stack of popup (client_id, xdg_popup_id) that have called `grab`, newest on top.
+    /// Stack of popup (`client_id`, `xdg_popup_id`) that have called `grab`, newest on top.
     /// When the user clicks outside the topmost grabbed popup, it is dismissed.
     pub grabbed_popups: Vec<ClientObjectId>,
 }
@@ -289,7 +289,7 @@ impl CompositorState {
             outputs: Vec::new(),
             output_global_names: HashMap::new(),
             output_bindings: HashMap::new(),
-            next_global_number: super::GLOBALS.len() as u32,
+            next_global_number: u32::try_from(super::GLOBALS.len()).unwrap_or(1),
             pointers: Vec::new(),
             keyboards: Vec::new(),
             focused_surface: None,
@@ -424,13 +424,11 @@ impl CompositorState {
             .shm_buffers
             .values()
             .any(|b| b.client_id == client_id && b.pool_id == pool_id);
-        if !has_buffers {
-            if let Some(pool) = self.shm_pools.remove(&(client_id, pool_id)) {
-                if !pool.map_ptr.is_null() {
-                    unsafe { libc::munmap(pool.map_ptr, pool.size as usize) };
-                }
-                unsafe { libc::close(pool.fd) };
+        if !has_buffers && let Some(pool) = self.shm_pools.remove(&(client_id, pool_id)) {
+            if !pool.map_ptr.is_null() {
+                unsafe { libc::munmap(pool.map_ptr, pool.size as usize) };
             }
+            unsafe { libc::close(pool.fd) };
         }
     }
 

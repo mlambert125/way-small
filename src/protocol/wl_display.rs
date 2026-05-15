@@ -1,8 +1,8 @@
-//! wl_display protocol handler (object id 1).
+//! `wl_display` protocol handler (object id 1).
 //!
 //! Handles the two core requests every client makes first:
-//! - sync: creates a transient wl_callback, fires done event, then deletes it
-//! - get_registry: creates a wl_registry and advertises all globals
+//! - sync: creates a transient `wl_callback`, fires done event, then deletes it
+//! - `get_registry`: creates a `wl_registry` and advertises all globals
 
 use tracing::debug;
 
@@ -40,10 +40,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_sync(
-    state: &mut super::ClientState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+async fn handle_sync(state: &mut super::ClientState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(callback_id) = ArgReader::new(&msg.message.args).new_id() else {
         state
             .send_error(OBJECT_ID, 0, "wl_display.sync: missing callback id")

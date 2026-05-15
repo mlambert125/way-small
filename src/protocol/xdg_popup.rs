@@ -1,7 +1,7 @@
-//! xdg_popup protocol handler.
+//! `xdg_popup` protocol handler.
 //!
 //! A popup is a short-lived surface (menu, tooltip, combo-box) positioned
-//! relative to a parent xdg_surface using an xdg_positioner. The compositor
+//! relative to a parent `xdg_surface` using an `xdg_positioner`. The compositor
 //! sends configure events with the computed position and size.
 
 use tracing::debug;
@@ -73,7 +73,7 @@ fn handle_grab(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
     state.grabbed_popups.push((client_id, popup_id));
 }
 
-/// Send xdg_popup.configure event with the computed position and size.
+/// Send `xdg_popup.configure` event with the computed position and size.
 pub async fn send_configure(
     state: &mut CompositorState,
     client_id: u32,
@@ -96,7 +96,7 @@ pub async fn send_configure(
     }
 }
 
-/// Send xdg_popup.popup_done to dismiss the popup.
+/// Send `xdg_popup.popup_done` to dismiss the popup.
 #[allow(dead_code)]
 pub async fn send_popup_done(state: &mut CompositorState, client_id: u32, popup_id: u32) {
     if let Some(client) = state.clients.get(client_id) {

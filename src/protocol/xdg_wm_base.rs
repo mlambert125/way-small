@@ -1,6 +1,6 @@
-//! xdg_wm_base protocol handler.
+//! `xdg_wm_base` protocol handler.
 //!
-//! The xdg_wm_base global lets clients create xdg_surfaces (window-managed
+//! The `xdg_wm_base` global lets clients create `xdg_surfaces` (window-managed
 //! surfaces). Also handles the ping/pong liveness protocol.
 
 use tracing::debug;
@@ -115,7 +115,7 @@ fn handle_pong(msg: &WaylandProtocolMessageWithClientInfo) {
     debug!("xdg_wm_base.pong: serial={}", serial);
 }
 
-/// Send a ping event to a client's xdg_wm_base object.
+/// Send a ping event to a client's `xdg_wm_base` object.
 #[allow(dead_code)]
 pub async fn send_ping(state: &mut CompositorState, client_id: u32, wm_base_id: u32, serial: u32) {
     let Some(client) = state.clients.get(client_id) else {

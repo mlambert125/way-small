@@ -1,4 +1,4 @@
-//! wl_subsurface protocol handler.
+//! `wl_subsurface` protocol handler.
 //!
 //! Controls a subsurface's position, z-order, and commit mode relative
 //! to its parent surface.

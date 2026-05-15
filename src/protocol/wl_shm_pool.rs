@@ -1,4 +1,4 @@
-//! wl_shm_pool protocol handler.
+//! `wl_shm_pool` protocol handler.
 //!
 //! A pool represents an mmap-able region of shared memory. Clients create
 //! buffers from pools (specifying offset, dimensions, stride, format),
@@ -96,5 +96,5 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         "wl_shm_pool.resize: pool_id={} new_size={}",
         pool_id, new_size
     );
-    state.resize_shm_pool(msg.client_id, pool_id, new_size as u32);
+    state.resize_shm_pool(msg.client_id, pool_id, new_size.unsigned_abs());
 }

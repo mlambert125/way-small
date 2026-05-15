@@ -69,8 +69,8 @@ impl App {
                 // Blit the frame into the window buffer, handling size mismatch
                 let dst_w = size.width as usize;
                 let dst_h = size.height as usize;
-                let src_w = frame.width as usize;
-                let src_h = frame.height as usize;
+                let src_w = frame.width.unsigned_abs() as usize;
+                let src_h = frame.height.unsigned_abs() as usize;
 
                 for y in 0..dst_h.min(src_h) {
                     let dst_start = y * dst_w;

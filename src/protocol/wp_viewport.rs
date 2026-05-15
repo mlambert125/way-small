@@ -1,8 +1,8 @@
-//! wp_viewport protocol handler.
+//! `wp_viewport` protocol handler.
 //!
-//! Handles set_source (crop rectangle) and set_destination (output size)
+//! Handles `set_source` (crop rectangle) and `set_destination` (output size)
 //! requests. Values are stored as pending state and applied on the next
-//! wl_surface.commit, matching the double-buffered semantics of the protocol.
+//! `wl_surface.commit,` matching the double-buffered semantics of the protocol.
 
 use tracing::debug;
 
@@ -53,12 +53,14 @@ fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         viewport_id, x, y, width, height
     );
 
+    // 1.0 is unset, need to use epsilon compare because of floats
+    let unset = |x: f64| (x - 1.0).abs() < f64::EPSILON;
+
     if let Some(vp) = state.viewports.get_mut(&(msg.client_id, viewport_id)) {
-        // -1.0 means "unset" per protocol
-        if x == -1.0 && y == -1.0 && width == -1.0 && height == -1.0 {
-            vp.pending_source = Some(None);
+        if unset(x) && unset(y) && unset(width) && unset(height) {
+            vp.pending_source = None;
         } else {
-            vp.pending_source = Some(Some((x, y, width, height)));
+            vp.pending_source = Some((x, y, width, height));
         }
     }
 }
@@ -76,11 +78,10 @@ fn handle_set_destination(state: &mut CompositorState, msg: &WaylandProtocolMess
     );
 
     if let Some(vp) = state.viewports.get_mut(&(msg.client_id, viewport_id)) {
-        // -1 means "unset" per protocol
         if width == -1 && height == -1 {
-            vp.pending_destination = Some(None);
+            vp.pending_destination = None;
         } else {
-            vp.pending_destination = Some(Some((width, height)));
+            vp.pending_destination = Some((width, height));
         }
     }
 }

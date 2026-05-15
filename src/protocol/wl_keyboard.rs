@@ -1,4 +1,4 @@
-//! wl_keyboard protocol handler.
+//! `wl_keyboard` protocol handler.
 //!
 //! Delivers keyboard events to focused clients: keymap, enter, leave,
 //! key, and modifiers events.
@@ -79,7 +79,7 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
     let keymap_size = keymap_str.len() + 1; // include null terminator
 
     // Write keymap to a memfd
-    let fd = unsafe { libc::memfd_create(c"keymap".as_ptr() as *const _, 0) };
+    let fd = unsafe { libc::memfd_create(c"keymap".as_ptr().cast(), 0) };
     if fd < 0 {
         tracing::warn!("Failed to create memfd for keymap");
         return;
@@ -96,7 +96,7 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
 
     let args = ArgWriter::new()
         .u32(KEYMAP_FORMAT_XKB_V1)
-        .u32(keymap_size as u32)
+        .u32(u32::try_from(keymap_size).expect("Keymap size should be < u32::MAX"))
         .build();
 
     let msg = WaylandProtocolMessage {
@@ -118,7 +118,7 @@ pub async fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_i
     }
 }
 
-/// Send wl_keyboard.enter to a client's keyboard object.
+/// Send `wl_keyboard`.enter to a client's keyboard object.
 pub async fn send_enter(
     state: &mut CompositorState,
     client_id: u32,
@@ -126,7 +126,7 @@ pub async fn send_enter(
     surface_id: u32,
 ) {
     let serial = next_serial();
-    // Build wl_array of currently pressed evdev keycodes
+    // Build `wl_array` of currently pressed evdev keycodes
     let keys_data: Vec<u8> = state
         .pressed_keys
         .iter()
@@ -135,7 +135,7 @@ pub async fn send_enter(
     let args = ArgWriter::new()
         .u32(serial)
         .u32(surface_id)
-        .u32(keys_data.len() as u32)
+        .u32(u32::try_from(keys_data.len()).expect("Pressed key length should be < u32::MAX"))
         .build();
     // Append raw key array after the wl_array length
     let mut full_args = args;
@@ -150,7 +150,7 @@ pub async fn send_enter(
     }
 }
 
-/// Send wl_keyboard.leave to a client's keyboard object.
+/// Send `wl_keyboard.leave` to a client's keyboard object.
 pub async fn send_leave(
     state: &mut CompositorState,
     client_id: u32,
@@ -166,7 +166,7 @@ pub async fn send_leave(
     }
 }
 
-/// Send wl_keyboard.key to a client's keyboard object.
+/// Send `wl_keyboard.key` to a client's keyboard object.
 pub async fn send_key(
     state: &mut CompositorState,
     client_id: u32,
@@ -176,7 +176,7 @@ pub async fn send_key(
     pressed: bool,
 ) {
     let serial = next_serial();
-    let key_state: u32 = if pressed { 1 } else { 0 };
+    let key_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
         .u32(serial)
         .u32(time_ms)
@@ -190,7 +190,7 @@ pub async fn send_key(
     }
 }
 
-/// Send wl_keyboard.modifiers to a client's keyboard object.
+/// Send `wl_keyboard.modifiers` to a client's keyboard object.
 pub async fn send_modifiers(
     state: &mut CompositorState,
     client_id: u32,

@@ -8,6 +8,7 @@ use tracing::{debug, info};
 
 use crate::backend::{BACKGROUND_COLOR, RenderFrame};
 use crate::protocol::state::{ClientObjectId, DefaultCursor, OUTPUT_MODE_CURRENT, Output};
+use crate::protocol::wire_utils::{f64_to_i32, f64_to_usize, usize_to_f64};
 use crate::protocol::{self, CompositorState};
 
 const BYTES_PER_PIXEL: u64 = 4;
@@ -56,15 +57,15 @@ pub fn render(output: &Output, state: &CompositorState) -> RenderFrame {
     let width = mode.width;
     let height = mode.height;
 
-    let mut pixels = vec![BACKGROUND_COLOR; (width * height) as usize];
+    let mut pixels = vec![BACKGROUND_COLOR; (width * height).unsigned_abs() as usize];
 
     for &key in &state.surface_stack {
         let (ox, oy) = state.surfaces.get(&key).map_or((0, 0), |s| s.position);
         blit_surface_tree(state, &mut pixels, width, height, key, ox, oy);
     }
 
-    let cx = state.cursor_x as i32;
-    let cy = state.cursor_y as i32;
+    let cx = f64_to_i32(state.cursor_x);
+    let cy = f64_to_i32(state.cursor_y);
     if !blit_client_cursor(state, &mut pixels, width, height, cx, cy) {
         if let Some(ref cursor) = state.default_cursor {
             blit_default_cursor(cursor, &mut pixels, width, height, cx, cy);
@@ -166,12 +167,13 @@ fn blit_surface_buffer(
 
     // The size of the last row of the buffer (this can be smaller than stride*bytes_per_pixel as
     // the last row doesn't require padding)
-    let last_row_size = shm_buffer.width as u64 * BYTES_PER_PIXEL;
+    let last_row_size = u64::from(shm_buffer.width.unsigned_abs()) * BYTES_PER_PIXEL;
 
     // The end offset of the buffer data in the pool. This must be <= pool.size
     // or it would be reading past the end of the mapping
-    let buf_end = shm_buffer.offset as u64
-        + (shm_buffer.height as u64 - 1) * shm_buffer.stride as u64
+    let buf_end = u64::from(shm_buffer.offset.unsigned_abs())
+        + (u64::from(shm_buffer.height.unsigned_abs()) - 1)
+            * u64::from(shm_buffer.stride.unsigned_abs())
         + last_row_size;
     if buf_end > u64::from(pool.size) {
         debug!(
@@ -181,67 +183,67 @@ fn blit_surface_buffer(
         return;
     }
 
-    let buf_w = shm_buffer.width as usize;
-    let buf_h = shm_buffer.height as usize;
-    let stride = shm_buffer.stride as usize;
-    let buf_offset = shm_buffer.offset as usize;
-    let dst_w = width as usize;
-    let dst_h = height as usize;
+    let buf_w = shm_buffer.width.unsigned_abs() as usize;
+    let buf_h = shm_buffer.height.unsigned_abs() as usize;
+    let stride = shm_buffer.stride.unsigned_abs() as usize;
+    let buf_offset = shm_buffer.offset.unsigned_abs() as usize;
+    let width = width.unsigned_abs() as usize;
+    let height = height.unsigned_abs() as usize;
 
     // Calculate the source rectangle in the buffer and the destination size on the surface.
     // This is based on the viewport if present, or defaults to the entire buffer at 1:1 scale.
 
     // Source rectangle (crop) in buffer pixel coordinates
-    let (src_x0, src_y0, src_w, src_h) = match viewport.and_then(|v| v.source) {
+    let (src_x, src_y, src_w, src_h) = match viewport.and_then(|v| v.source) {
         Some((sx, sy, sw, sh)) => (sx, sy, sw, sh),
-        None => (0.0, 0.0, buf_w as f64, buf_h as f64),
+        None => (0.0, 0.0, usize_to_f64(buf_w), usize_to_f64(buf_h)),
     };
 
     // Destination size in surface coordinates
     let (dest_w, dest_h) = match viewport.and_then(|v| v.destination) {
-        Some((dw, dh)) => (dw as usize, dh as usize),
-        None => (src_w as usize, src_h as usize),
+        Some((dw, dh)) => (dw.unsigned_abs() as usize, dh.unsigned_abs() as usize),
+        None => (f64_to_usize(src_w), f64_to_usize(src_h)),
     };
 
     for dy in 0..dest_h {
         let dst_y = offset_y as isize + dy.cast_signed();
-        if dst_y < 0 || dst_y >= dst_h.cast_signed() {
+        if dst_y < 0 || dst_y >= height.cast_signed() {
             continue;
         }
-        let dst_row_start = dst_y.cast_unsigned() * dst_w;
+        let dst_row_start = dst_y.cast_unsigned() * width;
 
         // Map destination y back to source buffer y
-        let sy = src_y0 + (dy as f64 + 0.5) * src_h / dest_h as f64;
-        let src_yi = sy as usize;
-        if src_yi >= buf_h {
+        let sy = src_y + (usize_to_f64(dy) + 0.5) * src_h / usize_to_f64(dest_h);
+        let current_src_y = f64_to_usize(sy);
+        if current_src_y >= buf_h {
             continue;
         }
 
         let src_row = unsafe {
             std::slice::from_raw_parts(
-                (ptr as *const u8).add(buf_offset + src_yi * stride),
+                (ptr as *const u8).add(buf_offset + current_src_y * stride),
                 buf_w * 4,
             )
         };
 
         for dx in 0..dest_w {
             let dst_x = offset_x as isize + dx.cast_signed();
-            if dst_x < 0 || dst_x >= dst_w.cast_signed() {
+            if dst_x < 0 || dst_x >= width.cast_signed() {
                 continue;
             }
 
             // Map destination x back to source buffer x
-            let sx = src_x0 + (dx as f64 + 0.5) * src_w / dest_w as f64;
-            let src_xi = sx as usize;
-            if src_xi >= buf_w {
+            let sx = src_x + (usize_to_f64(dx) + 0.5) * src_w / usize_to_f64(dest_w);
+            let current_src_x = f64_to_usize(sx);
+            if current_src_x >= buf_w {
                 continue;
             }
 
             let src = u32::from_le_bytes([
-                src_row[src_xi * 4],
-                src_row[src_xi * 4 + 1],
-                src_row[src_xi * 4 + 2],
-                src_row[src_xi * 4 + 3],
+                src_row[current_src_x * 4],
+                src_row[current_src_x * 4 + 1],
+                src_row[current_src_x * 4 + 2],
+                src_row[current_src_x * 4 + 3],
             ]);
 
             // XRGB8888 (format 1): high byte is undefined, treat as fully opaque
@@ -373,14 +375,14 @@ fn blit_default_cursor(
                 continue;
             }
 
-            let src = cursor.pixels[(sy * cursor.width + sx) as usize];
+            let src = cursor.pixels[(sy * cursor.width + sx).unsigned_abs() as usize];
             let alpha = (src >> 24) & 0xff;
 
             if alpha == 0 {
                 continue;
             }
 
-            let dst_idx = (dy * width + dx) as usize;
+            let dst_idx = (dy * width + dx).unsigned_abs() as usize;
             if alpha == 255 {
                 pixels[dst_idx] = src;
             } else {
@@ -406,7 +408,8 @@ fn blit_fallback_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i
                 b'W' => CURSOR_WHITE,
                 _ => continue,
             };
-            pixels[dy as usize * width as usize + dx as usize] = color;
+            pixels[dy.unsigned_abs() as usize * width.unsigned_abs() as usize
+                + dx.unsigned_abs() as usize] = color;
         }
     }
 }

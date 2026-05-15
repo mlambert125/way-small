@@ -1,8 +1,8 @@
 //! Wayland wire format serialization and deserialization.
 //!
 //! Provides low-level helpers for reading and writing the Wayland binary
-//! protocol: ArgWriter (builder for outgoing message args), ArgReader
-//! (cursor-based parser for incoming args), and the message() constructor.
+//! protocol: `ArgWriter` (builder for outgoing message args), `ArgReader`
+//! (cursor-based parser for incoming args), and the `message()` constructor.
 
 use crate::wayland_socket::WaylandProtocolMessage;
 
@@ -21,7 +21,7 @@ pub fn read_i32(args: &[u8], offset: usize) -> Option<i32> {
 }
 
 /// Read a Wayland string from a byte slice at the given offset.
-/// Returns (string, bytes_consumed including padding).
+/// Returns (`String`, `bytes_consumed` including padding).
 /// Wire format: u32 length (including null), then chars + null, padded to 4 bytes.
 pub fn read_string(args: &[u8], offset: usize) -> Option<(String, usize)> {
     let len = read_u32(args, offset)? as usize;
@@ -59,9 +59,12 @@ impl ArgWriter {
         self
     }
 
-    /// Write a Wayland string: u32 length (including null) + chars + null + padding.
     pub fn string(mut self, val: &str) -> Self {
-        let len = val.len() as u32 + 1; // include null terminator
+        assert!(
+            val.len() < u32::MAX as usize,
+            "String too long for Wayland protocol"
+        );
+        let len = u32::try_from(val.len()).expect("String too long for Wayland protocol") + 1;
         self.buf.extend_from_slice(&len.to_le_bytes());
         self.buf.extend_from_slice(val.as_bytes());
         self.buf.push(0); // null terminator
@@ -72,15 +75,31 @@ impl ArgWriter {
         self
     }
 
-    /// Write a Wayland fixed-point value (24.8 format).
     pub fn fixed(self, val: f64) -> Self {
-        let fixed = (val * 256.0) as i32;
-        self.i32(fixed)
+        self.i32(f64_to_24_8_fixed(val))
     }
 
     pub fn build(self) -> Vec<u8> {
         self.buf
     }
+}
+
+/// Convert a f64 to Wayland's 24.8 fixed-point format (i32 with 8 fractional bits).
+pub fn f64_to_24_8_fixed(val: f64) -> i32 {
+    f64_to_i32(val * 256.0)
+}
+
+// Convert a f64 to i32 without any scaling
+pub fn f64_to_i32(val: f64) -> i32 {
+    unsafe { f64::to_int_unchecked(val) }
+}
+
+pub fn f64_to_usize(val: f64) -> usize {
+    unsafe { f64::to_int_unchecked(val) }
+}
+
+pub fn usize_to_f64(val: usize) -> f64 {
+    f64::from(u32::try_from(val).expect("Value too large for f64 conversion"))
 }
 
 /// Cursor-based reader for parsing Wayland message arguments.
@@ -115,16 +134,16 @@ impl<'a> ArgReader<'a> {
 
     pub fn fixed(&mut self) -> Option<f64> {
         let raw = self.i32()?;
-        Some(raw as f64 / 256.0)
+        Some(f64::from(raw) / 256.0)
     }
 
-    /// Alias for u32 — reads a new_id argument.
+    /// Alias for u32 — reads a `new_id` argument.
     pub fn new_id(&mut self) -> Option<u32> {
         self.u32()
     }
 }
 
-/// Build a WaylandMessage with no file descriptors.
+/// Build a `WaylandMessage` with no file descriptors.
 pub fn message(object_id: u32, op_code: u16, args: Vec<u8>) -> WaylandProtocolMessage {
     WaylandProtocolMessage {
         object_id,

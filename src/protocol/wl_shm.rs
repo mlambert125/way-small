@@ -1,8 +1,8 @@
-//! wl_shm protocol handler.
+//! `wl_shm` protocol handler.
 //!
-//! Manages shared memory for buffer allocation. Clients bind wl_shm to
-//! discover supported pixel formats, then call create_pool with a file
-//! descriptor to an mmap-able region. Pools are used to allocate wl_buffers.
+//! Manages shared memory for buffer allocation. Clients bind `wl_shm` to
+//! discover supported pixel formats, then call `create_pool` with a file
+//! descriptor to an mmap-able region. Pools are used to allocate `wl_buffers`.
 
 use tracing::debug;
 
@@ -77,10 +77,10 @@ async fn handle_create_pool(
     );
 
     client.register(pool_id, ObjectType::WlShmPool);
-    state.register_shm_pool(msg.client_id, pool_id, fd, size as u32);
+    state.register_shm_pool(msg.client_id, pool_id, fd, size.unsigned_abs());
 }
 
-/// Send wl_shm.format events for all supported pixel formats.
+/// Send `wl_shm.format` events for all supported pixel formats.
 pub async fn send_formats(client: &mut ClientState, shm_id: u32) {
     for &fmt in &[FORMAT_ARGB8888, FORMAT_XRGB8888] {
         let args = ArgWriter::new().u32(fmt).build();

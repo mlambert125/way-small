@@ -1,4 +1,4 @@
-//! wl_data_device_manager protocol handler.
+//! `wl_data_device_manager` protocol handler.
 //!
 //! The data device manager global lets clients create data sources (for
 //! offering clipboard/drag content) and get data devices (for receiving

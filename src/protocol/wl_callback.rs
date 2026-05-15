@@ -1,7 +1,7 @@
-//! wl_callback protocol handler.
+//! `wl_callback` protocol handler.
 //!
 //! Callbacks are one-shot objects created by the compositor (e.g. for
-//! wl_display.sync or wl_surface.frame). Clients should never send
+//! `wl_display.sync` or `wl_surface.frame).` Clients should never send
 //! requests to them — any request is a protocol error.
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;

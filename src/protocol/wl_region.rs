@@ -1,8 +1,8 @@
-//! wl_region protocol handler.
+//! `wl_region` protocol handler.
 //!
 //! A region is a set of rectangles used to describe input and opaque areas
 //! of a surface. Clients add/subtract rectangles, then assign the region
-//! to a surface via set_opaque_region or set_input_region.
+//! to a surface via `set_opaque_region` or `set_input_region`.
 
 use tracing::debug;
 

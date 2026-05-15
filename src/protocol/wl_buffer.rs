@@ -1,4 +1,4 @@
-//! wl_buffer protocol handler.
+//! `wl_buffer` protocol handler.
 //!
 //! A buffer represents pixel data that can be attached to a surface.
 //! The only client request is destroy. The compositor sends the release

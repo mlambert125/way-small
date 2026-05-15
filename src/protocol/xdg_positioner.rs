@@ -1,8 +1,8 @@
-//! xdg_positioner protocol handler.
+//! `xdg_positioner` protocol handler.
 //!
 //! A positioner describes how a popup surface should be placed relative to
 //! its parent. Clients set size, anchor rect, anchor edge, gravity, offset,
-//! and constraint adjustments before passing the positioner to get_popup.
+//! and constraint adjustments before passing the positioner to `get_popup`.
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 

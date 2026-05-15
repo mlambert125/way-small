@@ -1,4 +1,4 @@
-//! wl_subcompositor protocol handler.
+//! `wl_subcompositor` protocol handler.
 //!
 //! The subcompositor global lets clients create subsurfaces — child surfaces
 //! positioned relative to a parent and composited together with it.

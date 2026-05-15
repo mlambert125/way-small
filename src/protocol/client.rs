@@ -1,7 +1,7 @@
 //! Per-client connection state.
 //!
-//! Each connected client gets a ClientState tracking its object map (id ->
-//! ObjectType) and a channel sender for pushing events back to the client.
+//! Each connected client gets a `ClientState` tracking its object map (id ->
+//! `ObjectType)` and a channel sender for pushing events back to the client.
 //! The Clients struct manages the collection of all active client states.
 
 use std::collections::{HashMap, VecDeque};
@@ -71,7 +71,7 @@ impl ClientState {
         Ok(())
     }
 
-    /// Send a wl_display.error to this client.
+    /// Send a `wl_display.error` to this client.
     pub async fn send_error(&self, object_id: u32, code: u32, msg: &str) {
         let args = ArgWriter::new()
             .u32(object_id)

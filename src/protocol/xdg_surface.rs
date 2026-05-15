@@ -1,6 +1,6 @@
-//! xdg_surface protocol handler.
+//! `xdg_surface` protocol handler.
 //!
-//! An xdg_surface wraps a wl_surface and adds window-management semantics.
+//! An `xdg_surface` wraps a `wl_surface` and adds window-management semantics.
 //! Clients assign a role (toplevel or popup) and must ack configure events
 //! before committing content.
 
@@ -213,7 +213,7 @@ fn handle_ack_configure(state: &mut CompositorState, msg: &WaylandProtocolMessag
     }
 }
 
-/// Send an xdg_surface.configure event.
+/// Send an `xdg_surface.configure` event.
 #[allow(dead_code)]
 pub async fn send_configure(
     state: &mut CompositorState,
@@ -229,7 +229,7 @@ pub async fn send_configure(
 
 /// Compute popup position from a positioner.
 ///
-/// The anchor point is derived from the anchor_rect + anchor edge.
+/// The anchor point is derived from the `anchor_rect` + anchor edge.
 /// The popup is placed so that the gravity edge of the popup aligns
 /// with the anchor point, then offset is applied.
 fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, i32, i32) {

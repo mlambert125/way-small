@@ -1,9 +1,9 @@
-//! wp_viewporter protocol handler.
+//! `wp_viewporter` protocol handler.
 //!
-//! Allows clients to crop (set_source) and scale (set_destination) surface
-//! content. The wp_viewporter global creates wp_viewport objects bound to
-//! a specific wl_surface. Source and destination are double-buffered and
-//! applied on wl_surface.commit.
+//! Allows clients to crop (`set_source`) and scale (`set_destination`) surface
+//! content. The `wp_viewporter` global creates `wp_viewport` objects bound to
+//! a specific `wl_surface`. Source and destination are double-buffered and
+//! applied on `wl_surface.commit`.
 
 use tracing::debug;
 

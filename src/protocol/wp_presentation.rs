@@ -1,9 +1,9 @@
-//! wp_presentation protocol handler.
+//! `wp_presentation` protocol handler.
 //!
-//! The wp_presentation global lets clients request per-commit feedback on
+//! The `wp_presentation` global lets clients request per-commit feedback on
 //! when their content was actually displayed. On bind the compositor sends
-//! the clock_id event (CLOCK_MONOTONIC). Clients call feedback() to create
-//! a wp_presentation_feedback object tied to the next commit on a surface.
+//! the `clock_id` event (`CLOCK_MONOTONIC`). Clients call `feedback()` to create
+//! a `wp_presentation_feedback` object tied to the next commit on a surface.
 
 use tracing::debug;
 
@@ -59,7 +59,7 @@ fn handle_feedback(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
     }
 }
 
-/// Send the clock_id event to tell the client which clock we use.
+/// Send the `clock_id` event to tell the client which clock we use.
 pub async fn send_clock_id(state: &mut CompositorState, client_id: u32, object_id: u32) {
     // CLOCK_MONOTONIC = 1 on Linux
     let args = ArgWriter::new().u32(1).build();

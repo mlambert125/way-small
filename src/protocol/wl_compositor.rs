@@ -1,4 +1,4 @@
-//! wl_compositor protocol handler.
+//! `wl_compositor` protocol handler.
 //!
 //! The compositor global allows clients to create surfaces and regions.
 //! Surfaces are the fundamental drawing primitive in Wayland — clients

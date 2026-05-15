@@ -1,4 +1,4 @@
-//! wp_presentation_feedback protocol handler.
+//! `wp_presentation_feedback` protocol handler.
 //!
 //! Feedback objects are one-shot: the compositor sends either a `presented`
 //! or `discarded` event, then the object is defunct. Clients don't send

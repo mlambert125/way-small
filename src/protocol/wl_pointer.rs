@@ -1,4 +1,4 @@
-//! wl_pointer protocol handler.
+//! `wl_pointer` protocol handler.
 //!
 //! Delivers pointer (mouse) events to focused clients: enter, leave,
 //! motion, button, and axis (scroll) events.
@@ -77,8 +77,7 @@ fn process_set_cursor(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     let is_subsurface = state
         .surfaces
         .get(&surface_key)
-        .map(|s| s.parent.is_some())
-        .unwrap_or(false);
+        .is_some_and(|s| s.parent.is_some());
     let is_xdg = state
         .xdg_surfaces
         .values()
@@ -97,7 +96,7 @@ fn process_set_cursor(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     state.dirty = true;
 }
 
-/// Send wl_pointer.enter to a client's pointer object.
+/// Send `wl_pointer.enter` to a client's pointer object.
 pub async fn send_enter(
     state: &mut CompositorState,
     client_id: u32,
@@ -121,7 +120,7 @@ pub async fn send_enter(
     }
 }
 
-/// Send wl_pointer.leave to a client's pointer object.
+/// Send `wl_pointer.leave` to a client's pointer object.
 pub async fn send_leave(
     state: &mut CompositorState,
     client_id: u32,
@@ -137,7 +136,7 @@ pub async fn send_leave(
     }
 }
 
-/// Send wl_pointer.motion to a client's pointer object.
+/// Send `wl_pointer.motion` to a client's pointer object.
 pub async fn send_motion(
     state: &mut CompositorState,
     client_id: u32,
@@ -154,7 +153,7 @@ pub async fn send_motion(
     }
 }
 
-/// Send wl_pointer.button to a client's pointer object.
+/// Send `wl_pointer.button` to a client's pointer object.
 pub async fn send_button(
     state: &mut CompositorState,
     client_id: u32,
@@ -164,7 +163,7 @@ pub async fn send_button(
     pressed: bool,
 ) {
     let serial = next_serial();
-    let btn_state: u32 = if pressed { 1 } else { 0 };
+    let btn_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
         .u32(serial)
         .u32(time_ms)
@@ -178,7 +177,7 @@ pub async fn send_button(
     }
 }
 
-/// Send wl_pointer.axis to a client's pointer object.
+/// Send `wl_pointer.axis` to a client's pointer object.
 pub async fn send_axis(
     state: &mut CompositorState,
     client_id: u32,
@@ -193,7 +192,7 @@ pub async fn send_axis(
     }
 }
 
-/// Send wl_pointer.frame to indicate end of a group of events (version 5+).
+/// Send `wl_pointer.frame` to indicate end of a group of events (version 5+).
 pub async fn send_frame(state: &mut CompositorState, client_id: u32, pointer_id: u32) {
     if let Some(client) = state.clients.get(client_id)
         && client.version(pointer_id) >= 5

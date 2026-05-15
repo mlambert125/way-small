@@ -1,8 +1,8 @@
-//! wl_seat protocol handler.
+//! `wl_seat` protocol handler.
 //!
 //! A seat represents a group of input devices (pointer, keyboard, touch).
-//! Clients bind wl_seat to receive capability events, then request specific
-//! input device objects (wl_pointer, wl_keyboard).
+//! Clients bind `wl_seat` to receive capability events, then request specific
+//! input device objects (`wl_pointer`, `wl_keyboard`).
 
 use tracing::debug;
 
@@ -108,7 +108,7 @@ async fn handle_get_keyboard(
     super::wl_keyboard::send_keymap(state, msg.client_id, keyboard_id).await;
 }
 
-/// Send wl_seat.capabilities and wl_seat.name after a client binds.
+/// Send `wl_seat.capabilities` and `wl_seat.name` after a client binds.
 pub async fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32) {
     let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);

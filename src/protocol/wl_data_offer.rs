@@ -1,4 +1,4 @@
-//! wl_data_offer protocol handler.
+//! `wl_data_offer` protocol handler.
 //!
 //! A data offer represents content offered by another client via the
 //! clipboard or drag-and-drop. Stub implementation.

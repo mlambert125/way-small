@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
 use crate::protocol::state::ClientObjectId;
-use crate::protocol::wire_utils::{ArgWriter, message};
+use crate::protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use crate::protocol::{self, CompositorState};
 use crate::protocol::{wl_keyboard, wl_pointer, wl_registry, xdg_popup, xdg_toplevel};
 use crate::renderer;
@@ -440,8 +440,8 @@ struct HitResult {
 /// Hit-test the surface stack from top to bottom. Returns the toplevel and the
 /// specific surface (possibly a subsurface) under the pointer.
 fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<HitResult> {
-    let px = x as i32;
-    let py = y as i32;
+    let px = f64_to_i32(x);
+    let py = f64_to_i32(y);
 
     for &key in state.surface_stack.iter().rev() {
         let Some(surface) = state.surfaces.get(&key) else {
@@ -532,8 +532,8 @@ fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) ->
 /// popups from the top of the grab stack until we reach one that contains the
 /// pointer (or the stack is empty). Returns true if any popup was dismissed.
 async fn dismiss_popups_outside_click(state: &mut CompositorState) -> bool {
-    let px = state.cursor_x as i32;
-    let py = state.cursor_y as i32;
+    let px = f64_to_i32(state.cursor_x);
+    let py = f64_to_i32(state.cursor_y);
     let mut dismissed = false;
 
     while let Some(&(client_id, popup_id)) = state.grabbed_popups.last() {

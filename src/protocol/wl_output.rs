@@ -1,7 +1,7 @@
-//! wl_output protocol handler.
+//! `wl_output` protocol handler.
 //!
 //! Advertises display output properties to clients: geometry, mode,
-//! scale factor, and name. Each physical output gets its own wl_output
+//! scale factor, and name. Each physical output gets its own `wl_output`
 //! global; clients bind each one separately.
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
@@ -38,7 +38,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-/// Send output info events for a specific output after a client binds its wl_output global.
+/// Send output info events for a specific output after a client binds its `wl_output` global.
 pub async fn send_output_info(
     state: &mut CompositorState,
     client_id: u32,
@@ -46,12 +46,7 @@ pub async fn send_output_info(
     target_id: OutputId,
 ) {
     // Clone the target output to avoid borrow conflict with clients.
-    let Some(output) = state
-        .outputs
-        .iter()
-        .find(|o| o.id == target_id)
-        .cloned()
-    else {
+    let Some(output) = state.outputs.iter().find(|o| o.id == target_id).cloned() else {
         return;
     };
 
@@ -104,7 +99,7 @@ pub async fn send_output_info(
     }
 }
 
-/// Send updated geometry + mode + done to all clients that have bound this output's wl_output.
+/// Send updated geometry + mode + done to all clients that have bound this output's `wl_output`.
 pub async fn broadcast_mode(state: &mut CompositorState) {
     // Clone outputs and collect bindings to avoid borrow conflicts.
     let outputs = state.outputs.clone();

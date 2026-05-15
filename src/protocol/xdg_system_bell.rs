@@ -1,4 +1,4 @@
-//! xdg_system_bell protocol handler.
+//! `xdg_system_bell` protocol handler.
 //!
 //! Enables clients to ring the system bell
 

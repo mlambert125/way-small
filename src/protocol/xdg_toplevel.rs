@@ -1,8 +1,8 @@
-//! xdg_toplevel protocol handler.
+//! `xdg_toplevel` protocol handler.
 //!
 //! A toplevel is the primary window role. The compositor sends configure
 //! events (size, states like maximized/fullscreen), and the client can
-//! set title, app_id, and request state changes.
+//! set title, `app_id`, and request state changes.
 
 use tracing::debug;
 
@@ -91,10 +91,10 @@ fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     }
 }
 
-// xdg_toplevel state values
+// `xdg_toplevel` state values
 const STATE_ACTIVATED: u32 = 4;
 
-/// Send xdg_toplevel.configure event (width, height, states array).
+/// Send `xdg_toplevel`.configure event (width, height, states array).
 pub async fn send_configure(
     state: &mut CompositorState,
     client_id: u32,
@@ -105,7 +105,7 @@ pub async fn send_configure(
     send_configure_with_states(state, client_id, toplevel_id, width, height, &[]).await;
 }
 
-/// Send xdg_toplevel.configure with explicit states.
+/// Send `xdg_toplevel`.configure with explicit states.
 async fn send_configure_with_states(
     state: &mut CompositorState,
     client_id: u32,
@@ -119,7 +119,7 @@ async fn send_configure_with_states(
     let mut args = ArgWriter::new()
         .i32(width)
         .i32(height)
-        .u32((states.len() * 4) as u32);
+        .u32(u32::try_from(states.len() * 4).expect("States length should be < u32::MAX"));
     for &s in states {
         args = args.u32(s);
     }
@@ -131,8 +131,8 @@ async fn send_configure_with_states(
 }
 
 /// Send a configure sequence to set or clear the activated state on a toplevel.
-/// Looks up the toplevel from a wl_surface id and sends toplevel.configure +
-/// xdg_surface.configure(serial).
+/// Looks up the toplevel from a `wl_surface` id and sends toplevel.configure +
+/// `xdg_surface.configure(serial)`.
 pub async fn send_activated(
     state: &mut CompositorState,
     client_id: u32,
@@ -172,7 +172,7 @@ pub async fn send_activated(
     }
 }
 
-/// Send xdg_toplevel.close event to request the client closes.
+/// Send `xdg_toplevel.close` event to request the client closes.
 #[allow(dead_code)]
 pub async fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
