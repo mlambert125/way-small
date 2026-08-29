@@ -12,14 +12,14 @@ const OFFER: u16 = 0;
 const DESTROY: u16 = 1;
 const SET_ACTIONS: u16 = 2;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         OFFER | SET_ACTIONS => {
             // DnD actions — ignored for now
         }
         DESTROY => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             }
         }
         op => {

@@ -199,10 +199,14 @@ fn blit_surface_buffer(
         None => (0.0, 0.0, usize_to_f64(buf_w), usize_to_f64(buf_h)),
     };
 
-    // Destination size in surface coordinates
+    // Destination size in surface coordinates. A viewport destination wins if
+    // set; otherwise the source is divided down by the surface's buffer scale,
+    // which is what turns an oversized buffer from a scaled client back into its
+    // logical size on screen.
+    let scale = surface.buffer_scale.max(1).unsigned_abs() as usize;
     let (dest_w, dest_h) = match viewport.and_then(|v| v.destination) {
         Some((dw, dh)) => (dw.unsigned_abs() as usize, dh.unsigned_abs() as usize),
-        None => (f64_to_usize(src_w), f64_to_usize(src_h)),
+        None => (f64_to_usize(src_w) / scale, f64_to_usize(src_h) / scale),
     };
 
     for dy in 0..dest_h {
@@ -411,5 +415,117 @@ fn blit_fallback_mouse_cursor(pixels: &mut [u32], width: i32, height: i32, cx: i
             pixels[dy.unsigned_abs() as usize * width.unsigned_abs() as usize
                 + dx.unsigned_abs() as usize] = color;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use crate::protocol::CompositorState;
+    use crate::protocol::state::{
+        OUTPUT_MODE_CURRENT, Output, OutputGeometry, OutputMode, OutputSubpixel, OutputTransform,
+    };
+    use std::collections::VecDeque;
+    use std::os::fd::IntoRawFd;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc::channel;
+    use tokio_util::sync::CancellationToken;
+
+    const SURFACE_COLOUR: u32 = 0xffff_0000;
+    const BUFFER_SIDE: i32 = 40;
+    const OUTPUT_SIDE: i32 = 100;
+
+    fn test_output() -> Output {
+        Output {
+            id: crate::protocol::state::OutputId(1),
+            geometry: OutputGeometry {
+                x: 0,
+                y: 0,
+                physical_width: OUTPUT_SIDE,
+                physical_height: OUTPUT_SIDE,
+                subpixel: OutputSubpixel::None,
+                make: String::new(),
+                model: String::new(),
+                transform: OutputTransform::Normal,
+            },
+            modes: vec![OutputMode {
+                flags: OUTPUT_MODE_CURRENT,
+                width: OUTPUT_SIDE,
+                height: OUTPUT_SIDE,
+                refresh_mhz: 60000,
+            }],
+            scale: 1,
+            name: String::from("test"),
+            description: String::from("test"),
+        }
+    }
+
+    /// Render one opaque BUFFER_SIDE-square buffer at the given buffer scale and
+    /// count how many pixels it actually painted.
+    fn painted_pixels_at_scale(buffer_scale: i32) -> usize {
+        let mut state = CompositorState::new();
+        let (tx, _rx) = channel(64);
+        state.clients.create(
+            1,
+            tx,
+            Arc::new(Mutex::new(VecDeque::new())),
+            CancellationToken::new(),
+        );
+
+        // A real memfd-backed pool, filled with a solid colour.
+        let pixel_count = (BUFFER_SIDE * BUFFER_SIDE).unsigned_abs() as usize;
+        let size = pixel_count * 4;
+        let file = memfd_filled_with(size, SURFACE_COLOUR);
+        state.register_shm_pool(1, 100, file.into_raw_fd(), size.try_into().unwrap());
+        state.register_buffer(1, 101, 100, 0, BUFFER_SIDE, BUFFER_SIDE, BUFFER_SIDE * 4, 0);
+
+        state.create_surface(1, 200);
+        let surface = state.surfaces.get_mut(&(1, 200)).unwrap();
+        surface.buffer_id = Some(101);
+        surface.position = (0, 0);
+        surface.buffer_scale = buffer_scale;
+        state.surface_stack.push((1, 200));
+
+        // Keep the cursor well clear of the surface so it cannot be miscounted.
+        state.cursor_x = f64::from(OUTPUT_SIDE) - 1.0;
+        state.cursor_y = f64::from(OUTPUT_SIDE) - 1.0;
+
+        let frame = render(&test_output(), &state);
+        frame
+            .pixels
+            .iter()
+            .filter(|&&p| p == SURFACE_COLOUR)
+            .count()
+    }
+
+    fn memfd_filled_with(size: usize, colour: u32) -> std::fs::File {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::memfd_create(c"render-test".as_ptr().cast(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let row: Vec<u8> = colour.to_ne_bytes().repeat(size / 4);
+        file.write_all(&row).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn unscaled_buffer_paints_its_full_size() {
+        assert_eq!(
+            painted_pixels_at_scale(1),
+            (BUFFER_SIDE * BUFFER_SIDE).unsigned_abs() as usize
+        );
+    }
+
+    #[test]
+    fn scaled_buffer_paints_its_logical_size() {
+        // A scale-2 client submits a buffer twice as large in each axis, so the
+        // same buffer must land on a quarter of the pixels.
+        let side = BUFFER_SIDE / 2;
+        assert_eq!(
+            painted_pixels_at_scale(2),
+            (side * side).unsigned_abs() as usize
+        );
     }
 }

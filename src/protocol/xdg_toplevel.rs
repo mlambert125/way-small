@@ -29,12 +29,11 @@ const SET_MINIMIZED: u16 = 13;
 
 // Event opcodes
 const CONFIGURE: u16 = 0;
-#[allow(dead_code)]
 const CLOSE: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
         SET_TITLE => handle_set_title(state, msg),
         SET_APP_ID => handle_set_app_id(state, msg),
         SET_PARENT | SHOW_WINDOW_MENU | MOVE | RESIZE => {
@@ -58,12 +57,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let toplevel_id = msg.message.object_id;
     debug!("xdg_toplevel.destroy: toplevel_id={}", toplevel_id);
     state.destroy_xdg_toplevel(msg.client_id, toplevel_id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(toplevel_id).await;
+        client.unregister(toplevel_id);
     }
 }
 
@@ -95,18 +94,18 @@ fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
 const STATE_ACTIVATED: u32 = 4;
 
 /// Send `xdg_toplevel`.configure event (width, height, states array).
-pub async fn send_configure(
+pub fn send_configure(
     state: &mut CompositorState,
     client_id: u32,
     toplevel_id: u32,
     width: i32,
     height: i32,
 ) {
-    send_configure_with_states(state, client_id, toplevel_id, width, height, &[]).await;
+    send_configure_with_states(state, client_id, toplevel_id, width, height, &[]);
 }
 
 /// Send `xdg_toplevel`.configure with explicit states.
-async fn send_configure_with_states(
+fn send_configure_with_states(
     state: &mut CompositorState,
     client_id: u32,
     toplevel_id: u32,
@@ -124,16 +123,35 @@ async fn send_configure_with_states(
         args = args.u32(s);
     }
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client
-            .send(message(toplevel_id, CONFIGURE, args.build()))
-            .await;
+        let _ = client.send(message(toplevel_id, CONFIGURE, args.build()));
     }
+}
+
+/// Find the `xdg_surface` and `xdg_toplevel` object ids backing a client's
+/// `wl_surface`, if that surface has the toplevel role.
+///
+/// Most compositor-side state is keyed by `wl_surface`, but the `xdg_shell`
+/// events are addressed to the toplevel, so this bridges the two.
+pub fn xdg_ids_for_surface(
+    state: &CompositorState,
+    client_id: u32,
+    wl_surface_id: u32,
+) -> Option<(u32, u32)> {
+    state.xdg_surfaces.iter().find_map(|(key, xdg_surface)| {
+        if key.0 != client_id || xdg_surface.wl_surface_id != wl_surface_id {
+            return None;
+        }
+        match &xdg_surface.role {
+            Some(super::state::XdgRole::Toplevel(tid)) => Some((key.1, *tid)),
+            _ => None,
+        }
+    })
 }
 
 /// Send a configure sequence to set or clear the activated state on a toplevel.
 /// Looks up the toplevel from a `wl_surface` id and sends toplevel.configure +
 /// `xdg_surface.configure(serial)`.
-pub async fn send_activated(
+pub fn send_activated(
     state: &mut CompositorState,
     client_id: u32,
     wl_surface_id: u32,
@@ -144,38 +162,30 @@ pub async fn send_activated(
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
     }
-    // Find the xdg_surface and toplevel for this wl_surface
-    let mut found = None;
-    for (key, xdg_surface) in &state.xdg_surfaces {
-        if key.0 == client_id && xdg_surface.wl_surface_id == wl_surface_id {
-            if let Some(super::state::XdgRole::Toplevel(tid)) = &xdg_surface.role {
-                found = Some((key.1, *tid));
-            }
-            break;
-        }
-    }
-    let Some((xdg_surface_id, toplevel_id)) = found else {
+    let Some((xdg_surface_id, toplevel_id)) = xdg_ids_for_surface(state, client_id, wl_surface_id)
+    else {
         return;
     };
 
     let states: &[u32] = if activated { &[STATE_ACTIVATED] } else { &[] };
-    send_configure_with_states(state, client_id, toplevel_id, 0, 0, states).await;
+    send_configure_with_states(state, client_id, toplevel_id, 0, 0, states);
 
     // Send xdg_surface.configure with a serial
     let serial = super::next_serial();
     let args = ArgWriter::new().u32(serial).build();
 
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client
-            .send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args))
-            .await;
+        let _ = client.send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args));
     }
 }
 
-/// Send `xdg_toplevel.close` event to request the client closes.
-#[allow(dead_code)]
-pub async fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32) {
+/// Send `xdg_toplevel.close`, asking the client to close the window.
+///
+/// This is a request, not a command: the client decides what to do, and may
+/// prompt the user or ignore it entirely. A client that agrees destroys the
+/// toplevel, which tears the window down through the normal destroy path.
+pub fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(toplevel_id, CLOSE, Vec::new())).await;
+        let _ = client.send(message(toplevel_id, CLOSE, Vec::new()));
     }
 }

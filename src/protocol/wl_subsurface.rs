@@ -18,9 +18,9 @@ const PLACE_BELOW: u16 = 3;
 const SET_SYNC: u16 = 4;
 const SET_DESYNC: u16 = 5;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
         SET_POSITION => handle_set_position(state, msg),
         PLACE_ABOVE => handle_place_above(state, msg),
         PLACE_BELOW => handle_place_below(state, msg),
@@ -32,7 +32,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let subsurface_id = msg.message.object_id;
     let client_id = msg.client_id;
     debug!("wl_subsurface.destroy: subsurface_id={}", subsurface_id);
@@ -56,7 +56,7 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     }
 
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(subsurface_id).await;
+        client.unregister(subsurface_id);
     } else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
     }

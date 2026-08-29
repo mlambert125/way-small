@@ -16,9 +16,9 @@ const DESTROY: u16 = 0;
 const SET_SOURCE: u16 = 1;
 const SET_DESTINATION: u16 = 2;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
         SET_SOURCE => handle_set_source(state, msg),
         SET_DESTINATION => handle_set_destination(state, msg),
         op => {
@@ -27,12 +27,12 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let viewport_id = msg.message.object_id;
     debug!("wp_viewport.destroy: viewport_id={}", viewport_id);
     state.destroy_viewport(msg.client_id, viewport_id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(viewport_id).await;
+        client.unregister(viewport_id);
     } else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
     }

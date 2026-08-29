@@ -58,6 +58,9 @@ pub struct SurfacePending {
     pub damage: Vec<(i32, i32, i32, i32)>,
     pub frame_callback: Option<u32>,
     pub presentation_feedbacks: Vec<u32>,
+    pub input_region: PendingInputRegion,
+    /// Pending `wl_surface.set_buffer_scale`.
+    pub buffer_scale: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -72,6 +75,16 @@ pub struct Surface {
     pub subsurface_position: (i32, i32),
     pub subsurface_sync: bool,
     pub position: (i32, i32),
+    /// Which parts of the surface accept pointer input, in surface-local
+    /// coordinates. `None` is the protocol default: the whole surface does.
+    pub input_region: Option<Vec<RegionRect>>,
+    /// How many buffer pixels map to one surface-local coordinate. Clients on a
+    /// scaled output submit a correspondingly larger buffer, so the surface's
+    /// logical size is its buffer size divided by this. Always at least 1.
+    pub buffer_scale: i32,
+    /// Outputs the client has been told this surface is on, via
+    /// `wl_surface.enter`. Diffed each frame so only changes are sent.
+    pub entered_outputs: HashSet<OutputId>,
 }
 
 #[derive(Debug)]
@@ -84,11 +97,67 @@ pub struct ViewportState {
     pub pending_destination: Option<(i32, i32)>,
 }
 
+/// Whether a rectangle adds to or subtracts from a region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionOp {
+    Add,
+    Subtract,
+}
+
+/// One add/subtract rectangle from a `wl_region`.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionRect {
+    pub op: RegionOp,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl RegionRect {
+    fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && y >= self.y
+            && x < self.x.saturating_add(self.width)
+            && y < self.y.saturating_add(self.height)
+    }
+}
+
+/// Whether a point falls inside the region built from these operations.
+///
+/// The operations are replayed in order rather than reduced to a set of
+/// disjoint rectangles. Order is significant: a rectangle added after a
+/// subtraction re-includes the overlapping area, so keeping adds and subtracts
+/// in separate lists would get that case wrong. Replaying is exact for point
+/// queries, which is all the compositor needs a region for.
+pub fn region_contains(rects: &[RegionRect], x: i32, y: i32) -> bool {
+    let mut inside = false;
+    for rect in rects {
+        if rect.contains(x, y) {
+            inside = rect.op == RegionOp::Add;
+        }
+    }
+    inside
+}
+
+/// A `wl_surface.set_input_region` waiting to be applied at the next commit.
+#[derive(Debug, Default, Clone)]
+pub enum PendingInputRegion {
+    /// The client has not set an input region since the last commit.
+    #[default]
+    Unchanged,
+    /// Reset to the protocol default, where the whole surface accepts input.
+    /// This is what the null region argument means.
+    Infinite,
+    /// Restricted to these rectangles, in surface-local coordinates.
+    Rects(Vec<RegionRect>),
+}
+
 #[derive(Debug, Default)]
 pub struct Region {
     pub client_id: u32,
-    pub rects: Vec<(i32, i32, i32, i32)>,
-    pub subtracts: Vec<(i32, i32, i32, i32)>,
+    /// Add/subtract rectangles in the order the client issued them.
+    pub rects: Vec<RegionRect>,
 }
 
 #[derive(Debug)]
@@ -360,6 +429,21 @@ impl CompositorState {
     }
 
     pub fn register_shm_pool(&mut self, client_id: u32, pool_id: u32, fd: RawFd, size: u32) {
+        // Reusing a live object id is a protocol error, rejected in
+        // `wl_shm::handle_create_pool` before we get here. Guard anyway: a plain
+        // insert would drop the displaced pool without unmapping or closing it.
+        if let Some(old) = self.shm_pools.remove(&(client_id, pool_id)) {
+            tracing::warn!(
+                "wl_shm pool {} re-registered for client {}, freeing the displaced mapping",
+                pool_id,
+                client_id,
+            );
+            if !old.map_ptr.is_null() {
+                unsafe { libc::munmap(old.map_ptr, old.size as usize) };
+            }
+            unsafe { libc::close(old.fd) };
+        }
+
         let map_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -488,6 +572,9 @@ impl CompositorState {
                 frame_callback: None,
                 presentation_feedbacks: Vec::new(),
                 pending: SurfacePending::default(),
+                input_region: None,
+                buffer_scale: 1,
+                entered_outputs: HashSet::new(),
                 parent: None,
                 children: Vec::new(),
                 subsurface_position: (0, 0),
@@ -682,5 +769,62 @@ impl CompositorState {
         {
             self.focused_surface = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegionOp, RegionRect, region_contains};
+
+    fn r(op: RegionOp, x: i32, y: i32, width: i32, height: i32) -> RegionRect {
+        RegionRect {
+            op,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn empty_region_accepts_nothing() {
+        assert!(!region_contains(&[], 0, 0));
+        assert!(!region_contains(&[], 50, 50));
+    }
+
+    #[test]
+    fn add_bounds_are_half_open() {
+        let rects = [r(RegionOp::Add, 10, 10, 20, 20)];
+        assert!(region_contains(&rects, 10, 10));
+        assert!(region_contains(&rects, 29, 29));
+        assert!(!region_contains(&rects, 30, 30));
+        assert!(!region_contains(&rects, 9, 10));
+    }
+
+    #[test]
+    fn subtract_punches_a_hole() {
+        let rects = [
+            r(RegionOp::Add, 0, 0, 100, 100),
+            r(RegionOp::Subtract, 40, 40, 20, 20),
+        ];
+        assert!(region_contains(&rects, 10, 10));
+        assert!(!region_contains(&rects, 45, 45));
+    }
+
+    #[test]
+    fn later_add_reinstates_subtracted_area() {
+        // The case two unordered lists would get wrong.
+        let rects = [
+            r(RegionOp::Add, 0, 0, 100, 100),
+            r(RegionOp::Subtract, 40, 40, 20, 20),
+            r(RegionOp::Add, 45, 45, 5, 5),
+        ];
+        assert!(!region_contains(&rects, 41, 41));
+        assert!(region_contains(&rects, 46, 46));
+    }
+
+    #[test]
+    fn zero_sized_rect_contains_nothing() {
+        assert!(!region_contains(&[r(RegionOp::Add, 5, 5, 0, 0)], 5, 5));
     }
 }

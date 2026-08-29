@@ -22,11 +22,11 @@ const ACK_CONFIGURE: u16 = 4;
 // Event opcodes
 pub const CONFIGURE: u16 = 0;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
-        GET_TOPLEVEL => handle_get_toplevel(state, msg).await,
-        GET_POPUP => handle_get_popup(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
+        GET_TOPLEVEL => handle_get_toplevel(state, msg),
+        GET_POPUP => handle_get_popup(state, msg),
         SET_WINDOW_GEOMETRY => handle_set_window_geometry(state, msg),
         ACK_CONFIGURE => handle_ack_configure(state, msg),
         op => {
@@ -35,32 +35,27 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let xdg_surface_id = msg.message.object_id;
     debug!("xdg_surface.destroy: xdg_surface_id={}", xdg_surface_id);
     state.destroy_xdg_surface(msg.client_id, xdg_surface_id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(xdg_surface_id).await;
+        client.unregister(xdg_surface_id);
     }
 }
 
-async fn handle_get_toplevel(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_toplevel(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
     };
     let mut args = ArgReader::new(&msg.message.args);
     let Some(toplevel_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "xdg_surface.get_toplevel: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "xdg_surface.get_toplevel: malformed args",
+        );
         return;
     };
 
@@ -71,11 +66,16 @@ async fn handle_get_toplevel(
     );
 
     let client_id = msg.client_id;
-    client.register(toplevel_id, ObjectType::XdgToplevel);
+    if client
+        .register(toplevel_id, ObjectType::XdgToplevel)
+        .is_err()
+    {
+        return;
+    }
     state.create_xdg_toplevel(client_id, toplevel_id, xdg_surface_id);
 
     // Send initial xdg_toplevel.configure (empty states, 0x0 = client picks size)
-    super::xdg_toplevel::send_configure(state, client_id, toplevel_id, 0, 0).await;
+    super::xdg_toplevel::send_configure(state, client_id, toplevel_id, 0, 0);
 
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
@@ -85,7 +85,7 @@ async fn handle_get_toplevel(
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
     };
-    let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
+    let _ = client.send(message(xdg_surface_id, CONFIGURE, args));
 
     // Take focus on the new toplevel
     let wl_surface_id = state
@@ -93,11 +93,11 @@ async fn handle_get_toplevel(
         .get(&(client_id, xdg_surface_id))
         .map(|s| s.wl_surface_id);
     if let Some(wl_surface_id) = wl_surface_id {
-        crate::compositor::switch_focus(state, (client_id, wl_surface_id)).await;
+        crate::compositor::switch_focus(state, (client_id, wl_surface_id));
     }
 }
 
-async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -107,13 +107,11 @@ async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMess
     let (Some(popup_id), Some(parent_xdg_surface_id), Some(positioner_id)) =
         (args.new_id(), args.u32(), args.u32())
     else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "xdg_surface.get_popup: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "xdg_surface.get_popup: malformed args",
+        );
         return;
     };
 
@@ -132,7 +130,9 @@ async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMess
             (0, 0, 1, 1)
         };
 
-    client.register(popup_id, ObjectType::XdgPopup);
+    if client.register(popup_id, ObjectType::XdgPopup).is_err() {
+        return;
+    }
     state.create_xdg_popup(
         client_id,
         popup_id,
@@ -165,7 +165,7 @@ async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMess
     }
 
     // Send xdg_popup.configure with the computed position
-    super::xdg_popup::send_configure(state, client_id, popup_id, x, y, width, height).await;
+    super::xdg_popup::send_configure(state, client_id, popup_id, x, y, width, height);
 
     // Send xdg_surface.configure with a serial the client must ack
     let serial = super::next_serial();
@@ -174,9 +174,7 @@ async fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMess
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
     };
-    let _ = client
-        .send(message(xdg_surface_id, CONFIGURE, configure_args))
-        .await;
+    let _ = client.send(message(xdg_surface_id, CONFIGURE, configure_args));
 }
 
 fn handle_set_window_geometry(
@@ -215,7 +213,7 @@ fn handle_ack_configure(state: &mut CompositorState, msg: &WaylandProtocolMessag
 
 /// Send an `xdg_surface.configure` event.
 #[allow(dead_code)]
-pub async fn send_configure(
+pub fn send_configure(
     state: &mut CompositorState,
     client_id: u32,
     xdg_surface_id: u32,
@@ -223,7 +221,7 @@ pub async fn send_configure(
 ) {
     let args = ArgWriter::new().u32(serial).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(xdg_surface_id, CONFIGURE, args)).await;
+        let _ = client.send(message(xdg_surface_id, CONFIGURE, args));
     }
 }
 

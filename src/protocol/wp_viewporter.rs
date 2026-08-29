@@ -17,26 +17,23 @@ use super::wire_utils::ArgReader;
 const DESTROY: u16 = 0;
 const GET_VIEWPORT: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             } else {
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }
         }
-        GET_VIEWPORT => handle_get_viewport(state, msg).await,
+        GET_VIEWPORT => handle_get_viewport(state, msg),
         op => {
             tracing::warn!("wp_viewporter: unhandled opcode {}", op);
         }
     }
 }
 
-async fn handle_get_viewport(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_viewport(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -57,17 +54,20 @@ async fn handle_get_viewport(
         .surface_viewport
         .contains_key(&(msg.client_id, surface_id))
     {
-        client
-            .send_error(
-                msg.message.object_id,
-                0, // error::viewport_exists
-                "surface already has a viewport",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0, // error::viewport_exists
+            "surface already has a viewport",
+        );
         return;
     }
 
-    client.register(viewport_id, ObjectType::WpViewport);
+    if client
+        .register(viewport_id, ObjectType::WpViewport)
+        .is_err()
+    {
+        return;
+    }
 
     state.create_viewport(msg.client_id, viewport_id, surface_id);
 }

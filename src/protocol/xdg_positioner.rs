@@ -21,9 +21,9 @@ const SET_GRAVITY: u16 = 4;
 const SET_CONSTRAINT_ADJUSTMENT: u16 = 5;
 const SET_OFFSET: u16 = 6;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
         SET_SIZE => handle_set_size(state, msg),
         SET_ANCHOR_RECT => handle_set_anchor_rect(state, msg),
         SET_ANCHOR => handle_set_anchor(state, msg),
@@ -36,11 +36,11 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let id = msg.message.object_id;
     state.destroy_xdg_positioner(msg.client_id, id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(id).await;
+        client.unregister(id);
     } else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
     }

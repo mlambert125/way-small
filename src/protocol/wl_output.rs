@@ -20,14 +20,14 @@ const SCALE: u16 = 3;
 const NAME: u16 = 4;
 const DESCRIPTION: u16 = 5;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         RELEASE => {
             state
                 .output_bindings
                 .remove(&(msg.client_id, msg.message.object_id));
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             } else {
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }
@@ -39,7 +39,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 }
 
 /// Send output info events for a specific output after a client binds its `wl_output` global.
-pub async fn send_output_info(
+pub fn send_output_info(
     state: &mut CompositorState,
     client_id: u32,
     obj_id: u32,
@@ -67,7 +67,7 @@ pub async fn send_output_info(
         .string(&output.geometry.model)
         .i32(output.geometry.transform as i32)
         .build();
-    let _ = client.send(message(obj_id, GEOMETRY, args)).await;
+    let _ = client.send(message(obj_id, GEOMETRY, args));
 
     // wl_output.mode (one event per mode)
     for mode in &output.modes {
@@ -77,30 +77,30 @@ pub async fn send_output_info(
             .i32(mode.height)
             .i32(mode.refresh_mhz)
             .build();
-        let _ = client.send(message(obj_id, MODE, args)).await;
+        let _ = client.send(message(obj_id, MODE, args));
     }
 
     // wl_output.scale (version 2+)
     if version >= 2 {
         let args = ArgWriter::new().i32(output.scale).build();
-        let _ = client.send(message(obj_id, SCALE, args)).await;
+        let _ = client.send(message(obj_id, SCALE, args));
 
         // wl_output.name and wl_output.description (version 4+)
         if version >= 4 {
             let args = ArgWriter::new().string(&output.name).build();
-            let _ = client.send(message(obj_id, NAME, args)).await;
+            let _ = client.send(message(obj_id, NAME, args));
 
             let args = ArgWriter::new().string(&output.description).build();
-            let _ = client.send(message(obj_id, DESCRIPTION, args)).await;
+            let _ = client.send(message(obj_id, DESCRIPTION, args));
         }
 
         // wl_output.done — sent once after all property events for this output.
-        let _ = client.send(message(obj_id, DONE, Vec::new())).await;
+        let _ = client.send(message(obj_id, DONE, Vec::new()));
     }
 }
 
 /// Send updated geometry + mode + done to all clients that have bound this output's `wl_output`.
-pub async fn broadcast_mode(state: &mut CompositorState) {
+pub fn broadcast_mode(state: &mut CompositorState) {
     // Clone outputs and collect bindings to avoid borrow conflicts.
     let outputs = state.outputs.clone();
     let bindings: Vec<((u32, u32), OutputId)> = state
@@ -131,7 +131,7 @@ pub async fn broadcast_mode(state: &mut CompositorState) {
                 .string(&output.geometry.model)
                 .i32(output.geometry.transform as i32)
                 .build();
-            let _ = client.send(message(obj_id, GEOMETRY, args)).await;
+            let _ = client.send(message(obj_id, GEOMETRY, args));
 
             // All modes
             for mode in &output.modes {
@@ -141,12 +141,12 @@ pub async fn broadcast_mode(state: &mut CompositorState) {
                     .i32(mode.height)
                     .i32(mode.refresh_mhz)
                     .build();
-                let _ = client.send(message(obj_id, MODE, args)).await;
+                let _ = client.send(message(obj_id, MODE, args));
             }
 
             // wl_output.done — once after all property events (version 2+)
             if version >= 2 {
-                let _ = client.send(message(obj_id, DONE, Vec::new())).await;
+                let _ = client.send(message(obj_id, DONE, Vec::new()));
             }
         }
     }

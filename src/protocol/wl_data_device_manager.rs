@@ -16,17 +16,17 @@ use super::wire_utils::ArgReader;
 const CREATE_DATA_SOURCE: u16 = 0;
 const GET_DATA_DEVICE: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        CREATE_DATA_SOURCE => handle_create_data_source(state, msg).await,
-        GET_DATA_DEVICE => handle_get_data_device(state, msg).await,
+        CREATE_DATA_SOURCE => handle_create_data_source(state, msg),
+        GET_DATA_DEVICE => handle_get_data_device(state, msg),
         op => {
             tracing::warn!("wl_data_device_manager: unhandled opcode {}", op);
         }
     }
 }
 
-async fn handle_create_data_source(
+fn handle_create_data_source(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
@@ -37,13 +37,11 @@ async fn handle_create_data_source(
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(source_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_data_device_manager.create_data_source: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_data_device_manager.create_data_source: malformed args",
+        );
         return;
     };
 
@@ -52,13 +50,12 @@ async fn handle_create_data_source(
         source_id
     );
 
-    client.register(source_id, ObjectType::WlDataSource);
+    // Registering is the whole handler, so there is nothing to skip when the id
+    // is rejected — `register` has already errored and dropped the client.
+    let _ = client.register(source_id, ObjectType::WlDataSource);
 }
 
-async fn handle_get_data_device(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_data_device(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -67,13 +64,11 @@ async fn handle_get_data_device(
     let mut args = ArgReader::new(&msg.message.args);
     // get_data_device args: new_id, object seat
     let (Some(device_id), Some(_seat_id)) = (args.new_id(), args.u32()) else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_data_device_manager.get_data_device: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_data_device_manager.get_data_device: malformed args",
+        );
         return;
     };
 
@@ -82,5 +77,7 @@ async fn handle_get_data_device(
         device_id
     );
 
-    client.register(device_id, ObjectType::WlDataDevice);
+    // Registering is the whole handler, so there is nothing to skip when the id
+    // is rejected — `register` has already errored and dropped the client.
+    let _ = client.register(device_id, ObjectType::WlDataDevice);
 }

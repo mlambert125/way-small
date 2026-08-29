@@ -21,9 +21,9 @@ const REPOSITION: u16 = 2;
 const CONFIGURE: u16 = 0;
 const POPUP_DONE: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        DESTROY => handle_destroy(state, msg).await,
+        DESTROY => handle_destroy(state, msg),
         GRAB => handle_grab(state, msg),
         REPOSITION => {
             debug!("xdg_popup.reposition: not yet implemented");
@@ -34,7 +34,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let popup_id = msg.message.object_id;
     let client_id = msg.client_id;
     debug!("xdg_popup.destroy: popup_id={}", popup_id);
@@ -62,7 +62,7 @@ async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessag
     state.grabbed_popups.retain(|k| *k != (client_id, popup_id));
     state.destroy_xdg_popup(client_id, popup_id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(popup_id).await;
+        client.unregister(popup_id);
     }
 }
 
@@ -74,7 +74,7 @@ fn handle_grab(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
 }
 
 /// Send `xdg_popup.configure` event with the computed position and size.
-pub async fn send_configure(
+pub fn send_configure(
     state: &mut CompositorState,
     client_id: u32,
     popup_id: u32,
@@ -90,7 +90,7 @@ pub async fn send_configure(
         .i32(height)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(popup_id, CONFIGURE, args)).await;
+        let _ = client.send(message(popup_id, CONFIGURE, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -98,9 +98,9 @@ pub async fn send_configure(
 
 /// Send `xdg_popup.popup_done` to dismiss the popup.
 #[allow(dead_code)]
-pub async fn send_popup_done(state: &mut CompositorState, client_id: u32, popup_id: u32) {
+pub fn send_popup_done(state: &mut CompositorState, client_id: u32, popup_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(popup_id, POPUP_DONE, Vec::new())).await;
+        let _ = client.send(message(popup_id, POPUP_DONE, Vec::new()));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }

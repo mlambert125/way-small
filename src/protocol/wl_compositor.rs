@@ -16,20 +16,17 @@ use super::wire_utils::ArgReader;
 const CREATE_SURFACE: u16 = 0;
 const CREATE_REGION: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        CREATE_SURFACE => handle_create_surface(state, msg).await,
-        CREATE_REGION => handle_create_region(state, msg).await,
+        CREATE_SURFACE => handle_create_surface(state, msg),
+        CREATE_REGION => handle_create_region(state, msg),
         op => {
             tracing::warn!("wl_compositor: unhandled opcode {}", op);
         }
     }
 }
 
-async fn handle_create_surface(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_create_surface(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -37,26 +34,23 @@ async fn handle_create_surface(
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(surface_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_compositor.create_surface: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_compositor.create_surface: malformed args",
+        );
         return;
     };
 
     debug!("wl_compositor.create_surface: surface_id={}", surface_id);
 
-    client.register(surface_id, ObjectType::WlSurface);
+    if client.register(surface_id, ObjectType::WlSurface).is_err() {
+        return;
+    }
     state.create_surface(msg.client_id, surface_id);
 }
 
-async fn handle_create_region(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_create_region(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -64,18 +58,18 @@ async fn handle_create_region(
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(region_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_compositor.create_region: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_compositor.create_region: malformed args",
+        );
         return;
     };
 
     debug!("wl_compositor.create_region: region_id={}", region_id);
 
-    client.register(region_id, ObjectType::WlRegion);
+    if client.register(region_id, ObjectType::WlRegion).is_err() {
+        return;
+    }
     state.create_region(msg.client_id, region_id);
 }

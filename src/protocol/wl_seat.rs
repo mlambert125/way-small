@@ -26,16 +26,16 @@ pub const NAME: u16 = 1;
 const CAP_POINTER: u32 = 1;
 const CAP_KEYBOARD: u32 = 2;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        GET_POINTER => handle_get_pointer(state, msg).await,
-        GET_KEYBOARD => handle_get_keyboard(state, msg).await,
+        GET_POINTER => handle_get_pointer(state, msg),
+        GET_KEYBOARD => handle_get_keyboard(state, msg),
         GET_TOUCH => {
             debug!("wl_seat.get_touch: not supported");
         }
         RELEASE => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             }
         }
         op => {
@@ -44,40 +44,37 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_get_pointer(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_pointer(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
     };
     let mut args = ArgReader::new(&msg.message.args);
     let Some(pointer_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_seat.get_pointer: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_seat.get_pointer: malformed args",
+        );
         return;
     };
 
     debug!("wl_seat.get_pointer: pointer_id={}", pointer_id);
 
     let seat_version = client.version(msg.message.object_id);
-    client.register_with_version(pointer_id, ObjectType::WlPointer, seat_version);
+    if client
+        .register_with_version(pointer_id, ObjectType::WlPointer, seat_version)
+        .is_err()
+    {
+        return;
+    }
     state.pointers.push(super::state::PointerBinding {
         client_id: msg.client_id,
         object_id: pointer_id,
     });
 }
 
-async fn handle_get_keyboard(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_keyboard(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -85,31 +82,34 @@ async fn handle_get_keyboard(
 
     let mut args = ArgReader::new(&msg.message.args);
     let Some(keyboard_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_seat.get_keyboard: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_seat.get_keyboard: malformed args",
+        );
         return;
     };
 
     debug!("wl_seat.get_keyboard: keyboard_id={}", keyboard_id);
 
     let seat_version = client.version(msg.message.object_id);
-    client.register_with_version(keyboard_id, ObjectType::WlKeyboard, seat_version);
+    if client
+        .register_with_version(keyboard_id, ObjectType::WlKeyboard, seat_version)
+        .is_err()
+    {
+        return;
+    }
     state.keyboards.push(super::state::KeyboardBinding {
         client_id: msg.client_id,
         object_id: keyboard_id,
     });
 
     // Send keymap to the client (required before any key events)
-    super::wl_keyboard::send_keymap(state, msg.client_id, keyboard_id).await;
+    super::wl_keyboard::send_keymap(state, msg.client_id, keyboard_id);
 }
 
 /// Send `wl_seat.capabilities` and `wl_seat.name` after a client binds.
-pub async fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32) {
+pub fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32) {
     let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
@@ -123,8 +123,8 @@ pub async fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id
     }
 
     let args = ArgWriter::new().u32(caps).build();
-    let _ = client.send(message(seat_id, CAPABILITIES, args)).await;
+    let _ = client.send(message(seat_id, CAPABILITIES, args));
 
     let args = ArgWriter::new().string("default").build();
-    let _ = client.send(message(seat_id, NAME, args)).await;
+    let _ = client.send(message(seat_id, NAME, args));
 }

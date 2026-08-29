@@ -17,10 +17,10 @@ const CREATE_BUFFER: u16 = 0;
 const DESTROY: u16 = 1;
 const RESIZE: u16 = 2;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
-        CREATE_BUFFER => handle_create_buffer(state, msg).await,
-        DESTROY => handle_destroy(state, msg).await,
+        CREATE_BUFFER => handle_create_buffer(state, msg),
+        DESTROY => handle_destroy(state, msg),
         RESIZE => handle_resize(state, msg),
         op => {
             tracing::warn!("wl_shm_pool: unhandled opcode {}", op);
@@ -28,10 +28,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_create_buffer(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_create_buffer(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -47,13 +44,11 @@ async fn handle_create_buffer(
         args.i32(),
         args.u32(),
     ) else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_shm_pool.create_buffer: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_shm_pool.create_buffer: malformed args",
+        );
         return;
     };
 
@@ -62,7 +57,9 @@ async fn handle_create_buffer(
         buffer_id, offset, width, height, stride, format
     );
 
-    client.register(buffer_id, ObjectType::WlBuffer);
+    if client.register(buffer_id, ObjectType::WlBuffer).is_err() {
+        return;
+    }
     state.register_buffer(
         msg.client_id,
         buffer_id,
@@ -75,12 +72,12 @@ async fn handle_create_buffer(
     );
 }
 
-async fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let pool_id = msg.message.object_id;
     debug!("wl_shm_pool.destroy: pool_id={}", pool_id);
     state.destroy_shm_pool(msg.client_id, pool_id);
     if let Some(client) = state.clients.get(msg.client_id) {
-        client.unregister(pool_id).await;
+        client.unregister(pool_id);
     } else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
     }

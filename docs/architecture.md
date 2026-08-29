@@ -71,12 +71,31 @@ pub struct WaylandProtocolMessage {
     pub object_id: u32,
     pub op_code: u16,
     pub args: Vec<u8>,
-    pub fds: Vec<i32>,  // Always empty for inbound messages, see "File Descriptors" section below
+    pub fds: Vec<OwnedFd>,  // Always empty for inbound messages, see "File Descriptors" section below
 }
 ```
 
 Each of these messages represents a single wayland message that the compositor should process and possibly
 respond to through the client's sender channel.
+
+#### Outgoing Messages and Unresponsive Clients
+
+The compositor subsystem is a single task that owns all compositor state, so it must never block. In particular it
+must never wait on a client: a client that stops reading its socket will fill the kernel's socket buffer, which stalls
+that client's send task, which in turn fills the send channel. If the compositor awaited that channel, one wedged
+client would freeze input handling, rendering, and every other client along with it.
+
+Sends to a client are therefore non-blocking. `ClientState::send` uses `try_send` and, when a client's send channel
+reaches `CLIENT_SEND_QUEUE_LIMIT` messages, the client is assumed to be wedged and is disconnected rather than waited
+on. This is the same policy libwayland applies once a client's output buffer grows past its threshold.
+
+Disconnection is signalled through a per-client `CancellationToken`, created as a child of the global shutdown token
+and handed to the compositor in the `WaylandNewClientMessage`. Cancelling it stops that client's read and send tasks
+without affecting any other client; the read task then emits the usual `ClientDisconnected` message so the compositor
+cleans up the client's resources through the normal path.
+
+Because sends cannot block, the entire protocol handling layer is synchronous. This keeps the message handlers plain
+state-machine code that is straightforward to unit test without a runtime.
 
 
 #### File Descriptors
@@ -89,12 +108,58 @@ the messages.
 
 By specification, each file descriptor is associated with a particular message.  However, the wayland socket
 subsystem can not associate the file descriptors with a particular message without parsing the message and
-considering compositor state, which is the responsibility of the compositor subsystem.  
+considering compositor state, which is the responsibility of the compositor subsystem.
 
-Instead, file descriptors are places on a queue in the client struct as they are received, and the compositor
-subsystem is responsible for associating them with the correct message when processing messages from that client. 
-Since messages are guaranteed to be processed in order, this works as long as the compositor subsystem is careful
-to always pull the correct number of file descriptors from the queue for each message.
+Instead, file descriptors are placed on a queue in the client struct as they are received, and the compositor
+subsystem associates them with the correct message when processing messages from that client.  Messages are
+processed in order, so this works as long as exactly the right number of file descriptors is pulled from the queue
+for each message.
+
+That last condition is the fragile part, so it is enforced in one place rather than left to individual handlers.
+`request_fd_count` in `protocol/mod.rs` is a table of how many file descriptors each request carries, and
+`handle_message` applies it to every request before dispatch: it moves that many descriptors off the queue into a
+`Vec<OwnedFd>` and passes them to the handler.  Only the interfaces that can actually receive a descriptor take that
+parameter.
+
+Making this the dispatcher's job rather than each handler's is what keeps the accounting honest.  A handler that
+ignores its descriptors, returns early, or is an unimplemented stub simply drops the `Vec<OwnedFd>`, which closes
+them.  It cannot leave a descriptor on the queue to be mispaired with some later request, which would otherwise
+corrupt every remaining file descriptor on that connection — a failure that surfaces far away from its cause.
+
+Adding a new request that takes an `fd` argument therefore means adding it to `request_fd_count` and widening its
+interface's arm in `handle_message`.  Forgetting the arm closes the descriptor and makes the request a no-op;
+forgetting the table entry desyncs the queue, which is why the table carries a comment saying so.
+
+`OwnedFd` is used throughout rather than a raw `i32` so that ownership is explicit and closing is automatic.  The
+one `unsafe` conversion happens where the kernel hands the descriptors over, in the socket read loop.
+
+#### Ordering
+
+Treating a missing file descriptor as a client protocol violation — which the compositor does, by disconnecting the
+client — relies on a descriptor never arriving *after* the message it belongs to.  It cannot: for a `SOCK_STREAM`
+socket the kernel stops a `recvmsg` at the boundary where ancillary data is attached, so a descriptor always arrives
+with the first byte of its own `sendmsg`.  The read loop then queues the descriptors from a read before forwarding
+that read's messages to the compositor.  A descriptor may arrive early, batched ahead of its message, but never
+late.
+
+Note that the ancillary buffer is fixed at `MAX_FDS_IN` (28, matching libwayland's `MAX_FDS_OUT`).  A client that
+attaches more than that to a single `sendmsg` overflows it, and the kernel closes the excess rather than requeueing
+it.  The `sendfd` crate does not surface `MSG_CTRUNC`, so this would be silent.
+
+#### Limits
+
+Requests that take no file descriptor never drain the queue, so a client that attaches descriptors to them would
+grow it without bound.  Because descriptors are a process-wide resource, that is not merely the offending client's
+problem: exhausting `RLIMIT_NOFILE` would break every other client, along with `mmap` and `memfd_create`.  The queue
+is therefore capped at `MAX_PENDING_FDS`, and a client that exceeds it is disconnected and its queued descriptors
+closed.  libwayland bounds the same queue the same way.
+
+The cap is set well above any legitimate burst.  Only two requests carry descriptors, and the compositor drains its
+entire message channel on each pass of its loop, so a well-behaved client never accumulates more than a handful.
+
+Received descriptors are marked close-on-exec as they arrive.  `sendfd` does not pass `MSG_CMSG_CLOEXEC`, so this is
+not atomic with the `recvmsg`, but way-small never forks, so there is no window in which they could leak into a
+child.  The keymap memfd the compositor creates for `wl_keyboard.keymap` is likewise created with `MFD_CLOEXEC`.
 
 ### Compositor
 
@@ -163,6 +228,27 @@ with the surface object that the client created.
 Storing the IDs and types of objects created by a client at client level also ensures that the client only has access to 
 the objects that it has created or requested, and can not access or manipulate objects created by other clients.  It also
 lets the compositor easily clean up all of a client's objects when the client disconnects by just looking at that client's state.
+
+#### Object IDs
+
+Clients choose the ids for the objects they create, and must not reuse one until the compositor has acknowledged the
+previous object's destruction with `wl_display.delete_id`.  `ClientState::register` enforces that: reusing a live id
+is a protocol error, so the client is sent an error and disconnected.
+
+This matters because most compositor state is keyed by object id but lives in the *global* state rather than in the
+client's object map — shm pools, surfaces, pointer and keyboard bindings.  Letting a reused id silently replace its
+predecessor would leave that state in place with nothing pointing at it: unreachable to the client, and invisible to
+the disconnect-time cleanup, which finds a client's resources by walking its object map.  An `mmap`ed pool stranded
+this way would stay mapped for the compositor's lifetime.
+
+`register` returns a `Result` rather than handling the error silently so that the check cannot be bypassed by
+accident.  `Result` is `#[must_use]`, so a caller that creates an object without considering the rejected case is a
+compiler warning rather than a leak discovered much later.  Callers only need to stop what they were doing; the error
+and the disconnect have already been sent.
+
+The converse invariant is what keeps well-behaved clients working: an id is removed from the object map and
+`wl_display.delete_id` is sent together, in `ClientState::unregister`, and nowhere else.  A client is therefore told
+an id is free at exactly the moment the compositor stops considering it live.
 
 ### Dispatch Loop
 

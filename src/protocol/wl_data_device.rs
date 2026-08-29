@@ -12,14 +12,14 @@ const START_DRAG: u16 = 0;
 const SET_SELECTION: u16 = 1;
 const RELEASE: u16 = 2;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         START_DRAG | SET_SELECTION => {
             // Clipboard selection not implemented yet
         }
         RELEASE => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             } else {
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }

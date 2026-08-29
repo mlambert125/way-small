@@ -21,7 +21,7 @@ pub fn handle(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
             info!("xdg_system_bell: ring");
         }
         op => {
-            warn!("wl_data_device: unhandled opcode {}", op);
+            warn!("xdg_system_bell: unhandled opcode {}", op);
         }
     }
 }

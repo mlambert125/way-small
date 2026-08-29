@@ -20,15 +20,15 @@ const PONG: u16 = 3;
 // Event opcodes
 pub const PING: u16 = 0;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             }
         }
-        CREATE_POSITIONER => handle_create_positioner(state, msg).await,
-        GET_XDG_SURFACE => handle_get_xdg_surface(state, msg).await,
+        CREATE_POSITIONER => handle_create_positioner(state, msg),
+        GET_XDG_SURFACE => handle_get_xdg_surface(state, msg),
         PONG => handle_pong(msg),
         op => {
             tracing::warn!("xdg_wm_base: unhandled opcode {}", op);
@@ -36,7 +36,7 @@ pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     }
 }
 
-async fn handle_create_positioner(
+fn handle_create_positioner(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
@@ -46,13 +46,11 @@ async fn handle_create_positioner(
     };
     let mut args = ArgReader::new(&msg.message.args);
     let Some(positioner_id) = args.new_id() else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "xdg_wm_base.create_positioner: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "xdg_wm_base.create_positioner: malformed args",
+        );
         return;
     };
 
@@ -61,14 +59,16 @@ async fn handle_create_positioner(
         positioner_id
     );
 
-    client.register(positioner_id, ObjectType::XdgPositioner);
+    if client
+        .register(positioner_id, ObjectType::XdgPositioner)
+        .is_err()
+    {
+        return;
+    }
     state.create_xdg_positioner(msg.client_id, positioner_id);
 }
 
-async fn handle_get_xdg_surface(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_xdg_surface(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -76,13 +76,11 @@ async fn handle_get_xdg_surface(
     let mut args = ArgReader::new(&msg.message.args);
     // get_xdg_surface args: new_id, object surface
     let (Some(xdg_surface_id), Some(wl_surface_id)) = (args.new_id(), args.u32()) else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "xdg_wm_base.get_xdg_surface: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "xdg_wm_base.get_xdg_surface: malformed args",
+        );
         return;
     };
 
@@ -95,17 +93,20 @@ async fn handle_get_xdg_surface(
         .cursor_role_surfaces
         .contains(&(msg.client_id, wl_surface_id))
     {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "xdg_wm_base.get_xdg_surface: surface already has cursor role",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "xdg_wm_base.get_xdg_surface: surface already has cursor role",
+        );
         return;
     }
 
-    client.register(xdg_surface_id, ObjectType::XdgSurface);
+    if client
+        .register(xdg_surface_id, ObjectType::XdgSurface)
+        .is_err()
+    {
+        return;
+    }
     state.create_xdg_surface(msg.client_id, xdg_surface_id, wl_surface_id);
 }
 
@@ -117,11 +118,11 @@ fn handle_pong(msg: &WaylandProtocolMessageWithClientInfo) {
 
 /// Send a ping event to a client's `xdg_wm_base` object.
 #[allow(dead_code)]
-pub async fn send_ping(state: &mut CompositorState, client_id: u32, wm_base_id: u32, serial: u32) {
+pub fn send_ping(state: &mut CompositorState, client_id: u32, wm_base_id: u32, serial: u32) {
     let Some(client) = state.clients.get(client_id) else {
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
     };
     let args = ArgWriter::new().u32(serial).build();
-    let _ = client.send(message(wm_base_id, PING, args)).await;
+    let _ = client.send(message(wm_base_id, PING, args));
 }

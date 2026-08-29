@@ -37,6 +37,7 @@ pub mod xdg_system_bell;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
 
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
@@ -139,11 +140,28 @@ pub static GLOBALS: &[Global] = &[
     },
 ];
 
+/// Number of file descriptors a request carries as ancillary data.
+///
+/// Wayland passes fds out-of-band, so the socket task cannot pair them with
+/// messages on its own — that needs the object id to interface mapping, which
+/// only lives here. This table is the single place that pairing is decided, and
+/// `handle_message` applies it to every request before dispatch.
+///
+/// Any new request taking an `fd` argument MUST be listed here, and its
+/// interface's arm in `handle_message` widened to receive the fds. Forgetting
+/// the table entry desyncs the client's fd queue for the rest of the
+/// connection; forgetting only the arm merely closes the fd, which makes the
+/// request a no-op but keeps every later request correct.
+fn request_fd_count(obj_type: ObjectType, op_code: u16) -> usize {
+    match (obj_type, op_code) {
+        (ObjectType::WlShm, wl_shm::CREATE_POOL)
+        | (ObjectType::WlDataOffer, wl_data_offer::RECEIVE) => 1,
+        _ => 0,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-pub async fn handle_message(
-    state: &mut CompositorState,
-    message: &WaylandProtocolMessageWithClientInfo,
-) {
+pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMessageWithClientInfo) {
     let object_id = message.message.object_id;
     let client_id = message.client_id;
     let Some(client) = state.clients.get(client_id) else {
@@ -153,93 +171,123 @@ pub async fn handle_message(
 
     let obj_type = client.objects.get(&object_id).copied();
 
+    // Claim the fds this request is specified to carry, before any handler
+    // runs. Holding them here rather than leaving them on the shared queue is
+    // what makes the accounting total: a handler that ignores them (or returns
+    // early, or is an unimplemented stub) drops the `Vec<OwnedFd>` and the
+    // descriptors are closed, instead of being mispaired with a later request.
+    let mut request_fds: Vec<OwnedFd> = Vec::new();
+    if let Some(obj_type) = obj_type {
+        let count = request_fd_count(obj_type, message.message.op_code);
+        if count > 0 {
+            let mut queue = client.fd_queue.lock().unwrap();
+            if queue.len() < count {
+                // An fd always reaches us with the first byte of the message it
+                // belongs to, so a short queue is a genuine protocol violation
+                // rather than a race with the socket task. Continuing would
+                // mispair every later fd, so drop the client.
+                drop(queue);
+                tracing::warn!(
+                    "client {}: request for object {} is missing its file descriptor",
+                    client_id,
+                    object_id,
+                );
+                // WL_DISPLAY_ERROR_INVALID_METHOD = 1
+                client.send_error(object_id, 1, "request is missing its file descriptor");
+                client.cancel_token.cancel();
+                return;
+            }
+            request_fds = queue.drain(..count).collect();
+        }
+    }
+
     match obj_type {
         Some(ObjectType::WlDisplay) => {
-            wl_display::handle(state, message).await;
+            wl_display::handle(state, message);
         }
         Some(ObjectType::WlRegistry) => {
-            wl_registry::handle(state, message).await;
+            wl_registry::handle(state, message);
         }
         Some(ObjectType::WlCallback) => {
             wl_callback::handle(message);
         }
         Some(ObjectType::WlShm) => {
-            wl_shm::handle(state, message).await;
+            wl_shm::handle(state, message, request_fds);
         }
         Some(ObjectType::WlShmPool) => {
-            wl_shm_pool::handle(state, message).await;
+            wl_shm_pool::handle(state, message);
         }
         Some(ObjectType::WlCompositor) => {
-            wl_compositor::handle(state, message).await;
+            wl_compositor::handle(state, message);
         }
         Some(ObjectType::WlSurface) => {
-            wl_surface::handle(state, message).await;
+            wl_surface::handle(state, message);
         }
         Some(ObjectType::WlRegion) => {
-            wl_region::handle(state, message).await;
+            wl_region::handle(state, message);
         }
         Some(ObjectType::WlSubcompositor) => {
-            wl_subcompositor::handle(state, message).await;
+            wl_subcompositor::handle(state, message);
         }
         Some(ObjectType::WlSubsurface) => {
-            wl_subsurface::handle(state, message).await;
+            wl_subsurface::handle(state, message);
         }
         Some(ObjectType::WlDataDeviceManager) => {
-            wl_data_device_manager::handle(state, message).await;
+            wl_data_device_manager::handle(state, message);
         }
         Some(ObjectType::WlDataDevice) => {
-            wl_data_device::handle(state, message).await;
+            wl_data_device::handle(state, message);
         }
         Some(ObjectType::WlDataSource) => {
-            wl_data_source::handle(state, message).await;
+            wl_data_source::handle(state, message);
         }
         Some(ObjectType::WlDataOffer) => {
-            wl_data_offer::handle(state, message).await;
+            wl_data_offer::handle(state, message, request_fds);
         }
         Some(ObjectType::WlSeat) => {
-            wl_seat::handle(state, message).await;
+            wl_seat::handle(state, message);
         }
         Some(ObjectType::WlPointer) => {
-            wl_pointer::handle(state, message).await;
+            wl_pointer::handle(state, message);
         }
         Some(ObjectType::WlKeyboard) => {
-            wl_keyboard::handle(state, message).await;
+            wl_keyboard::handle(state, message);
         }
         Some(ObjectType::WlOutput) => {
-            wl_output::handle(state, message).await;
+            wl_output::handle(state, message);
         }
         Some(ObjectType::XdgWmBase) => {
-            xdg_wm_base::handle(state, message).await;
+            xdg_wm_base::handle(state, message);
         }
         Some(ObjectType::XdgSurface) => {
-            xdg_surface::handle(state, message).await;
+            xdg_surface::handle(state, message);
         }
         Some(ObjectType::XdgSystemBell) => {
             xdg_system_bell::handle(state, message);
         }
         Some(ObjectType::XdgToplevel) => {
-            xdg_toplevel::handle(state, message).await;
+            xdg_toplevel::handle(state, message);
         }
         Some(ObjectType::XdgPopup) => {
-            xdg_popup::handle(state, message).await;
+            xdg_popup::handle(state, message);
         }
         Some(ObjectType::XdgPositioner) => {
-            xdg_positioner::handle(state, message).await;
+            xdg_positioner::handle(state, message);
         }
         Some(ObjectType::WlBuffer) => {
-            wl_buffer::handle(state, message).await;
+            wl_buffer::handle(state, message);
         }
         Some(ObjectType::WpPresentation) => {
-            wp_presentation::handle(state, message).await;
+            wp_presentation::handle(state, message);
         }
         Some(ObjectType::WpPresentationFeedback) => {
             wp_presentation_feedback::handle(state, message);
         }
         Some(ObjectType::WpViewporter) => {
-            wp_viewporter::handle(state, message).await;
+            wp_viewporter::handle(state, message);
         }
         Some(ObjectType::WpViewport) => {
-            wp_viewport::handle(state, message).await;
+            wp_viewport::handle(state, message);
         }
         None => {
             tracing::warn!(
@@ -249,9 +297,11 @@ pub async fn handle_message(
                 message.message.op_code,
             );
             // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
-            client
-                .send_error(object_id, 0, &format!("invalid object {object_id}"))
-                .await;
+            client.send_error(object_id, 0, &format!("invalid object {object_id}"));
+            // Fatal by spec. Also necessary here: we cannot know how many fds an
+            // unknown object's request carried, so anything it attached is
+            // already orphaned on the queue and would mispair later requests.
+            client.cancel_token.cancel();
         }
     }
 }

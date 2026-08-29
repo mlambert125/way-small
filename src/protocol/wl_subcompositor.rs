@@ -15,26 +15,23 @@ use super::wire_utils::ArgReader;
 const DESTROY: u16 = 0;
 const GET_SUBSURFACE: u16 = 1;
 
-pub async fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
             if let Some(client) = state.clients.get(msg.client_id) {
-                client.unregister(msg.message.object_id).await;
+                client.unregister(msg.message.object_id);
             } else {
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }
         }
-        GET_SUBSURFACE => handle_get_subsurface(state, msg).await,
+        GET_SUBSURFACE => handle_get_subsurface(state, msg),
         op => {
             tracing::warn!("wl_subcompositor: unhandled opcode {}", op);
         }
     }
 }
 
-async fn handle_get_subsurface(
-    state: &mut CompositorState,
-    msg: &WaylandProtocolMessageWithClientInfo,
-) {
+fn handle_get_subsurface(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
@@ -45,13 +42,11 @@ async fn handle_get_subsurface(
     let (Some(subsurface_id), Some(surface_id), Some(parent_id)) =
         (args.new_id(), args.u32(), args.u32())
     else {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_subcompositor.get_subsurface: malformed args",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_subcompositor.get_subsurface: malformed args",
+        );
         return;
     };
 
@@ -61,13 +56,11 @@ async fn handle_get_subsurface(
         .cursor_role_surfaces
         .contains(&(client_id, surface_id))
     {
-        client
-            .send_error(
-                msg.message.object_id,
-                0,
-                "wl_subcompositor.get_subsurface: surface already has cursor role",
-            )
-            .await;
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_subcompositor.get_subsurface: surface already has cursor role",
+        );
         return;
     }
 
@@ -76,6 +69,15 @@ async fn handle_get_subsurface(
         subsurface_id, surface_id, parent_id
     );
 
+    // Register before touching any surface state: a rejected id must not leave
+    // a half-built parent-child relationship behind.
+    if client
+        .register(subsurface_id, ObjectType::WlSubsurface)
+        .is_err()
+    {
+        return;
+    }
+
     // Set up the parent-child relationship
     if let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id)) {
         surface.parent = Some(parent_id);
@@ -83,8 +85,6 @@ async fn handle_get_subsurface(
     if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_id)) {
         parent.children.push(surface_id);
     }
-
-    client.register(subsurface_id, ObjectType::WlSubsurface);
 
     // Store the mapping from subsurface object id to the wl_surface id it controls
     state
