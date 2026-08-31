@@ -10,9 +10,11 @@
 //! compositor task. EGL is also what a future dmabuf import path needs, so a
 //! client-supplied GPU buffer will slot into the same renderer.
 
-use std::num::NonZeroU32;
-use std::sync::Arc;
-
+use super::gl_renderer::GlRenderer;
+use crate::shared::{
+    BackendMessage, ButtonState, Frame, KeyState, MouseButton, PresentedAt, Scene,
+};
+use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId};
 use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
@@ -21,6 +23,8 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::surface::{GlSurface, Surface as GlSurfaceHandle, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -34,13 +38,6 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 use xkbcommon::xkb;
-
-use super::gl_renderer::GlRenderer;
-use crate::shared::{
-    BackendMessage, ButtonState, Frame, KeyState, MouseButton, PresentedAt, Scene,
-};
-
-use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId};
 
 /// The one and only output id for this winit host
 const WINIT_OUTPUT_ID: OutputId = OutputId(1);
@@ -72,19 +69,25 @@ struct GlState {
     renderer: GlRenderer,
 }
 
+/// Winit application
 struct App {
+    /// GL State data
     gl: Option<GlState>,
     backend_sender: Sender<BackendMessage>,
+    /// Cancellation token for this host to cancel the compositor at large
+    /// when a window is closed, or an unrecoverable error occurs
     cancel_token: CancellationToken,
-    // xkb_context and xkb_keymap must outlive xkb_state
+    /// xkb_context and xkb_keymap must outlive xkb_state
     #[allow(dead_code)]
     xkb_context: xkb::Context,
+    /// XKB keyboard map for mapping winit keycodes to xkb keymaps
     #[allow(dead_code)]
     xkb_keymap: xkb::Keymap,
+    /// Keyboard state
     xkb_state: xkb::State,
     /// The newest frame the compositor has published.
     frames: watch::Receiver<Frame>,
-    // Last drawn frame, for repainting on resize
+    /// Last drawn frame, for repainting on resize
     last_frame: Option<Frame>,
 }
 
@@ -121,18 +124,18 @@ impl App {
     /// Several wake-ups can arrive for one frame, or one wake-up can cover
     /// several frames, so the receiver's own change flag decides whether there
     /// is anything to do rather than the number of events.
-    fn present_latest(&mut self) {
+    fn present_pending_frames(&mut self) {
         if !self.frames.has_changed().unwrap_or(false) {
             return;
         }
-        let frame = self.frames.borrow_and_update().clone();
-        for scene in &frame {
+        let frames = self.frames.borrow_and_update().clone();
+        for scene in &frames {
             self.present_scene(scene);
         }
         if let Some(gl) = self.gl.as_mut() {
-            gl.renderer.retain_textures(&frame);
+            gl.renderer.drop_unused_cached_textures(&frames);
         }
-        self.last_frame = Some(frame);
+        self.last_frame = Some(frames);
 
         // Reported even if there was no context to draw with or the window had
         // no area. The frame is dealt with either way, and a backend that went
@@ -213,6 +216,9 @@ fn pick_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    /// Called once when the app starts and is ready.  This is a bit poorly
+    /// named for platforms that don't do tombstoning (desktops), but that's
+    /// what winit::application::ApplicationHandler calls it
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gl.is_some() {
             return;
@@ -278,6 +284,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.present_scene(&empty);
     }
 
+    /// Window event handler (called by winit event loop)
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -373,16 +380,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    /// User event handler (called by winit event loop)
+    /// Winit separates this handler from the normal `windows_event` handler above
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Shutdown => {
                 event_loop.exit();
             }
-            UserEvent::FrameReady => self.present_latest(),
+            UserEvent::FrameReady => self.present_pending_frames(),
         }
     }
 }
 
+/// Runs this wayland backend, waiting for frames from the compositor and
+/// sending over input events from keyboard/mouse, etc.
 pub fn run_winit_backend(
     backend_sender: Sender<BackendMessage>,
     cancel_token: &CancellationToken,

@@ -45,20 +45,24 @@ pub struct ArgWriter {
 
 #[allow(dead_code)]
 impl ArgWriter {
+    /// Create a new `ArgWriter` with an emptargument buffer
     pub fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
+    /// Adds a `u32` to the argument buffer
     pub fn u32(mut self, val: u32) -> Self {
         self.buf.extend_from_slice(&val.to_le_bytes());
         self
     }
 
+    /// Adds an `i32` to the argument buffer
     pub fn i32(mut self, val: i32) -> Self {
         self.buf.extend_from_slice(&val.to_le_bytes());
         self
     }
 
+    /// Adds a wayland string to the argument buffer
     pub fn string(mut self, val: &str) -> Self {
         assert!(
             val.len() < u32::MAX as usize,
@@ -75,6 +79,7 @@ impl ArgWriter {
         self
     }
 
+    /// Adds a 64-bit float as a 24.8 fixed point decimal to the buffer
     pub fn fixed(self, val: f64) -> Self {
         self.i32(f64_to_24_8_fixed(val))
     }
@@ -102,28 +107,33 @@ pub struct ArgReader<'a> {
 
 #[allow(dead_code)]
 impl<'a> ArgReader<'a> {
+    /// Create a new argument reader
     pub fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
+    /// Attempt to read a u32 from the buffer and advance the cursor
     pub fn u32(&mut self) -> Option<u32> {
         let val = read_u32(self.buf, self.pos)?;
         self.pos += 4;
         Some(val)
     }
 
+    /// Attempt to read an i32 from the buffer and advance the cursor
     pub fn i32(&mut self) -> Option<i32> {
         let val = read_i32(self.buf, self.pos)?;
         self.pos += 4;
         Some(val)
     }
 
+    /// Attempt to read a wayland string from the buffer and advance the cursor
     pub fn string(&mut self) -> Option<String> {
         let (s, consumed) = read_string(self.buf, self.pos)?;
         self.pos += consumed;
         Some(s)
     }
 
+    /// Attempt to read a fixed-point decimal from the buffer, convert it to a `f64` and advance the cursor
     pub fn fixed(&mut self) -> Option<f64> {
         let raw = self.i32()?;
         Some(f64::from(raw) / 256.0)

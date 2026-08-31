@@ -14,20 +14,23 @@
 //! frame to say what the backend already has, so damage can be expressed
 //! against it.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use tracing::{debug, info};
-
 use super::protocol::CompositorState;
 use super::protocol::state::{ClientObjectId, DefaultCursor};
 use super::protocol::wire_utils::f64_to_i32;
 use super::protocol::wl_shm::FORMAT_XRGB8888;
 use crate::shared::{OUTPUT_MODE_CURRENT, Output, PoolMapping, output_contains};
 use crate::shared::{PixelFormat, Scene, SceneElement, TextureId, TextureImage, TexturePixels};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::{debug, info};
 
+#[cfg(test)]
+mod tests;
+
+/// Number of bytes for representing one pixel
 const BYTES_PER_PIXEL: usize = 4;
 
+/// Fallback mouse cursor image encoded as an ASCII string
 const FALLBACK_CURSOR_BITMAP: [&[u8; 12]; 19] = [
     b"B...........",
     b"BB..........",
@@ -50,9 +53,23 @@ const FALLBACK_CURSOR_BITMAP: [&[u8; 12]; 19] = [
     b".......BB...",
 ];
 
+/// Black color for coloring the fallback cursor
 const CURSOR_BLACK: u32 = 0xff00_0000;
+/// White color for coloring the fallback cursor
 const CURSOR_WHITE: u32 = 0xffff_ffff;
+/// The width of the fallback cursor
 const FALLBACK_CURSOR_WIDTH: i32 = 12;
+
+/// A choice of how to render the cursor (hidden, client-provided surface, or compositor
+/// default/theme.)
+enum CursorChoice {
+    /// The focused client asked for no cursor.
+    Hidden,
+    /// Draw the client's own cursor surface at the given hotspot.
+    Surface(ClientObjectId, i32, i32),
+    /// The compositor picks: theme cursor, or the built-in one.
+    Compositor,
+}
 
 /// Pixel copies of client buffers and cursors, kept across frames.
 ///
@@ -68,20 +85,27 @@ const FALLBACK_CURSOR_WIDTH: i32 = 12;
 /// buffer forever and stall its release.
 #[derive(Clone, Copy)]
 struct CachedImage {
+    /// A unique serial number for this cached image
     serial: u64,
+    /// Width of the cached image
     width: i32,
+    /// Height of the cached image
     height: i32,
 }
 
+/// Cached textures
 #[derive(Default)]
 pub struct SceneCache {
+    /// Buffers from the client
     buffers: HashMap<ClientObjectId, CachedImage>,
+    /// Cursor textures
     cursors: HashMap<TextureId, Arc<TextureImage>>,
     /// Serials for cursor images, which have no protocol-side content serial.
     next_cursor_serial: u64,
 }
 
 impl SceneCache {
+    /// Create a new instance of the scene cache with defaults
     pub fn new() -> Self {
         Self::default()
     }
@@ -140,6 +164,7 @@ pub fn build(
     }
 }
 
+/// Get the size (resolution) of the current mode of the provided output
 fn current_mode_size(output: &Output) -> Option<(i32, i32)> {
     output
         .modes
@@ -148,6 +173,8 @@ fn current_mode_size(output: &Output) -> Option<(i32, i32)> {
         .map(|m| (m.width, m.height))
 }
 
+/// Push the entire surface tree into `elements` to build
+/// the scene graph to be passed to the backend
 fn push_surface_tree(
     state: &CompositorState,
     cache: &mut SceneCache,
@@ -380,15 +407,7 @@ fn push_cursor(
     });
 }
 
-enum CursorChoice {
-    /// The focused client asked for no cursor.
-    Hidden,
-    /// Draw the client's own cursor surface at the given hotspot.
-    Surface(ClientObjectId, i32, i32),
-    /// The compositor picks: theme cursor, or the built-in one.
-    Compositor,
-}
-
+/// Look at compositor state and decide on a mouse cursor to display
 fn client_cursor(state: &CompositorState) -> CursorChoice {
     let Some((pointer_client, _)) = state.pointer_surface else {
         return CursorChoice::Compositor;
@@ -518,6 +537,3 @@ pub fn load_default_cursor() -> Option<DefaultCursor> {
         hotspot_y: image.yhot.cast_signed(),
     })
 }
-
-#[cfg(test)]
-mod tests;

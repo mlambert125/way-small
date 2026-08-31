@@ -3,29 +3,32 @@
 //! `CompositorState` holds everything shared across all clients: the client
 //! collection, shm pools, buffers, surfaces, and (eventually) outputs, etc.
 
-use std::collections::{HashMap, HashSet};
-use std::os::unix::io::RawFd;
-use std::sync::Arc;
-
-use strum::FromRepr;
-
+use super::client::Clients;
+use super::wire_utils::f64_to_i32;
+use super::wl_pointer;
 use crate::shared::{
     BufferGuard, Output, OutputId, PoolMapping, TextureRect, cursor_bounds, output_contains,
 };
+use std::collections::{HashMap, HashSet};
+use std::os::unix::io::RawFd;
+use std::sync::Arc;
+use strum::FromRepr;
 
-use super::wl_pointer;
-
-use super::wire_utils::f64_to_i32;
-
-use super::client::Clients;
-
+/// A client object-id tuple holding a `client_id` paired with an object id.  This pair
+/// is needed because object ids are only unique per client, so the `client_id` is paired
+/// to make it unique
 pub type ClientObjectId = (u32, u32);
 
+/// A shared memory pool
 #[derive(Debug)]
 pub struct ShmPool {
+    /// Client owning the pool
     pub client_id: u32,
+    /// The file descriptor pointing to the shared memory
     pub fd: RawFd,
+    /// The size of the shared memory
     pub size: u32,
+    /// A live mmap of the shared memory.
     /// `None` if the mapping failed; the pool then renders nothing.
     pub mapping: Option<Arc<PoolMapping>>,
     /// True after `wl_shm_pool.destroy` — the pool will be freed once no
@@ -33,15 +36,23 @@ pub struct ShmPool {
     pub dead: bool,
 }
 
+/// An individual buffer in some `ShmPool`
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ShmBuffer {
+    /// Client owning the buffer
     pub client_id: u32,
+    /// Pool Id that this buffer points into
     pub pool_id: u32,
+    /// Offset into the pool where this buffer begins
     pub offset: i32,
+    /// Width of this buffer in pixels
     pub width: i32,
+    /// Height of this buffer in pixels
     pub height: i32,
+    /// Actual byte length of each row in this buffer (includes padding, etc.)
     pub stride: i32,
+    /// Format of this buffer
     pub format: u32,
     /// Identifies the current contents of this buffer.
     ///

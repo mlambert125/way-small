@@ -4,6 +4,13 @@
 //! constants (`ObjectType`, globals table, serial generation), and provides
 //! the top-level `handle_message()` dispatch.
 
+use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
+pub use client::ClientState;
+pub use state::CompositorState;
+use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+pub use wire_utils::{ArgReader, ArgWriter, message};
+
 pub mod client;
 pub mod state;
 pub mod wire_utils;
@@ -37,23 +44,16 @@ pub mod xdg_system_bell;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
 
-use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
-
-// Re-export key types for convenience
-pub use client::ClientState;
-pub use state::CompositorState;
-pub use wire_utils::{ArgReader, ArgWriter, message};
-
+/// Atomic serial number used throughout the compositor to track
+/// event and operation ordering
 static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 
+/// Helper method for getting the next atomic number
 pub fn next_serial() -> u32 {
     NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The type and state of a Wayland protocol object.
+/// The type of a Wayland protocol object.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectType {
@@ -99,6 +99,8 @@ pub struct Global {
 /// in the static GLOBALS array.
 pub const WL_OUTPUT_VERSION: u32 = 4;
 
+/// Globals provided by the compositor.  These are available to all clients and
+/// live for the entire lifetime of the compositor.
 pub static GLOBALS: &[Global] = &[
     Global {
         interface: "wl_compositor",
@@ -120,8 +122,6 @@ pub static GLOBALS: &[Global] = &[
         interface: "wl_seat",
         version: 8,
     },
-    // wl_output is not in this static list — each physical output gets its own
-    // dynamic global, managed via CompositorState::output_global_names.
     Global {
         interface: "xdg_wm_base",
         version: 5,
@@ -138,6 +138,8 @@ pub static GLOBALS: &[Global] = &[
         interface: "wp_presentation",
         version: 1,
     },
+    // wl_output is not in this static list — each physical output gets its own
+    // dynamic global, managed via CompositorState::output_global_names.
 ];
 
 /// Number of file descriptors a request carries as ancillary data.
@@ -160,6 +162,8 @@ fn request_fd_count(obj_type: ObjectType, op_code: u16) -> usize {
     }
 }
 
+/// Dispatch an individual message coming from the socket to the appropriate handler to
+/// decode and update compositor state
 #[allow(clippy::too_many_lines)]
 pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMessageWithClientInfo) {
     let object_id = message.message.object_id;

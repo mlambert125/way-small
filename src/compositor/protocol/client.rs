@@ -4,17 +4,16 @@
 //! `ObjectType)` and a channel sender for pushing events back to the client.
 //! The Clients struct manages the collection of all active client states.
 
-use std::collections::{HashMap, VecDeque};
-use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
-
-use tokio::sync::mpsc::{Sender, error::TrySendError};
-use tokio_util::sync::CancellationToken;
-
 use super::wire_utils::{ArgWriter, message};
 use super::{ObjectType, wl_display};
 use crate::wayland_socket::{CLIENT_SEND_QUEUE_LIMIT, WaylandProtocolMessage};
+use std::collections::{HashMap, VecDeque};
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::{Sender, error::TrySendError};
+use tokio_util::sync::CancellationToken;
 
+/// State specific to an individual wayland client
 pub struct ClientState {
     /// Maps object id -> object type/state for every object this client has created.
     pub objects: HashMap<u32, ObjectType>,
@@ -30,6 +29,9 @@ pub struct ClientState {
 }
 
 impl ClientState {
+    /// Create a new client state with a provided sender for talking back to
+    /// the socket, an fd_queue containing ancillary socket fds, and a cancellation
+    /// token for killing the underlying socket
     pub fn new(
         sender: Sender<WaylandProtocolMessage>,
         fd_queue: Arc<Mutex<VecDeque<OwnedFd>>>,
@@ -74,6 +76,7 @@ impl ClientState {
         Ok(())
     }
 
+    /// Registers a new wayland object with wayland protocol version information
     pub fn register_with_version(
         &mut self,
         id: u32,
@@ -85,10 +88,13 @@ impl ClientState {
         Ok(())
     }
 
+    /// Gets the version of an object, defaulting to 1 if the object was registered
+    /// without a version #
     pub fn version(&self, id: u32) -> u32 {
         self.object_versions.get(&id).copied().unwrap_or(1)
     }
 
+    /// Unregister a wayland client object
     pub fn unregister(&mut self, id: u32) {
         self.objects.remove(&id);
         self.object_versions.remove(&id);
@@ -97,7 +103,7 @@ impl ClientState {
         let _ = self.send(message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args));
     }
 
-    /// Queue a message for delivery to this client.
+    /// Queue a message for delivery to this client's wayland socket
     ///
     /// This never blocks. The compositor loop is single-threaded and owns all
     /// state, so awaiting a client here would let one client that has stopped
@@ -140,17 +146,21 @@ impl ClientState {
     }
 }
 
+/// A wrapper for a hashmap of all clients on the compositor keyed by client id
 pub struct Clients {
+    /// The hashmap
     states: HashMap<u32, ClientState>,
 }
 
 impl Clients {
+    /// Create a new wrapped client state hashmap
     pub fn new() -> Self {
         Self {
             states: HashMap::new(),
         }
     }
 
+    /// Create/add a new client to hashmap
     pub fn create(
         &mut self,
         client_id: u32,
@@ -163,14 +173,17 @@ impl Clients {
         self.states.insert(client_id, client_state);
     }
 
+    /// Get a mutable client state from this hashmap
     pub fn get(&mut self, client_id: u32) -> Option<&mut ClientState> {
         self.states.get_mut(&client_id)
     }
 
+    /// Remove a client
     pub fn remove(&mut self, client_id: u32) {
         self.states.remove(&client_id);
     }
 
+    /// Iterate over all clients
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &ClientState)> {
         self.states.iter()
     }

@@ -8,21 +8,6 @@
 //! quads per output — see [`scene`] — and publishes it to the backend, which
 //! turns it into GPU work.
 
-pub mod protocol;
-pub mod scene;
-
-#[cfg(test)]
-mod tests;
-
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
-
 use crate::shared::{BackendMessage, Frame, KeyState, MouseButton, PresentedAt};
 use crate::shared::{OutputId, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
@@ -32,22 +17,34 @@ use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use protocol::{
     wl_keyboard, wl_pointer, wl_registry, wl_surface, xdg_popup, xdg_surface, xdg_toplevel,
 };
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16); // ~60fps
+pub mod protocol;
+pub mod scene;
+#[cfg(test)]
+mod tests;
 
-// Keys the compositor binds for itself, as evdev keycodes
-// (`linux/input-event-codes.h`) — the same currency as `CompositorState::pressed_keys`
-// and `wl_keyboard.key`.
+/// Milliseconds between frames (~60fps)
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+// evdev keycode for TAB (used for now for hard-coded keymap)
 const KEY_TAB: u32 = 15;
+// evdev keycode for LEFTALT (used for now for hard-coded keymap)
 const KEY_LEFTALT: u32 = 56;
+// evdev keycode for F4 (used for now for hard-coded keymap)
 const KEY_F4: u32 = 62;
+// evdev keycode for RIGHTALT (used for now for hard-coded keymap)
 const KEY_RIGHTALT: u32 = 100;
 
-/// Smallest window an interactive resize will produce.
-///
-/// Enough to keep a title bar and its buttons reachable, which is what makes
-/// the window recoverable: dragged to nothing there is no edge left to grab.
+/// Smallest window width an interactive resize will produce.
 const MIN_WINDOW_WIDTH: i32 = 120;
+/// Smallest window height an interactive resize will produce.
 const MIN_WINDOW_HEIGHT: i32 = 80;
 
 /// A key combination the compositor acts on itself rather than forwarding.
@@ -66,113 +63,13 @@ struct HitResult {
     toplevel: ClientObjectId,
     /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
     surface: ClientObjectId,
-    /// Global position of the specific surface, for computing local coordinates.
+    /// Global x position of the specific surface, for computing local coordinates.
     surface_x: i32,
+    /// Global y position of the specific surface, for computing local coordinates.
     surface_y: i32,
 }
 
-/// Work out what the pointer is now over, and tell the client about it.
-///
-/// Reads the position from state rather than taking one, because by this point
-/// it has been constrained onto an output and the raw value the backend sent is
-/// no longer the truth.
-fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
-    state.dirty = true;
-    let (x, y) = (state.cursor_x, state.cursor_y);
-
-    // A grab owns the pointer: motion drives the window, and the client hears
-    // nothing until the button is up.
-    if update_grab(state, x, y) {
-        return;
-    }
-
-    // Auto-focus the top surface if nothing is focused yet
-    if state.focused_surface.is_none()
-        && let Some(&top_key) = state.surface_stack.last()
-        && state.surfaces.contains_key(&top_key)
-    {
-        switch_focus(state, top_key);
-    }
-
-    // Determine which specific surface the pointer is over
-    let hit = hit_test(state, x, y);
-    let new_pointer_surface = hit.as_ref().map(|h| h.surface);
-    let old_pointer_surface = state.pointer_surface;
-
-    // Send pointer enter/leave when the surface under the cursor changes
-    if new_pointer_surface != old_pointer_surface {
-        if let Some(old_ps) = old_pointer_surface {
-            for ptr in state.pointers.clone() {
-                if ptr.client_id == old_ps.0 {
-                    wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_ps.1);
-                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
-                }
-            }
-        }
-        state.pointer_surface = new_pointer_surface;
-        if let Some(ref h) = hit {
-            let local_x = x - f64::from(h.surface_x);
-            let local_y = y - f64::from(h.surface_y);
-            for ptr in state.pointers.clone() {
-                if ptr.client_id == h.surface.0 {
-                    wl_pointer::send_enter(
-                        state,
-                        ptr.client_id,
-                        ptr.object_id,
-                        h.surface.1,
-                        local_x,
-                        local_y,
-                    );
-                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
-                }
-            }
-        }
-    }
-
-    // Send motion to the current pointer surface
-    if let Some(ref h) = hit {
-        let local_x = x - f64::from(h.surface_x);
-        let local_y = y - f64::from(h.surface_y);
-        for ptr in state.pointers.clone() {
-            if ptr.client_id == h.surface.0 {
-                wl_pointer::send_motion(
-                    state,
-                    ptr.client_id,
-                    ptr.object_id,
-                    time_ms,
-                    local_x,
-                    local_y,
-                );
-                wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
-            }
-        }
-    }
-}
-
-/// Whether either Alt is held, for the compositor's own drag bindings.
-fn alt_held(state: &CompositorState) -> bool {
-    state.pressed_keys.contains(&KEY_LEFTALT) || state.pressed_keys.contains(&KEY_RIGHTALT)
-}
-
-/// Match a key press against the compositor's bindings.
-///
-/// Alt is matched on the physical keys rather than the xkb modifier mask.
-/// Everything else in the input path already speaks evdev keycodes, and the
-/// compositor builds its keymap from the default names, so there is no
-/// remapping to respect yet. If configurable xkb layouts land (see
-/// `docs/notes.md`), this should switch to the `mods_depressed` mask so that a
-/// remapped Alt still works.
-fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding> {
-    if !pressed_keys.contains(&KEY_LEFTALT) && !pressed_keys.contains(&KEY_RIGHTALT) {
-        return None;
-    }
-    match evdev_key {
-        KEY_F4 => Some(Binding::CloseWindow),
-        KEY_TAB => Some(Binding::CycleFocus),
-        _ => None,
-    }
-}
-
+/// Run the compositor thread
 #[allow(clippy::too_many_lines)]
 pub async fn run_compositor(
     mut wayland_message_receiver: Receiver<WaylandSocketMessage>,
@@ -523,6 +420,108 @@ pub async fn run_compositor(
     }
 
     Ok(())
+}
+
+/// Work out what the pointer is now over, and tell the client about it.
+///
+/// Reads the position from state rather than taking one, because by this point
+/// it has been constrained onto an output and the raw value the backend sent is
+/// no longer the truth.
+fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
+    state.dirty = true;
+    let (x, y) = (state.cursor_x, state.cursor_y);
+
+    // A grab owns the pointer: motion drives the window, and the client hears
+    // nothing until the button is up.
+    if update_grab(state, x, y) {
+        return;
+    }
+
+    // Auto-focus the top surface if nothing is focused yet
+    if state.focused_surface.is_none()
+        && let Some(&top_key) = state.surface_stack.last()
+        && state.surfaces.contains_key(&top_key)
+    {
+        switch_focus(state, top_key);
+    }
+
+    // Determine which specific surface the pointer is over
+    let hit = hit_test(state, x, y);
+    let new_pointer_surface = hit.as_ref().map(|h| h.surface);
+    let old_pointer_surface = state.pointer_surface;
+
+    // Send pointer enter/leave when the surface under the cursor changes
+    if new_pointer_surface != old_pointer_surface {
+        if let Some(old_ps) = old_pointer_surface {
+            for ptr in state.pointers.clone() {
+                if ptr.client_id == old_ps.0 {
+                    wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_ps.1);
+                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+                }
+            }
+        }
+        state.pointer_surface = new_pointer_surface;
+        if let Some(ref h) = hit {
+            let local_x = x - f64::from(h.surface_x);
+            let local_y = y - f64::from(h.surface_y);
+            for ptr in state.pointers.clone() {
+                if ptr.client_id == h.surface.0 {
+                    wl_pointer::send_enter(
+                        state,
+                        ptr.client_id,
+                        ptr.object_id,
+                        h.surface.1,
+                        local_x,
+                        local_y,
+                    );
+                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+                }
+            }
+        }
+    }
+
+    // Send motion to the current pointer surface
+    if let Some(ref h) = hit {
+        let local_x = x - f64::from(h.surface_x);
+        let local_y = y - f64::from(h.surface_y);
+        for ptr in state.pointers.clone() {
+            if ptr.client_id == h.surface.0 {
+                wl_pointer::send_motion(
+                    state,
+                    ptr.client_id,
+                    ptr.object_id,
+                    time_ms,
+                    local_x,
+                    local_y,
+                );
+                wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+            }
+        }
+    }
+}
+
+/// Whether either Alt is held, for the compositor's own drag bindings.
+fn alt_held(state: &CompositorState) -> bool {
+    state.pressed_keys.contains(&KEY_LEFTALT) || state.pressed_keys.contains(&KEY_RIGHTALT)
+}
+
+/// Match a key press against the compositor's bindings.
+///
+/// Alt is matched on the physical keys rather than the xkb modifier mask.
+/// Everything else in the input path already speaks evdev keycodes, and the
+/// compositor builds its keymap from the default names, so there is no
+/// remapping to respect yet. If configurable xkb layouts land (see
+/// `docs/notes.md`), this should switch to the `mods_depressed` mask so that a
+/// remapped Alt still works.
+fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding> {
+    if !pressed_keys.contains(&KEY_LEFTALT) && !pressed_keys.contains(&KEY_RIGHTALT) {
+        return None;
+    }
+    match evdev_key {
+        KEY_F4 => Some(Binding::CloseWindow),
+        KEY_TAB => Some(Binding::CycleFocus),
+        _ => None,
+    }
 }
 
 /// Tell clients which outputs each of their surfaces is displayed on.

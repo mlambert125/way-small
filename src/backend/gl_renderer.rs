@@ -19,6 +19,26 @@ use crate::shared::{
     BACKGROUND_COLOR, Frame, PixelFormat, Scene, TextureId, TextureImage, TextureRect,
 };
 
+/// Vertex shader: puts one textured quad in place.
+///
+/// Runs once per vertex, so four times per element — once for each corner of
+/// `QUAD`. Its job is to stretch that unit square into a rectangle at the
+/// right spot on screen and hand the fragment shader the matching corner of
+/// the source crop; the GPU interpolates `v_texcoord` across everything in
+/// between for free.
+///
+/// The geometry itself never changes, which is the point: the same four
+/// vertices are drawn for every element and only the uniforms move. `a_unit`
+/// of `(0, 0)` is the top-left of both rectangles and `(1, 1)` the
+/// bottom-right, so one corner value indexes destination and source alike —
+/// `mix` is component-wise, so x picks between `u_src`'s two u values and y
+/// between its two v values.
+///
+/// `gl_Position` has to come back in clip space: x and y in -1..1 with the
+/// origin at the centre of the window, so pixels are divided by the viewport
+/// and rescaled. The y negation is the only twist, and it is why the source
+/// coordinates need no flip of their own — the texture rows are already
+/// stored top-down, and flipping the quad instead lines the two up.
 const VERTEX_SHADER: &str = r"#version 300 es
 precision highp float;
 
@@ -44,6 +64,20 @@ void main() {
 }
 ";
 
+/// Fragment shader: colours one pixel of that quad.
+///
+/// Runs once per pixel the quad covers, with `v_texcoord` interpolated from
+/// the four corners the vertex shader emitted. All it does is sample the
+/// surface texture there and repair the two ways a client buffer differs from
+/// what GL assumes: the channel order described in the module header, and
+/// XRGB8888's undefined high byte.
+///
+/// What it writes goes straight into the blend stage set up in `new`
+/// (`ONE, ONE_MINUS_SRC_ALPHA`), so the output must stay premultiplied —
+/// hence only the alpha is touched, never the colour channels.
+///
+/// `u_ignore_alpha` is a float rather than a bool so the fix can be a `mix`:
+/// both formats then run the same instructions with no per-pixel branch.
 const FRAGMENT_SHADER: &str = r"#version 300 es
 precision highp float;
 
@@ -67,24 +101,59 @@ void main() {
 /// source coordinates: top-left, top-right, bottom-left, bottom-right.
 const QUAD: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
+/// A cached texture
 struct CachedTexture {
+    /// The texture
     texture: glow::Texture,
     /// Serial of the image last uploaded, so unchanged content is not re-sent,
     /// and so a partial update can check it is patching what it thinks it is.
     serial: u64,
+    /// Width of the texture
     width: i32,
+    /// Height of the texture
     height: i32,
 }
 
+/// The whole GL pipeline: one program, one quad, and the texture cache.
+///
+/// Everything here is built once in `new` and reused for every element of
+/// every frame. Drawing a scene is then a matter of rebinding a texture and
+/// setting uniforms per element, so the per-frame cost scales with the number
+/// of surfaces rather than with their size.
+///
+/// Every field is a handle into the GL context, valid only while that context
+/// is current on this thread. That is why the type is not `Send` in practice
+/// and why `new` is unsafe: the caller promises the context outlives the
+/// renderer and stays current. `Drop` gives the handles back in the same
+/// breath, so the context must still be current when the renderer is dropped.
 pub struct GlRenderer {
+    /// Loaded GL entry points. Owning it here ties every handle below to the
+    /// context they were created in.
     gl: glow::Context,
+    /// The linked vertex + fragment program from the shaders above. There is
+    /// only one, because there is only one kind of thing to draw.
     program: glow::Program,
+    /// Vertex array holding the attribute layout for `QUAD`, so drawing is a
+    /// single bind rather than a re-description of the format each time.
     vao: glow::VertexArray,
+    /// Buffer holding `QUAD` itself. Never touched after upload, but kept so
+    /// `Drop` can delete it.
     vbo: glow::Buffer,
+    /// Destination rect uniform, in output pixels.
     u_dst: Option<glow::UniformLocation>,
+    /// Output size uniform, set once per `draw` rather than per element.
     u_viewport: Option<glow::UniformLocation>,
+    /// Source crop uniform, in normalised texture coordinates.
     u_src: Option<glow::UniformLocation>,
+    /// Opaque-alpha flag uniform, 1.0 for XRGB8888.
+    ///
+    /// All four are `Option` because GL returns no location for a uniform the
+    /// linker optimised out; a `None` simply makes the later set a no-op
+    /// instead of an error.
     u_ignore_alpha: Option<glow::UniformLocation>,
+    /// One GPU texture per `TextureId`, so a surface that has not changed
+    /// costs no upload. Entries outlive the frame that created them and are
+    /// pruned by `drop_unused_cached_textures`.
     textures: HashMap<TextureId, CachedTexture>,
 }
 
@@ -340,7 +409,7 @@ impl GlRenderer {
     /// Takes the whole frame rather than one scene: with more than one output
     /// the same texture can appear in one scene and not another, and evicting
     /// per scene would drop and re-upload it on every frame.
-    pub fn retain_textures(&mut self, frame: &Frame) {
+    pub fn drop_unused_cached_textures(&mut self, frame: &Frame) {
         let live: std::collections::HashSet<TextureId> = frame
             .iter()
             .flat_map(|scene| scene.elements.iter())
@@ -358,6 +427,7 @@ impl GlRenderer {
 }
 
 impl Drop for GlRenderer {
+    /// Drop implementation for this `GlRenderer`, cleans up Gl resources
     fn drop(&mut self) {
         unsafe {
             for cached in self.textures.values() {
@@ -370,6 +440,8 @@ impl Drop for GlRenderer {
     }
 }
 
+/// Creates and links a GL program with shaders for rendering scenes from the
+/// compositor.
 unsafe fn link_program(gl: &glow::Context) -> anyhow::Result<glow::Program> {
     unsafe {
         let program = gl
