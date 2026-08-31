@@ -4,9 +4,7 @@
 //! its parent. Clients set size, anchor rect, anchor edge, gravity, offset,
 //! and constraint adjustments before passing the positioner to `get_popup`.
 
-use crate::protocol::state::{
-    XdgPositionerAnchor, XdgPositionerConstraintAdjustment, XdgPositionerGravity,
-};
+use super::state::{XdgPositionerAnchor, XdgPositionerConstraintAdjustment, XdgPositionerGravity};
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;

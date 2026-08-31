@@ -8,13 +8,18 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tracing::{debug, info};
 
+/// Application configuration
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
+    /// Which backend to use for compositor I/O
     pub backend: Option<String>,
+    /// The unix socket name/path to use for the Wayland wire protocol
     pub socket_path: Option<String>,
 }
 
 impl ConfigFile {
+    /// Load the configuration file from the current directory, fall
+    /// back to the XDG .config path
     pub fn load() -> Self {
         let config_paths = [
             Some(PathBuf::from("config.toml")),

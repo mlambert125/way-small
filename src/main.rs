@@ -7,39 +7,43 @@
 //! waits for shutdown.
 
 use crate::{
-    backend::{BackendMessage, RenderFrame},
+    shared::{BackendMessage, Frame},
     wayland_socket::WaylandSocketMessage,
 };
 use clap::{Parser, ValueEnum};
-use std::sync::Arc;
-use tokio::sync::mpsc::channel;
+use tokio::sync::{mpsc::channel, watch};
 use tracing::{debug, info};
 
 mod backend;
 mod compositor;
 mod config;
-mod null_backend;
-mod protocol;
-mod renderer;
+mod shared;
 mod wayland_socket;
-mod winit_backend;
 
+/// Backend choices for compositor I/O
 #[derive(Debug, Clone, ValueEnum)]
 enum Backend {
+    // Winit backend for testing / running as a child compositor
     Winit,
+
+    // Null backend (logging only)
     None,
 }
 
+/// Command-line arguments
+/// Most of these are config file overrides
 #[derive(Parser, Debug)]
 #[command(name = "way-small", about = "A small Wayland compositor")]
 struct Args {
+    /// Which backend to use for compositor I/O
     #[arg(short, long, value_enum)]
     backend: Option<Backend>,
-
+    /// The unix socket name/path to use for the Wayland wire protocol
     #[arg(short, long)]
     socket_path: Option<String>,
 }
 
+/// Main method (entry-point)
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -86,7 +90,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (wayland_message_tx, wayland_message_rx) = channel::<WaylandSocketMessage>(1000);
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(1000);
-    let (frame_tx, frame_rx) = channel::<Arc<RenderFrame>>(2);
+    // A latest-frame slot rather than a queue: the backend only ever wants the
+    // newest frame, and a frame it has not picked up yet is stale by definition.
+    let (frame_tx, frame_rx) = watch::channel::<Frame>(Frame::new());
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
     debug!("Spawning subsystem tasks");
@@ -97,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             let handle = tokio::task::spawn_blocking({
                 let cancel_token = cancel_token.clone();
                 move || {
-                    winit_backend::run_winit_backend(
+                    backend::winit::run_winit_backend(
                         backend_message_tx,
                         &cancel_token,
                         ready_tx,
@@ -114,9 +120,7 @@ async fn main() -> anyhow::Result<()> {
             unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
             let cancel = cancel_token.clone();
             tokio::spawn(async move {
-                // Keep the frame_rx alive
-                let _frame_rx = frame_rx;
-                null_backend::run_null_backend(backend_message_tx, cancel).await
+                backend::null::run_null_backend(backend_message_tx, frame_rx, cancel).await
             });
             None
         }

@@ -4,6 +4,7 @@
 //! per client, frames the wire protocol (8-byte header + args), passes FDs,
 //! and forwards parsed messages to the compositor via a channel.
 
+use sendfd::{RecvWithFd, SendWithFd};
 use std::{
     collections::VecDeque,
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -12,8 +13,6 @@ use std::{
         atomic::{AtomicU32, Ordering},
     },
 };
-
-use sendfd::{RecvWithFd, SendWithFd};
 use tokio::{
     net::{UnixSocket, UnixStream},
     select,
@@ -23,70 +22,64 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+/// The atomic client ID counter, assigned as clients connect
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Size of the ancillary buffer used when receiving file descriptors. Matches
-/// libwayland's `MAX_FDS_OUT`, which bounds how many fds a well-behaved client
-/// attaches to a single `sendmsg`. Note that `sendfd` does not surface
-/// `MSG_CTRUNC`, so overflow past this would be silent — the kernel closes the
-/// excess fds and the client's requests would then be missing them.
+/// Size of the ancillary buffer used when receiving file descriptors.
 const MAX_FDS_IN: usize = 28;
 
 /// Maximum number of file descriptors a client may have queued but unclaimed.
-///
-/// Requests that take no fd never drain the queue, so a client that attaches
-/// descriptors to them would otherwise grow it without bound and exhaust the
-/// compositor's `RLIMIT_NOFILE` — which would break every other client, plus
-/// `mmap` and `memfd_create` process-wide. libwayland bounds the same queue
-/// with a fixed-size ring and errors the connection on overflow; this is the
-/// equivalent. Sized well above any legitimate burst: descriptors only arrive
-/// with `wl_shm.create_pool` and `wl_data_offer.receive`, and the compositor
-/// drains its whole message channel on every loop iteration.
 const MAX_PENDING_FDS: usize = 256;
 
 /// Maximum number of messages that may be queued for a single client before we
-/// give up on it. A client that stops draining its socket must never be able to
-/// stall the compositor loop, so once this many messages are outstanding the
-/// client is disconnected instead of being waited on.
+/// give up on it.
 pub const CLIENT_SEND_QUEUE_LIMIT: usize = 4096;
 
+/// A low-level (untyped) wayland message
 pub struct WaylandProtocolMessage {
+    /// The object being acted upon
     pub object_id: u32,
+    /// The op code (method) to call
     pub op_code: u16,
+    /// Arguments to the operation
     pub args: Vec<u8>,
-
     /// File descriptors to attach as ancillary data when sending this message.
-    ///
-    /// Always empty on inbound messages: the socket task cannot tell which
-    /// message an fd belongs to without protocol state, so incoming fds go on
-    /// the client's `fd_queue` and are claimed by `protocol::handle_message`.
-    ///
-    /// `OwnedFd` rather than `RawFd` so that dropping a message closes its fds.
-    /// `SCM_RIGHTS` duplicates the descriptor into the receiver, so we always
-    /// own our copy and must close it whether or not the send succeeded.
+    /// Always empty on inbound messages: inbound fds are on the client's `fd_queue`
     pub fds: Vec<OwnedFd>,
 }
 
+/// A wayland protocol message with an associated client-id
 pub struct WaylandProtocolMessageWithClientInfo {
+    /// The client id associated with the message
     pub client_id: u32,
+    /// The wayland protocol message
     pub message: WaylandProtocolMessage,
 }
 
+/// A message from this thread notifying the compositor of a new client connection
 pub struct WaylandNewClientMessage {
+    /// The id for the new client
     pub client_id: u32,
+    /// A sender for sending wayland protocol messages back to this client
     pub socket_sender: Sender<WaylandProtocolMessage>,
+    /// A shared queue of file-descriptors collected/pending on this client
     pub fd_queue: Arc<Mutex<VecDeque<OwnedFd>>>,
     /// Cancels just this client's socket tasks, leaving other clients running.
     /// The compositor triggers it to drop a client that has stopped reading.
     pub client_cancel_token: CancellationToken,
 }
 
+/// The top-level type for channel messages sent from this thread to the compositor thread
 pub enum WaylandSocketMessage {
+    /// A message denoting a new client connection
     NewClient(WaylandNewClientMessage),
+    /// A wayland protocol message from some client
     Message(WaylandProtocolMessageWithClientInfo),
+    /// A message denoting a client hanging up the socket
     ClientDisconnected { client_id: u32 },
 }
 
+/// Run a listening socket/loop until told to shutdown
 pub async fn run_wayland_socket(
     socket_path: String,
     compositor_message_sender: Sender<WaylandSocketMessage>,
@@ -141,6 +134,7 @@ pub async fn run_wayland_socket(
     Ok(())
 }
 
+/// Handle and individual client
 #[allow(clippy::too_many_lines)]
 fn handle_client(
     client_id: u32,
@@ -192,8 +186,6 @@ fn handle_client(
                             let mut bytes_sent = 0;
                             let mut fds_sent = false;
                             while bytes_sent < buffer.len() {
-                                // A client that has stopped reading can leave us
-                                // parked here indefinitely, so honour cancellation.
                                 let writable = select! {
                                     res = sender_stream.writable() => res,
                                     () = sender_cancel_token.cancelled() => {

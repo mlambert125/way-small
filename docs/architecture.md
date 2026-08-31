@@ -17,6 +17,47 @@ The primary goals:
     - Testing, including unit tests, integration tests, and end-to-end tests.
     - Code quality, including readability, maintainability, and adherence to rust idioms and best practices.
 
+## Source Layout
+
+Each subsystem is a module folder under `src/`, and the folders match the sections below:
+
+```
+src/
+  main.rs            wiring: config, channels, task startup
+  shared/            the vocabulary the subsystems share
+    scene.rs         Frame, Scene, SceneElement
+    texture.rs       what a backend uploads
+    buffer.rs        client buffer memory, and its SIGBUS net
+    output.rs        how a backend describes displays
+  wayland_socket/    the socket subsystem
+  compositor/        the event loop
+    scene.rs         scene building
+    protocol/        request dispatch and all compositor state
+  backend/           each backend, and the GL renderer they share
+```
+
+Every subsystem is a folder with a `mod.rs`, whether or not it has grown a second file yet.
+
+`protocol/` sits inside `compositor/` because it is part of that subsystem, not a peer of it: the compositor task is the
+only thing that touches protocol state, and `CompositorState` itself lives there.
+
+`shared/` sits above the subsystems because it belongs to none of them. `Frame` is produced by the compositor and
+consumed by a backend; `BackendMessage` goes the other way. Putting either in one subsystem makes the other depend on
+its internals for a type it owns half of, which is how the backend previously ended up reaching into the compositor's
+protocol state for `Output` and `BufferGuard`. `shared/` depends on nothing else in the crate, and everything else
+depends on it:
+
+```
+shared  <-  backend
+shared  <-  compositor  ->  wayland_socket
+```
+
+`compositor` and `backend` no longer reference each other at all — they meet only in `shared`.
+
+Tests live in their own `tests.rs` beside the code they cover, declared with `#[cfg(test)] mod tests;`. A child module
+still sees its parent's private items, so nothing has to be made public to test it, and the source files stay free of
+fixtures.
+
 ## Top Level Architecture
 
 At the very top level, there are several subsystems (tokio tasks), that communicate with each other via channels.
@@ -88,6 +129,11 @@ client would freeze input handling, rendering, and every other client along with
 Sends to a client are therefore non-blocking. `ClientState::send` uses `try_send` and, when a client's send channel
 reaches `CLIENT_SEND_QUEUE_LIMIT` messages, the client is assumed to be wedged and is disconnected rather than waited
 on. This is the same policy libwayland applies once a client's output buffer grows past its threshold.
+
+Frames follow the same rule for the same reason.  The compositor publishes each frame into a single-slot channel and
+never awaits it, so a backend that has fallen behind cannot stall protocol handling.  Replacing the slot's contents is
+also the behaviour you want on its own merits: a frame the backend has not picked up yet has been overtaken by a newer
+one, and presenting it would only put a stale frame in front of a fresh one.  A queue of frames is never useful.
 
 Disconnection is signalled through a per-client `CancellationToken`, created as a child of the global shutdown token
 and handed to the compositor in the `WaylandNewClientMessage`. Cancelling it stops that client's read and send tasks
@@ -176,24 +222,42 @@ The backend subsystem has a few implementations for different scenarios.  The ba
 the compositor's output and capturing input events and sending them to the compositor subsystem.  The backend connects
 the compositor to a set of I/O devices so that users can see and interact with the compositor.
 
+Every backend that displays anything is responsible for rasterising the scenes it receives.  The GL renderer that does
+this is shared rather than reimplemented per backend: it takes a scene and a drawable size and issues one textured quad
+per element, keeping a GPU texture per texture id so an unchanged surface costs no upload.  What differs between
+backends is only how the GL context and its drawable are obtained.
+
+Textures are cached per texture id and evicted against the whole frame rather than a single output's scene: with more
+than one output the same buffer can appear in one scene and not another, and evicting per scene would drop and re-upload
+it every frame.
+
+The drawable size comes from the backend, never from the scene.  During a resize the two disagree for a frame or two —
+the backend learns its new size before the compositor has composed for it — and the backend's answer is the correct one.
+
 #### Winit Backend
 
 The winit backend provides a backend for running the compositor inside of a normal window hosted in an existing
 compositor (or x session.)  This is useful for development and testing, as it allows us to run the compositor
 without needing to set up a full wayland session.
 
+It gets its GL context from glutin: an EGL display off the winit window, a GLES 3.0 context, and a window surface, all
+created and made current on the winit thread.  Vsync is off, because the compositor already paces frames on its own
+16ms timer and waiting for vblank here would only stall the thread handling input.
+
 #### DRM Backend
 
 The DRM backend provides a backend for running the compositor on a linux system without an existing compositor.  This
 is the "real" backend that allows the compositor to be used as a standalone compositor for a linux system.  It uses
 the Direct Rendering Manager (DRM) subsystem of the linux kernel to display the compositors output and capture input
-events using the evdev and libinput libraries.
+events using the evdev and libinput libraries.  Its GL context comes from EGL on a gbm device rather than from a host
+window, which is the same EGL that `linux-dmabuf` import needs; the renderer above it is unchanged.
 
 #### Null Backend
 
 The null backend provides a backend that does not display anything and does not capture any input events.  This is
 useful for testing and benchmarking, as it allows us to run the compositor without needing to set up any graphical
-output or input devices.
+output or input devices.  It has no GL context and drops the scenes it is sent; there is no software rasteriser to fall
+back to, so a backend that cannot get a context has nothing to display and shuts down rather than run blind.
 
 ## Compositor Architecture
 
@@ -272,9 +336,189 @@ sending notifications to the appropriate clients based on focus, activation, etc
 a keyboard input event from the backend, it will look at which client is currently focused for keyboard input, and then
 will translate and send a wayland keyboard event message to that client through the wayland socket subsystem.
 
+#### The pointer
+
+Two kinds of motion reach the compositor. `MouseMovedTo` carries a position, which is what a hosted backend reports —
+the host owns the pointer and says where it put it — and what a touchscreen or tablet produces. `MouseMovedBy` carries a
+delta, which is what a mouse produces: at the `libinput` layer a mouse has no position at all, only movement. The
+pointer position belongs to the compositor, not to any device.
+
+Which means the compositor has to keep it somewhere useful. Every position, however it arrives, is constrained onto the
+outputs. Without that a relative device walks the pointer off the desktop and it never returns, and the failure is
+silent rather than loud: the cursor stops being drawn, hit testing finds nothing, and clicks land nowhere, with no edge
+for the user to push against. It also keeps the position inside `i32`, which everything downstream converts to without
+checking.
+
+The constraint is the union of the outputs, not their bounding box. Two outputs of different heights side by side leave
+a notch belonging to no display, and a pointer parked there would be exactly as lost. A position off every output snaps
+to the nearest point of the nearest one.
+
+#### Windows and outputs
+
+An `xdg_toplevel` belongs to exactly one output and is confined to it. There is no support for a window straddling two,
+and the model is deliberately simple: the window records which output it is on, and popups and subsurfaces hang off a
+toplevel and inherit that along with its position.
+
+A window opens on the output under the pointer, or on the first output if the pointer is not over one. Placement
+cascades from the top-left, per output, restarting rather than marching off the far edge. Positions are stored globally —
+so input hit-testing, subsurface trees and `wl_surface.enter` all keep working in one coordinate space — but the scene
+for an output contains only that output's windows, drawn relative to its origin. That is what stops every output showing
+the same top-left corner of the desktop.
+
+Windows are re-confined every tick, which covers a client resizing itself out of bounds, an output changing size, and a
+window whose output has gone away being re-homed. A window larger than its output is pinned to the top-left, since no
+position fits and the top-left is the part worth showing.
+
+Stacking, focus and alt-tab remain global: one stack across all outputs, so cycling focus moves between them.
+
+#### Interactive move and resize
+
+Clients draw their own decorations — no decoration manager is advertised — so dragging a title bar or an edge reaches the
+compositor as `xdg_toplevel.move` or `.resize`. Both start a *grab*: for as long as one is held the compositor owns the
+pointer, and motion and buttons drive the window instead of reaching any client. The client is sent a pointer leave when
+the grab begins, so it is not left drawing a hover state for a pointer it will hear no more about, and re-enters
+naturally on the next motion after the grab ends.
+
+A client may only start a grab off the back of real user input, or any client could seize the pointer whenever it liked.
+The serial it quotes must be one minted for a `wl_pointer.button` press it was sent, that button must still be held, and
+the window named must be its own.
+
+A move keeps the grip point under the cursor. A resize is measured from where the drag began rather than accumulated
+per event, so the window cannot drift, and the opposite edge stays put — dragging the left edge changes the width and the
+origin together. Size changes are requests: the compositor sends `xdg_toplevel.configure` carrying the `resizing` state
+along with the matching `xdg_surface.configure`, and the client resizes when it acknowledges. An unchanged size sends
+nothing, so a drag does not flood the client.
+
+A drag is clamped at both ends, from three sources, and the narrowest wins where they overlap:
+
+- the compositor's own floor, enough to keep a title bar and its buttons reachable — that is what makes a window
+  recoverable, since one dragged to nothing has no edge left to grab;
+- the client's `set_min_size` and `set_max_size`, which say what it can actually render at;
+- the size of the output the window is on, so a window can never be dragged larger than the display showing it. One a
+  client has already made larger than its display is brought back within it by the first drag.
+
+Where the three contradict each other the range widens rather than inverting, because a clamp needs a floor no higher
+than its ceiling. A client insisting on a minimum larger than the display gets it: the compositor cannot make it render
+smaller, and configuring a size it will refuse achieves nothing. A client whose minimum and maximum are equal has told us
+it has one size, and a drag leaves it alone.
+
+When a clamp bites, the origin is derived from the clamped size rather than the pointer, so the anchored edge stays
+exactly where it was instead of sliding away.
+
+The size hints are applied when they arrive rather than on the next commit as the protocol specifies. The difference is
+only visible to a client that sets a limit and starts a resize before committing, and there is no other double-buffered
+toplevel state to hang it off. A negative limit is refused with `invalid_size` rather than stored, since it would poison
+every later resize. A minimum above the current maximum is *not* an error: the two arrive in separate requests, so a
+client raising both would momentarily look inconsistent through no fault of its own.
+
+Dragging a window towards another output hands it over rather than letting it straddle: the window follows the pointer's
+output, and the tick's confinement then pulls it wholly inside the new one.
+
+The same grabs are available without the client's cooperation, which is the only way to move a window whose decorations
+offer no handle: Alt+left-drag moves, and Alt+right-drag resizes from whichever corner of the window the pointer is
+nearest.
+
 #### Rendering
 
-Rendering is triggered at 60 fps and looks at the current state of the compositor and draws the appropriate output frames
-and sends them to the backend for display.  This includes compositing the windows and surfaces together, applying any
-effects or transformations, and sending the final frame to the backend for display.
+Rendering is triggered at 60 fps and looks at the current state of the compositor, but the compositor subsystem does not
+rasterise anything itself.  It builds a *scene* per output: a flat, back-to-front list of textured quads, each one a
+source rectangle in some texture paired with a destination rectangle in output pixels.  Surface position, subsurface
+offsets, `wp_viewport` cropping and scaling, and buffer scale are all resolved here, into that pair of rectangles.
+
+A frame is every output's scene from one tick, published together, because a frame is a moment in time rather than a
+per-output event — and because only a whole frame can be meaningfully superseded by a newer one.
+
+The frame goes to the backend, which draws it on the GPU.  What crosses is a notification, not the frame itself: the
+backend is woken and reads the slot when it is ready to draw, so wake-ups that arrive while it is busy collapse into a
+single draw of the newest frame rather than a backlog of stale ones.  This matters more than it looks, because a queued
+frame pins the shm pixel copies it references; bounding the queue at one bounds that memory too.
+
+The split is forced by GL: a context belongs to one thread, and that thread is the backend's.  It is also the useful
+split, because everything that needs compositor state is on this side and everything that needs a GPU is on the other.
+
+Client pixels are not copied.  A texture handed to the backend points straight into the client's shm mapping, and the
+GPU uploads from there.  What the compositor tracks instead is *identity*: every `wl_buffer` carries a `content_serial`
+from a counter that never repeats, bumped by any commit that attaches it and by anything that moves the pool mapping
+underneath it.  Scene building compares serials and re-reads nothing when they match; because the serial never repeats, a
+buffer id reused after destruction cannot be mistaken for the one it replaced.
+
+`wl_shm` is not a legacy path that `linux-dmabuf` will retire.  It is a core global every compositor must offer, and
+plenty of clients will never use anything else — software-rendered clients, machines with no GPU driver, and client-side
+cursors among them.  dmabuf adds a texture source the backend imports rather than uploads; it does not remove this one.
+Both paths are permanent, so both are worth making good.
+
+##### Buffer lifetime
+
+Not copying moves a cost into a correctness requirement.  A client may not draw into a buffer it has committed until the
+compositor sends `wl_buffer.release`, and with a copy that could be sent as soon as the copy was taken.  Reading the
+mapping directly means the release has to wait for the *backend*, which is on another thread and a frame or two behind.
+
+Each buffer therefore has a guard: a reference-counted handle on the pool mapping that every texture borrowing that
+buffer holds a clone of.  The compositor keeps one handle of its own for as long as the buffer exists, so a count of one
+means nobody is reading.  A commit that replaces a buffer only marks it as wanted-back; the release goes out on a later
+tick, once the count has fallen and the buffer is no longer attached to anything on screen.  That check runs on every
+tick, not only the ones that draw, because the last reader is usually the previous frame — dropped when a newer frame
+replaces it or when the backend finishes with it, neither of which has anything to do with whether compositor state has
+changed.
+
+Counting references rather than watching for a drop is deliberate.  It keeps the compositor's own handle in place for the
+whole life of the buffer, so a client that re-attaches a buffer before hearing it was released still renders, and it
+keeps the release decision on the compositor thread where the client's socket already lives.
+
+Pool mappings are reference counted for the same reason.  A resize replaces the mapping rather than unmapping it, and a
+destroyed pool forgets it; the `munmap` happens when the last texture borrowing it goes.
+
+##### Truncated pools
+
+A pool is a file the client owns, and nothing stops it shrinking that file after the compositor has mapped it.  Reading a
+mapped page with no file behind it raises `SIGBUS` — and because buffers are read in place rather than copied, that read
+happens inside the GL driver on the backend thread.  Unhandled, any client could take down the compositor and everyone
+else's windows with it, by accident or on purpose.  Three defences, cheapest first:
+
+- A pool larger than the file behind it is refused outright, and the client gets `wl_shm.error.invalid_fd`.  This catches
+  the ordinary bug of declaring the wrong size, which would otherwise become a page that faults on first read.
+- The pool file is sealed against shrinking.  Clients using libwayland's shm helpers hand over a `memfd` that accepts
+  `F_SEAL_SHRINK`, and for those the fault becomes impossible for the life of the pool.  It is best effort: a file that
+  cannot be sealed is still mapped.
+- Whatever is left is caught by a `SIGBUS` handler that maps a page of zeroes over the hole, so the faulting read retries
+  and succeeds.  The client sees black where its buffer used to be, which is the right outcome for one that broke its own
+  promise.  The handler consults a fixed, lock-free table of live mappings, so it allocates nothing and takes no locks; a
+  fault outside those ranges is re-raised with the default handler rather than masked.  Blanked pages are counted and
+  logged by the compositor, since a signal handler cannot log.
+
+The rare buffer GL cannot address in place — a row stride that is not a whole number of pixels — falls back to a copy.
+Cursors are copies too, having no client buffer behind them.
+
+##### Damage
+
+Alongside the serial, each buffer carries the damage accumulated since it was last read — the regions the client says it
+drew into.  This is a promise about what did *not* change, so it is tracked in three states rather than two: exact
+rectangles, nothing-changed-yet, and *unknown*.  Anything the compositor cannot place accurately collapses to unknown,
+which means the whole buffer, and unknown is sticky until the damage is read: once one change could not be described, no
+later rectangle can narrow the window back down.
+
+The two damage requests are in different coordinate spaces and cannot share a list.  `wl_surface.damage_buffer` is
+already in buffer pixels; `wl_surface.damage` is surface-local, and only means something once run backwards through the
+same viewport-and-scale mapping the scene draws forwards with.  Both are resolved at commit, after the commit's own
+viewport state has been applied, and rounded outward with a pixel of padding — uploading slightly more than changed is
+always safe, uploading less is not.
+
+Damage travels to the backend as a hint attached to the pixel copy, along with the serial the copy was derived from.  The
+copy itself is always complete, so a backend that cannot use the hint can always fall back to the whole thing.  It can
+only patch if it holds a texture at exactly that previous serial, at the same dimensions; a texture it never had, or one
+several serials behind, gets a full upload.  That is what keeps partial uploads correct even though the backend evicts
+textures without telling anyone.  For a client redrawing a small part of a large window — a terminal appending a line —
+this is the difference between megabytes and kilobytes of upload per frame.
+
+Damage and zero-copy compound: a client redrawing one line of a terminal causes no read on the compositor side at all,
+and an upload of just the changed rows on the backend side.
+
+Frame callbacks follow presentation, not hand-off.  A backend reports `FramePresented` once a frame has reached the
+screen, and that is what fires `wl_surface.frame` and `wp_presentation_feedback.presented`; the timestamp a client is
+told is the one the backend read at that moment, not one measured a channel hop later.
+
+Callbacks live in surface state until they fire, which is what makes this safe against the single-slot frame channel: a
+frame that is superseded before the backend draws it costs a client some latency, never a lost callback.  Every backend
+reports presentation, including the headless one — a backend that went quiet here would strand every client waiting for
+a callback that could not arrive.
 

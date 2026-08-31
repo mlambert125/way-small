@@ -22,8 +22,8 @@ pub const CREATE_POOL: u16 = 0;
 const FORMAT: u16 = 0;
 
 // Pixel format constants (from wayland-protocol's wl_shm.xml)
-const FORMAT_ARGB8888: u32 = 0;
-const FORMAT_XRGB8888: u32 = 1;
+pub const FORMAT_ARGB8888: u32 = 0;
+pub const FORMAT_XRGB8888: u32 = 1;
 
 pub fn handle(
     state: &mut CompositorState,
@@ -88,7 +88,16 @@ fn handle_create_pool(
     );
     // Ownership of the raw fd passes to the pool, which closes it in
     // `try_cleanup_pool`.
-    state.register_shm_pool(msg.client_id, pool_id, fd, size.unsigned_abs());
+    if !state.register_shm_pool(msg.client_id, pool_id, fd, size.unsigned_abs())
+        && let Some(client) = state.clients.get(msg.client_id)
+    {
+        // WL_SHM_ERROR_INVALID_FD = 2
+        client.send_error(
+            msg.message.object_id,
+            2,
+            "wl_shm.create_pool: fd is not a readable file of at least the given size",
+        );
+    }
 }
 
 /// Send `wl_shm.format` events for all supported pixel formats.

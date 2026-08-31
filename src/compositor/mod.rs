@@ -1,25 +1,37 @@
-//! Compositor event loop.
+//! Compositor subsystem.
 //!
-//! Receives messages from two sources: Wayland clients (protocol requests)
-//! and the display backend (input events, resize, focus). Composites surfaces
-//! into frames and sends them to the backend for display on a 60fps timer.
+//! Owns all compositor state and the event loop that drives it. Receives
+//! messages from two sources: Wayland clients (protocol requests) and the
+//! display backend (input events, resize, focus).
+//!
+//! Rasterises nothing itself. On a 60fps timer it builds a scene of textured
+//! quads per output — see [`scene`] — and publishes it to the backend, which
+//! turns it into GPU work.
+
+pub mod protocol;
+pub mod scene;
+
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::sync::Arc;
-
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::backend::{BackendMessage, KeyState, MouseButton, RenderFrame};
-use crate::protocol::state::{ClientObjectId, OutputId, region_contains};
-use crate::protocol::wire_utils::{ArgWriter, f64_to_i32, message};
-use crate::protocol::{self, CompositorState};
-use crate::protocol::{wl_keyboard, wl_pointer, wl_registry, wl_surface, xdg_popup, xdg_toplevel};
-use crate::renderer;
+use crate::shared::{BackendMessage, Frame, KeyState, MouseButton, PresentedAt};
+use crate::shared::{OutputId, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
+use protocol::CompositorState;
+use protocol::state::{ClientObjectId, GrabKind, ResizeEdges, region_contains};
+use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
+use protocol::{
+    wl_keyboard, wl_pointer, wl_registry, wl_surface, xdg_popup, xdg_surface, xdg_toplevel,
+};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16); // ~60fps
 
@@ -31,6 +43,13 @@ const KEY_LEFTALT: u32 = 56;
 const KEY_F4: u32 = 62;
 const KEY_RIGHTALT: u32 = 100;
 
+/// Smallest window an interactive resize will produce.
+///
+/// Enough to keep a title bar and its buttons reachable, which is what makes
+/// the window recoverable: dragged to nothing there is no edge left to grab.
+const MIN_WINDOW_WIDTH: i32 = 120;
+const MIN_WINDOW_HEIGHT: i32 = 80;
+
 /// A key combination the compositor acts on itself rather than forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Binding {
@@ -38,6 +57,101 @@ enum Binding {
     CloseWindow,
     /// Alt+Tab — move focus to the next toplevel.
     CycleFocus,
+}
+
+/// Result of a hit test: which toplevel was hit, and which specific surface
+/// (possibly a subsurface) the pointer is actually over.
+struct HitResult {
+    /// The toplevel surface key (in `surface_stack`) — used for stacking/keyboard focus.
+    toplevel: ClientObjectId,
+    /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
+    surface: ClientObjectId,
+    /// Global position of the specific surface, for computing local coordinates.
+    surface_x: i32,
+    surface_y: i32,
+}
+
+/// Work out what the pointer is now over, and tell the client about it.
+///
+/// Reads the position from state rather than taking one, because by this point
+/// it has been constrained onto an output and the raw value the backend sent is
+/// no longer the truth.
+fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
+    state.dirty = true;
+    let (x, y) = (state.cursor_x, state.cursor_y);
+
+    // A grab owns the pointer: motion drives the window, and the client hears
+    // nothing until the button is up.
+    if update_grab(state, x, y) {
+        return;
+    }
+
+    // Auto-focus the top surface if nothing is focused yet
+    if state.focused_surface.is_none()
+        && let Some(&top_key) = state.surface_stack.last()
+        && state.surfaces.contains_key(&top_key)
+    {
+        switch_focus(state, top_key);
+    }
+
+    // Determine which specific surface the pointer is over
+    let hit = hit_test(state, x, y);
+    let new_pointer_surface = hit.as_ref().map(|h| h.surface);
+    let old_pointer_surface = state.pointer_surface;
+
+    // Send pointer enter/leave when the surface under the cursor changes
+    if new_pointer_surface != old_pointer_surface {
+        if let Some(old_ps) = old_pointer_surface {
+            for ptr in state.pointers.clone() {
+                if ptr.client_id == old_ps.0 {
+                    wl_pointer::send_leave(state, ptr.client_id, ptr.object_id, old_ps.1);
+                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+                }
+            }
+        }
+        state.pointer_surface = new_pointer_surface;
+        if let Some(ref h) = hit {
+            let local_x = x - f64::from(h.surface_x);
+            let local_y = y - f64::from(h.surface_y);
+            for ptr in state.pointers.clone() {
+                if ptr.client_id == h.surface.0 {
+                    wl_pointer::send_enter(
+                        state,
+                        ptr.client_id,
+                        ptr.object_id,
+                        h.surface.1,
+                        local_x,
+                        local_y,
+                    );
+                    wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+                }
+            }
+        }
+    }
+
+    // Send motion to the current pointer surface
+    if let Some(ref h) = hit {
+        let local_x = x - f64::from(h.surface_x);
+        let local_y = y - f64::from(h.surface_y);
+        for ptr in state.pointers.clone() {
+            if ptr.client_id == h.surface.0 {
+                wl_pointer::send_motion(
+                    state,
+                    ptr.client_id,
+                    ptr.object_id,
+                    time_ms,
+                    local_x,
+                    local_y,
+                );
+                wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+            }
+        }
+    }
+}
+
+/// Whether either Alt is held, for the compositor's own drag bindings.
+fn alt_held(state: &CompositorState) -> bool {
+    state.pressed_keys.contains(&KEY_LEFTALT) || state.pressed_keys.contains(&KEY_RIGHTALT)
 }
 
 /// Match a key press against the compositor's bindings.
@@ -63,16 +177,20 @@ fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding>
 pub async fn run_compositor(
     mut wayland_message_receiver: Receiver<WaylandSocketMessage>,
     mut backend_message_receiver: Receiver<BackendMessage>,
-    frame_sender: Sender<Arc<RenderFrame>>,
+    frame_sender: watch::Sender<Frame>,
     cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
     info!("Running compositor...");
 
     let mut state = protocol::CompositorState::new();
-    state.default_cursor = renderer::load_default_cursor();
+    state.default_cursor = scene::load_default_cursor();
     if state.default_cursor.is_none() {
         info!("No cursor theme found, using built-in cursor");
     }
+    let mut scene_cache = scene::SceneCache::new();
+    // High-water mark for pages the SIGBUS net has blanked, so each new one is
+    // reported once.
+    let mut reported_patched_pages = 0usize;
     let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
     let start_time = Instant::now();
 
@@ -207,68 +325,67 @@ pub async fn run_compositor(
                         }
                     }
 
-                    BackendMessage::MouseMove { x, y } => {
-                        state.cursor_x = x;
-                        state.cursor_y = y;
-                        state.dirty = true;
+                    BackendMessage::MouseMovedTo { x, y } => {
+                        state.move_cursor_to(x, y);
                         let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-
-                        // Auto-focus the top surface if nothing is focused yet
-                        if state.focused_surface.is_none() &&
-                           let Some(&top_key) = state.surface_stack.last() &&
-                           state.surfaces.contains_key(&top_key) {
-                            switch_focus(&mut state, top_key);
-                        }
-
-                        // Determine which specific surface the pointer is over
-                        let hit = hit_test(&state, x, y);
-                        let new_pointer_surface = hit.as_ref().map(|h| h.surface);
-                        let old_pointer_surface = state.pointer_surface;
-
-                        // Send pointer enter/leave when the surface under the cursor changes
-                        if new_pointer_surface != old_pointer_surface {
-                            if let Some(old_ps) = old_pointer_surface {
-                                for ptr in state.pointers.clone() {
-                                    if ptr.client_id == old_ps.0 {
-                                        wl_pointer::send_leave(&mut state, ptr.client_id, ptr.object_id, old_ps.1);
-                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
-                                    }
-                                }
-                            }
-                            state.pointer_surface = new_pointer_surface;
-                            if let Some(ref h) = hit {
-                                let local_x = x - f64::from(h.surface_x);
-                                let local_y = y - f64::from(h.surface_y);
-                                for ptr in state.pointers.clone() {
-                                    if ptr.client_id == h.surface.0 {
-                                        wl_pointer::send_enter(&mut state, ptr.client_id, ptr.object_id, h.surface.1, local_x, local_y);
-                                        wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Send motion to the current pointer surface
-                        if let Some(ref h) = hit {
-                            let local_x = x - f64::from(h.surface_x);
-                            let local_y = y - f64::from(h.surface_y);
-                            for ptr in state.pointers.clone() {
-                                if ptr.client_id == h.surface.0 {
-                                    wl_pointer::send_motion(&mut state, ptr.client_id, ptr.object_id, time_ms, local_x, local_y);
-                                    wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
-                                }
-                            }
-                        }
+                        deliver_pointer_motion(&mut state, time_ms);
+                    }
+                    BackendMessage::MouseMovedBy { dx, dy } => {
+                        state.move_cursor_by(dx, dy);
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        deliver_pointer_motion(&mut state, time_ms);
                     }
                     BackendMessage::MouseButton { button, state: btn_state } => {
                         let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-                        let pressed = matches!(btn_state, crate::backend::ButtonState::Pressed);
+                        let pressed = matches!(btn_state, crate::shared::ButtonState::Pressed);
                         // Linux evdev button codes
                         let linux_button = match button {
                             MouseButton::Left => 0x110,
                             MouseButton::Right => 0x111,
                             MouseButton::Middle => 0x112,
                         };
+
+                        if pressed {
+                            state.pressed_buttons.insert(linux_button);
+                        } else {
+                            state.pressed_buttons.remove(&linux_button);
+                        }
+
+                        // A grab runs until the button comes up, and swallows
+                        // everything in between.
+                        if state.pointer_grab.is_some() {
+                            if !pressed {
+                                end_grab(&mut state);
+                            }
+                            continue;
+                        }
+
+                        // Alt+drag moves and resizes without the client's help,
+                        // which is the only way for one that draws no usable
+                        // decorations.
+                        if pressed
+                            && alt_held(&state)
+                            && let Some(hit) = hit_test(&state, state.cursor_x, state.cursor_y)
+                        {
+                            state.surface_stack.retain(|k| *k != hit.toplevel);
+                            state.surface_stack.push(hit.toplevel);
+                            switch_focus(&mut state, hit.toplevel);
+                            match button {
+                                MouseButton::Left => state.start_move_grab(hit.toplevel),
+                                MouseButton::Right => {
+                                    let edges = edges_for_point(
+                                        &state,
+                                        hit.toplevel,
+                                        state.cursor_x,
+                                        state.cursor_y,
+                                    );
+                                    state.start_resize_grab(hit.toplevel, edges);
+                                }
+                                MouseButton::Middle => {}
+                            }
+                            state.dirty = true;
+                            continue;
+                        }
 
                         // Dismiss grabbed popups if click lands outside them
                         if pressed && !state.grabbed_popups.is_empty() {
@@ -308,7 +425,12 @@ pub async fn run_compositor(
                         if let Some(ps) = state.pointer_surface {
                             for ptr in state.pointers.clone() {
                                 if ptr.client_id == ps.0 {
-                                    wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed);
+                                    let serial = wl_pointer::send_button(&mut state, ptr.client_id, ptr.object_id, time_ms, linux_button, pressed);
+                                    // Remembered so the client can quote it if
+                                    // this press turns into a move or resize.
+                                    if pressed {
+                                        state.last_button_serial.insert(ptr.client_id, serial);
+                                    }
                                     wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
                                 }
                             }
@@ -338,20 +460,59 @@ pub async fn run_compositor(
                     BackendMessage::FocusOut => {
                         debug!("Focus out");
                     }
+                    BackendMessage::FramePresented(presented_at) => {
+                        // Clients pace themselves on this, so it follows the
+                        // frame reaching the screen rather than the compositor
+                        // handing it over. Callbacks live in surface state
+                        // until fired, so a frame the backend skipped costs a
+                        // client latency but never a lost callback.
+                        let timestamp_ms =
+                            u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        fire_frame_callbacks(&mut state, timestamp_ms, presented_at);
+                    }
                 }
             }
             _ = render_timer.tick() => {
                 update_surface_outputs(&mut state);
+                // Windows belong to one output and stay inside it, so a client
+                // resizing itself or an output changing size can move them.
+                if state.confine_toplevels() {
+                    state.dirty = true;
+                }
                 if state.dirty {
-                    // TODO: track per-output dirty flags to avoid re-rendering
-                    // outputs that haven't changed.
-                    for output in &state.outputs {
-                        let frame = Arc::new(renderer::render(output, &state));
-                        let _ = frame_sender.send(frame).await;
+                    scene_cache.gc(&state);
+                    // TODO: track per-output dirty flags to avoid rebuilding
+                    // scenes for outputs that haven't changed.
+                    let output_ids: Vec<OutputId> = state.outputs.iter().map(|o| o.id).collect();
+                    let mut frame = Frame::with_capacity(output_ids.len());
+                    for output_id in output_ids {
+                        frame.push(Arc::new(scene::build(output_id, &state, &mut scene_cache)));
                     }
-                    let timestamp_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-                    fire_frame_callbacks(&mut state, timestamp_ms);
+                    // The scenes just built account for everything reported so
+                    // far, so the next frame starts from a clean slate.
+                    state.clear_buffer_damage();
+                    // Never awaited, in line with the rule that the compositor
+                    // task blocks on nothing: a backend that has not kept up
+                    // gets the newest frame, and the one it missed is dropped
+                    // here rather than queued in front of it.
+                    drop(frame_sender.send_replace(frame));
                     state.dirty = false;
+                }
+                // Both independent of `dirty`: a buffer becomes free when the
+                // last frame referencing it goes, which can happen on a tick
+                // where nothing has changed.
+                start_buffer_releases(&mut state);
+                finish_buffer_releases(&mut state);
+
+                // The SIGBUS handler cannot log, so the count is reported here.
+                let patched = crate::shared::patched_pages();
+                if patched > reported_patched_pages {
+                    warn!(
+                        "{} page(s) of client shm blanked after a pool was truncated \
+                         while in use; that client is showing black where it shrank",
+                        patched - reported_patched_pages
+                    );
+                    reported_patched_pages = patched;
                 }
             }
             () = cancel_token.cancelled() => {
@@ -471,11 +632,12 @@ fn cycle_focus(state: &mut CompositorState) {
     switch_focus(state, next);
 }
 
-/// Fire all pending frame callbacks, presentation feedbacks, and release buffers.
-fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
+/// Fire all pending frame callbacks and presentation feedbacks.
+///
+/// Called when a backend reports that a frame reached the screen.
+fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32, presented_at: PresentedAt) {
     let mut callbacks: Vec<(u32, u32)> = Vec::new(); // (client_id, callback_id)
     let mut presentation: Vec<(u32, u32)> = Vec::new(); // (client_id, feedback_id)
-    let mut buffers_to_release: Vec<(u32, u32)> = Vec::new(); // (client_id, buffer_id)
 
     for surface in state.surfaces.values_mut() {
         if let Some(callback_id) = surface.frame_callback.take() {
@@ -483,19 +645,6 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
         }
         for feedback_id in surface.presentation_feedbacks.drain(..) {
             presentation.push((surface.client_id, feedback_id));
-        }
-    }
-
-    // Drain buffers that were replaced by a commit, but skip any buffer
-    // that is still attached to a surface (can happen when multiple commits
-    // are batched and a buffer is re-attached after being replaced).
-    for (client_id, buffer_id) in state.buffers_pending_release.drain(..) {
-        let still_attached = state
-            .surfaces
-            .values()
-            .any(|s| s.client_id == client_id && s.buffer_id == Some(buffer_id));
-        if !still_attached {
-            buffers_to_release.push((client_id, buffer_id));
         }
     }
 
@@ -515,15 +664,12 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
 
     // Fire wp_presentation_feedback.presented events
     if !presentation.is_empty() {
-        // Get CLOCK_MONOTONIC timestamp in nanoseconds
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
-        let tv_sec_hi = (ts.tv_sec.cast_unsigned() >> 32) as u32;
-        let tv_sec_lo = u32::try_from(ts.tv_sec).unwrap_or(0);
-        let tv_nsec = u32::try_from(ts.tv_nsec).unwrap_or(0);
+        // The backend's own clock reading, taken when it presented, rather than
+        // one measured here a channel hop later. Accurate timing is the whole
+        // point of this protocol.
+        let tv_sec_hi = (presented_at.tv_sec.cast_unsigned() >> 32) as u32;
+        let tv_sec_lo = u32::try_from(presented_at.tv_sec).unwrap_or(0);
+        let tv_nsec = u32::try_from(presented_at.tv_nsec).unwrap_or(0);
 
         // wp_presentation_feedback.presented event (opcode 0)
         // flags: 0x1 = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
@@ -549,6 +695,55 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
             }
         }
     }
+}
+
+/// Note buffers a commit replaced as no longer wanted.
+///
+/// This is not the release itself: a frame still in flight may be reading the
+/// buffer, and telling the client it may draw would corrupt what is on screen.
+/// Buffers still attached to a surface are skipped, which happens when several
+/// commits are batched and a buffer is re-attached after being replaced.
+fn start_buffer_releases(state: &mut CompositorState) {
+    for (client_id, buffer_id) in std::mem::take(&mut state.buffers_pending_release) {
+        let still_attached = state
+            .surfaces
+            .values()
+            .any(|s| s.client_id == client_id && s.buffer_id == Some(buffer_id));
+        if still_attached {
+            continue;
+        }
+        state.releasing_buffers.insert((client_id, buffer_id));
+    }
+}
+
+/// Tell clients about buffers nothing is reading any more.
+///
+/// Runs every tick, not only the ones that draw: the last reader is usually the
+/// previous frame, which is dropped when a later frame replaces it or the
+/// backend finishes with it, and neither is tied to this compositor's idea of
+/// whether anything changed.
+fn finish_buffer_releases(state: &mut CompositorState) {
+    if state.releasing_buffers.is_empty() {
+        return;
+    }
+    let buffers_to_release: Vec<ClientObjectId> = state
+        .releasing_buffers
+        .iter()
+        .filter(|&&key| !state.buffer_is_being_read(key))
+        // A client can re-attach a buffer before hearing it was released.
+        // Telling it the buffer is free while it is on screen would invite it
+        // to draw over what is being displayed.
+        .filter(|&&(client_id, buffer_id)| {
+            !state
+                .surfaces
+                .values()
+                .any(|s| s.client_id == client_id && s.buffer_id == Some(buffer_id))
+        })
+        .copied()
+        .collect();
+    for key in &buffers_to_release {
+        state.releasing_buffers.remove(key);
+    }
 
     // Send wl_buffer.release (opcode 0, no args)
     for (client_id, buffer_id) in buffers_to_release {
@@ -561,6 +756,183 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32) {
             );
         }
     }
+}
+
+/// The size range an interactive resize of a window may produce.
+///
+/// Three sources, and the narrowest wins where they overlap:
+///
+/// - the compositor's own floor, so the window stays grabbable;
+/// - the client's `set_min_size` and `set_max_size`, which say what it can
+///   actually render at;
+/// - the size of the output the window is on, so a drag cannot make a window
+///   larger than the display showing it.
+///
+/// Where they contradict each other the range is widened rather than inverted,
+/// because a clamp needs a floor no higher than its ceiling. A client that
+/// insists on a minimum larger than the display gets it: the compositor cannot
+/// make it render smaller, and configuring a size it will refuse achieves
+/// nothing.
+fn resize_limits(state: &CompositorState, surface: ClientObjectId) -> ((i32, i32), (i32, i32)) {
+    let (display_width, display_height) = state
+        .surfaces
+        .get(&surface)
+        .and_then(|s| s.output)
+        .and_then(|id| state.outputs.iter().find(|o| o.id == id))
+        .map_or((i32::MAX, i32::MAX), |o| {
+            (o.geometry.physical_width, o.geometry.physical_height)
+        });
+    let ((client_min_w, client_min_h), (client_max_w, client_max_h)) =
+        state.client_size_limits(surface);
+
+    let min_width = MIN_WINDOW_WIDTH.max(client_min_w);
+    let min_height = MIN_WINDOW_HEIGHT.max(client_min_h);
+    // Zero means the client named no limit, so only the display applies.
+    let max_width = limit_or(client_max_w, display_width).max(min_width);
+    let max_height = limit_or(client_max_h, display_height).max(min_height);
+
+    ((min_width, min_height), (max_width, max_height))
+}
+
+/// A client's stated maximum narrowed by the display's, treating zero as unset.
+fn limit_or(client_limit: i32, display_limit: i32) -> i32 {
+    if client_limit > 0 {
+        client_limit.min(display_limit)
+    } else {
+        display_limit
+    }
+}
+
+/// Drive the active grab from a pointer position. Returns false if there is none.
+fn update_grab(state: &mut CompositorState, x: f64, y: f64) -> bool {
+    let Some(grab) = state.pointer_grab else {
+        return false;
+    };
+    match grab.kind {
+        GrabKind::Move { offset_x, offset_y } => {
+            let position = (f64_to_i32(x) + offset_x, f64_to_i32(y) + offset_y);
+            if let Some(surface) = state.surfaces.get_mut(&grab.surface) {
+                surface.position = position;
+            }
+            // Dragging toward another output hands the window over rather than
+            // letting it straddle: the window follows the pointer's output, and
+            // the tick's confinement then pulls it wholly inside that one.
+            let pointer_output = state
+                .outputs
+                .iter()
+                .find(|o| output_contains(o, f64_to_i32(x), f64_to_i32(y)))
+                .map(|o| o.id);
+            if let Some(output_id) = pointer_output
+                && let Some(surface) = state.surfaces.get_mut(&grab.surface)
+                && surface.output != Some(output_id)
+            {
+                surface.output = Some(output_id);
+            }
+        }
+        GrabKind::Resize {
+            edges,
+            start_pointer,
+            start_position,
+            start_size,
+            last_sent,
+        } => {
+            let dx = f64_to_i32(x - start_pointer.0);
+            let dy = f64_to_i32(y - start_pointer.1);
+
+            let ((min_width, min_height), (max_width, max_height)) =
+                resize_limits(state, grab.surface);
+
+            // Each edge moves independently, and the opposite edge stays put:
+            // dragging the left edge changes width and origin together. The
+            // origin is derived from the clamped width, so it stays pinned to
+            // the anchored edge even once the drag runs out of room.
+            let mut width = start_size.0;
+            let mut height = start_size.1;
+            let mut position = start_position;
+            if edges.right() {
+                width = (start_size.0 + dx).clamp(min_width, max_width);
+            } else if edges.left() {
+                width = (start_size.0 - dx).clamp(min_width, max_width);
+                position.0 = start_position.0 + start_size.0 - width;
+            }
+            if edges.bottom() {
+                height = (start_size.1 + dy).clamp(min_height, max_height);
+            } else if edges.top() {
+                height = (start_size.1 - dy).clamp(min_height, max_height);
+                position.1 = start_position.1 + start_size.1 - height;
+            }
+
+            if let Some(surface) = state.surfaces.get_mut(&grab.surface) {
+                surface.position = position;
+            }
+            // The client decides its own size; all we can do is ask. Asking on
+            // every motion event would flood it, so an unchanged size is
+            // silence.
+            if (width, height) != last_sent {
+                if let Some(g) = state.pointer_grab.as_mut()
+                    && let GrabKind::Resize { last_sent, .. } = &mut g.kind
+                {
+                    *last_sent = (width, height);
+                }
+                configure_resizing(state, grab.toplevel, width, height, true);
+            }
+        }
+    }
+    state.dirty = true;
+    true
+}
+
+/// End the active grab, telling a resized client it has stopped resizing.
+fn end_grab(state: &mut CompositorState) {
+    let Some(grab) = state.pointer_grab.take() else {
+        return;
+    };
+    if let GrabKind::Resize { last_sent, .. } = grab.kind {
+        configure_resizing(state, grab.toplevel, last_sent.0, last_sent.1, false);
+    }
+    state.dirty = true;
+}
+
+/// Ask a client for a size, marking whether the resize is still in progress.
+fn configure_resizing(
+    state: &mut CompositorState,
+    toplevel: ClientObjectId,
+    width: i32,
+    height: i32,
+    resizing: bool,
+) {
+    xdg_toplevel::send_resize_configure(state, toplevel.0, toplevel.1, width, height, resizing);
+    // The size only takes effect once the client acknowledges the matching
+    // xdg_surface.configure, so the two always travel together.
+    if let Some(xdg_surface_id) = state.xdg_toplevels.get(&toplevel).map(|t| t.xdg_surface_id) {
+        let serial = crate::compositor::protocol::next_serial();
+        xdg_surface::send_configure(state, toplevel.0, xdg_surface_id, serial);
+    }
+}
+
+/// Which edges an Alt+drag resize should pull, from where in the window the
+/// pointer sits: the nearest corner, so any part of the window is usable.
+fn edges_for_point(
+    state: &CompositorState,
+    surface: ClientObjectId,
+    x: f64,
+    y: f64,
+) -> ResizeEdges {
+    let Some(position) = state.surfaces.get(&surface).map(|s| s.position) else {
+        return ResizeEdges(ResizeEdges::BOTTOM | ResizeEdges::RIGHT);
+    };
+    let (width, height) = state.surface_size(surface);
+    let horizontal = if f64_to_i32(x) < position.0 + width / 2 {
+        ResizeEdges::LEFT
+    } else {
+        ResizeEdges::RIGHT
+    };
+    let vertical = if f64_to_i32(y) < position.1 + height / 2 {
+        ResizeEdges::TOP
+    } else {
+        ResizeEdges::BOTTOM
+    };
+    ResizeEdges(horizontal | vertical)
 }
 
 /// Switch keyboard focus to a new toplevel surface. Sends keyboard enter/leave
@@ -594,18 +966,6 @@ pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObject
         }
     }
     xdg_toplevel::send_activated(state, new_client, new_surface, true);
-}
-
-/// Result of a hit test: which toplevel was hit, and which specific surface
-/// (possibly a subsurface) the pointer is actually over.
-struct HitResult {
-    /// The toplevel surface key (in `surface_stack`) — used for stacking/keyboard focus.
-    toplevel: ClientObjectId,
-    /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
-    surface: ClientObjectId,
-    /// Global position of the specific surface, for computing local coordinates.
-    surface_x: i32,
-    surface_y: i32,
 }
 
 /// Hit-test the surface stack from top to bottom. Returns the toplevel and the
@@ -777,160 +1137,4 @@ fn surface_global_position(state: &CompositorState, client_id: u32, surface_id: 
     }
 
     (x, y)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        Binding, CompositorState, KEY_F4, KEY_LEFTALT, KEY_RIGHTALT, KEY_TAB, close_focused_window,
-        cycle_focus, match_binding,
-    };
-    use crate::wayland_socket::WaylandProtocolMessage;
-    use std::collections::{HashSet, VecDeque};
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc::{Receiver, channel};
-    use tokio_util::sync::CancellationToken;
-
-    fn held(keys: &[u32]) -> HashSet<u32> {
-        keys.iter().copied().collect()
-    }
-
-    #[test]
-    fn bindings_require_alt() {
-        assert_eq!(match_binding(KEY_F4, &held(&[])), None);
-        assert_eq!(match_binding(KEY_TAB, &held(&[])), None);
-        assert_eq!(
-            match_binding(KEY_F4, &held(&[KEY_LEFTALT])),
-            Some(Binding::CloseWindow)
-        );
-        assert_eq!(
-            match_binding(KEY_TAB, &held(&[KEY_RIGHTALT])),
-            Some(Binding::CycleFocus)
-        );
-    }
-
-    #[test]
-    fn unbound_keys_pass_through_even_with_alt() {
-        // Alt+E belongs to the client, not the compositor.
-        assert_eq!(match_binding(18, &held(&[KEY_LEFTALT])), None);
-    }
-
-    /// Register a client and give back the receiver its socket task would drain.
-    fn add_client(state: &mut CompositorState, client_id: u32) -> Receiver<WaylandProtocolMessage> {
-        let (tx, rx) = channel(64);
-        state.clients.create(
-            client_id,
-            tx,
-            Arc::new(Mutex::new(VecDeque::new())),
-            CancellationToken::new(),
-        );
-        rx
-    }
-
-    /// Build a mapped toplevel backed by a `wl_surface`.
-    fn add_toplevel(
-        state: &mut CompositorState,
-        client_id: u32,
-        wl_surface_id: u32,
-        xdg_surface_id: u32,
-        toplevel_id: u32,
-    ) {
-        state.create_surface(client_id, wl_surface_id);
-        state.create_xdg_surface(client_id, xdg_surface_id, wl_surface_id);
-        state.create_xdg_toplevel(client_id, toplevel_id, xdg_surface_id);
-    }
-
-    #[test]
-    fn buffer_scale_shrinks_the_hit_testable_area() {
-        use crate::protocol::state::ShmBuffer;
-        let mut state = CompositorState::new();
-        let _rx = add_client(&mut state, 1);
-        state.create_surface(1, 10);
-        state.shm_buffers.insert(
-            (1, 11),
-            ShmBuffer {
-                client_id: 1,
-                pool_id: 0,
-                offset: 0,
-                width: 200,
-                height: 100,
-                stride: 800,
-                format: 0,
-            },
-        );
-        let surface = state.surfaces.get_mut(&(1, 10)).unwrap();
-        surface.buffer_id = Some(11);
-
-        assert_eq!(super::surface_dimensions(&state, (1, 10)), (200, 100));
-
-        state.surfaces.get_mut(&(1, 10)).unwrap().buffer_scale = 2;
-        assert_eq!(
-            super::surface_dimensions(&state, (1, 10)),
-            (100, 50),
-            "a scale-2 buffer covers half as much surface-local area"
-        );
-    }
-
-    #[test]
-    fn close_sends_xdg_toplevel_close_to_the_focused_window() {
-        let mut state = CompositorState::new();
-        let mut rx = add_client(&mut state, 1);
-        add_toplevel(&mut state, 1, 10, 11, 12);
-        state.focused_surface = Some((1, 10));
-
-        close_focused_window(&mut state);
-
-        let msg = rx.try_recv().expect("expected an xdg_toplevel.close");
-        assert_eq!(
-            msg.object_id, 12,
-            "addressed to the toplevel, not the surface"
-        );
-        assert_eq!(msg.op_code, 1, "xdg_toplevel.close");
-    }
-
-    #[test]
-    fn close_with_nothing_focused_is_a_no_op() {
-        let mut state = CompositorState::new();
-        let mut rx = add_client(&mut state, 1);
-        add_toplevel(&mut state, 1, 10, 11, 12);
-        state.focused_surface = None;
-
-        close_focused_window(&mut state);
-
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn cycle_rotates_through_every_window() {
-        let mut state = CompositorState::new();
-        let _rx = add_client(&mut state, 1);
-        add_toplevel(&mut state, 1, 10, 11, 12);
-        add_toplevel(&mut state, 1, 20, 21, 22);
-        add_toplevel(&mut state, 1, 30, 31, 32);
-        // create_xdg_toplevel pushes each new window on top, bottom-to-top.
-        assert_eq!(state.surface_stack, vec![(1, 10), (1, 20), (1, 30)]);
-
-        cycle_focus(&mut state);
-        assert_eq!(state.focused_surface, Some((1, 10)));
-        assert_eq!(state.surface_stack, vec![(1, 20), (1, 30), (1, 10)]);
-
-        cycle_focus(&mut state);
-        assert_eq!(state.focused_surface, Some((1, 20)));
-
-        cycle_focus(&mut state);
-        assert_eq!(state.focused_surface, Some((1, 30)));
-    }
-
-    #[test]
-    fn cycle_with_one_window_does_nothing() {
-        let mut state = CompositorState::new();
-        let _rx = add_client(&mut state, 1);
-        add_toplevel(&mut state, 1, 10, 11, 12);
-        state.focused_surface = Some((1, 10));
-
-        cycle_focus(&mut state);
-
-        assert_eq!(state.surface_stack, vec![(1, 10)]);
-        assert_eq!(state.focused_surface, Some((1, 10)));
-    }
 }

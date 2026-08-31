@@ -6,8 +6,9 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{CompositorState, OutputId};
+use super::state::CompositorState;
 use super::wire_utils::{ArgWriter, message};
+use crate::shared::OutputId;
 
 // Request opcodes
 const RELEASE: u16 = 0;

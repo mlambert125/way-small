@@ -4,7 +4,8 @@
 //! The only client request is destroy. The compositor sends the release
 //! event when it's done reading the buffer's contents.
 
-use crate::{protocol::message, wayland_socket::WaylandProtocolMessageWithClientInfo};
+use crate::compositor::protocol::message;
+use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
 

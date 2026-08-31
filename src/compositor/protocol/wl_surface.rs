@@ -6,10 +6,11 @@
 
 use tracing::debug;
 
+use crate::shared::TextureRect;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
-use super::state::{CompositorState, PendingInputRegion};
+use super::state::{ClientObjectId, CompositorState, PendingInputRegion};
 use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
@@ -66,7 +67,12 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
     match msg.message.op_code {
         DESTROY => handle_destroy(state, msg),
         ATTACH => handle_attach(state, msg),
-        DAMAGE | DAMAGE_BUFFER => handle_damage(state, msg),
+        // The two damage requests differ in coordinate space, so they cannot
+        // share a list: `damage` is surface-local, `damage_buffer` is in
+        // buffer pixels, and only the latter is directly usable as an upload
+        // region.
+        DAMAGE => handle_damage(state, msg, DamageSpace::Surface),
+        DAMAGE_BUFFER => handle_damage(state, msg, DamageSpace::Buffer),
         FRAME => handle_frame(state, msg),
         SET_INPUT_REGION => handle_set_input_region(state, msg),
         SET_BUFFER_SCALE => handle_set_buffer_scale(state, msg),
@@ -109,17 +115,41 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     }
 }
 
-fn handle_damage(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+/// Which coordinate space a damage rectangle arrived in.
+#[derive(Debug, Clone, Copy)]
+enum DamageSpace {
+    /// `wl_surface.damage` — surface-local, so it has to be mapped through the
+    /// viewport and buffer scale before it means anything to a texture.
+    Surface,
+    /// `wl_surface.damage_buffer` — already buffer pixels.
+    Buffer,
+}
+
+fn handle_damage(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+    space: DamageSpace,
+) {
     let mut args = ArgReader::new(&msg.message.args);
     // damage args: int32 x, int32 y, int32 width, int32 height
-    let (Some(x), Some(y), Some(w), Some(h)) = (args.i32(), args.i32(), args.i32(), args.i32())
+    let (Some(x), Some(y), Some(width), Some(height)) =
+        (args.i32(), args.i32(), args.i32(), args.i32())
     else {
         return;
     };
 
     let surface_id = msg.message.object_id;
     if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
-        surface.pending.damage.push((x, y, w, h));
+        let rect = TextureRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        match space {
+            DamageSpace::Surface => surface.pending.damage_surface.push(rect),
+            DamageSpace::Buffer => surface.pending.damage_buffer.push(rect),
+        }
     }
 }
 
@@ -229,6 +259,9 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     let surface_id = msg.message.object_id;
     let client_id = msg.client_id;
     let key = (client_id, surface_id);
+    let mut committed_buffer = None;
+    let mut damage_surface = Vec::new();
+    let mut damage_buffer = Vec::new();
 
     if let Some(surface) = state.surfaces.get_mut(&key) {
         // Apply pending buffer, releasing the old one if it changed
@@ -265,17 +298,20 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             PendingInputRegion::Rects(rects) => surface.input_region = Some(rects),
         }
 
-        // Clear pending damage
-        surface.pending.damage.clear();
+        damage_surface = std::mem::take(&mut surface.pending.damage_surface);
+        damage_buffer = std::mem::take(&mut surface.pending.damage_buffer);
+
+        committed_buffer = surface.buffer_id;
 
         state.dirty = true;
         debug!(
             "wl_surface.commit: surface_id={} buffer={:?}",
-            surface_id, surface.buffer_id
+            surface_id, committed_buffer
         );
     }
 
-    // Apply pending viewport state
+    // Apply pending viewport state before reading damage: surface-local damage
+    // is interpreted through the viewport this same commit installs.
     if let Some(&vp_id) = state.surface_viewport.get(&(client_id, surface_id))
         && let Some(vp) = state.viewports.get_mut(&(client_id, vp_id))
     {
@@ -286,4 +322,100 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             vp.destination = Some(dst);
         }
     }
+
+    // A commit is the only point at which a client promises its buffer contents
+    // are stable, and it may have redrawn into a buffer it never detached, so
+    // every commit marks the attached buffer changed. What the damage adds is
+    // how *much* of it changed.
+    if let Some(buffer_id) = committed_buffer {
+        let damage = committed_damage(state, key, buffer_id, &damage_surface, &damage_buffer);
+        state.mark_buffer_damaged(client_id, buffer_id, &damage);
+    }
 }
+
+/// Convert a commit's damage into buffer-pixel rectangles.
+///
+/// An empty result means "assume the whole buffer changed", and every
+/// uncertain case collapses to it: damage is a promise that everything
+/// *outside* it is unchanged, so a rectangle we cannot place accurately is
+/// worse than no rectangle at all.
+fn committed_damage(
+    state: &CompositorState,
+    key: ClientObjectId,
+    buffer_id: u32,
+    damage_surface: &[TextureRect],
+    damage_buffer: &[TextureRect],
+) -> Vec<TextureRect> {
+    if damage_surface.is_empty() && damage_buffer.is_empty() {
+        return Vec::new();
+    }
+    let Some(buffer) = state.shm_buffers.get(&(key.0, buffer_id)) else {
+        return Vec::new();
+    };
+    let (width, height) = (buffer.width, buffer.height);
+
+    let mut rects = Vec::with_capacity(damage_surface.len() + damage_buffer.len());
+    rects.extend(
+        damage_buffer
+            .iter()
+            .filter_map(|r| clamp_rect(*r, width, height)),
+    );
+
+    if !damage_surface.is_empty() {
+        // Surface coordinates only mean something through the same mapping the
+        // scene draws with, run backwards. Without it, nothing can be placed.
+        let Some(mapping) = state.surface_buffer_mapping(key) else {
+            return Vec::new();
+        };
+        let (src_x, src_y, src_w, src_h) = mapping.src;
+        let scale_x = src_w / f64::from(mapping.dest_width);
+        let scale_y = src_h / f64::from(mapping.dest_height);
+
+        for rect in damage_surface {
+            // Round outward and pad by a pixel. The mapping is not pixel-exact,
+            // and uploading a little more than changed is always safe.
+            let x0 = (src_x + f64::from(rect.x) * scale_x).floor() - 1.0;
+            let y0 = (src_y + f64::from(rect.y) * scale_y).floor() - 1.0;
+            let x1 = (src_x + f64::from(rect.x.saturating_add(rect.width)) * scale_x).ceil() + 1.0;
+            let y1 = (src_y + f64::from(rect.y.saturating_add(rect.height)) * scale_y).ceil() + 1.0;
+            let mapped = TextureRect {
+                x: clamped_i32(x0),
+                y: clamped_i32(y0),
+                width: clamped_i32(x1 - x0),
+                height: clamped_i32(y1 - y0),
+            };
+            if let Some(clamped) = clamp_rect(mapped, width, height) {
+                rects.push(clamped);
+            }
+        }
+    }
+
+    rects
+}
+
+/// Clip a rectangle to a buffer, dropping it if nothing is left.
+fn clamp_rect(rect: TextureRect, width: i32, height: i32) -> Option<TextureRect> {
+    let x0 = rect.x.max(0);
+    let y0 = rect.y.max(0);
+    let x1 = rect.x.saturating_add(rect.width).min(width);
+    let y1 = rect.y.saturating_add(rect.height).min(height);
+    (x1 > x0 && y1 > y0).then_some(TextureRect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
+}
+
+/// Narrow a mapped coordinate to `i32`, saturating rather than wrapping.
+///
+/// These values come from client-supplied rectangles scaled by a client-chosen
+/// viewport, so they can be any float at all; `as` saturates, which is what we
+/// want, but the intent is worth naming.
+#[allow(clippy::cast_possible_truncation)]
+fn clamped_i32(value: f64) -> i32 {
+    value as i32
+}
+
+#[cfg(test)]
+mod tests;

@@ -93,5 +93,14 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         "wl_shm_pool.resize: pool_id={} new_size={}",
         pool_id, new_size
     );
-    state.resize_shm_pool(msg.client_id, pool_id, new_size.unsigned_abs());
+    if !state.resize_shm_pool(msg.client_id, pool_id, new_size.unsigned_abs())
+        && let Some(client) = state.clients.get(msg.client_id)
+    {
+        // WL_SHM_ERROR_INVALID_FD = 2
+        client.send_error(
+            pool_id,
+            2,
+            "wl_shm_pool.resize: pool file is smaller than the new size",
+        );
+    }
 }

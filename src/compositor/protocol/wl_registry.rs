@@ -8,9 +8,10 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{CompositorState, OutputId};
+use super::state::CompositorState;
 use super::wire_utils::{ArgReader, ArgWriter, message};
 use super::{GLOBALS, ObjectType, wl_output, wl_seat, wl_shm};
+use crate::shared::OutputId;
 
 // Request opcodes
 const BIND: u16 = 0;

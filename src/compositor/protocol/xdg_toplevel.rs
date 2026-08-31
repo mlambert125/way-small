@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::state::{ClientObjectId, CompositorState, ResizeEdges};
 use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
@@ -36,15 +36,16 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         DESTROY => handle_destroy(state, msg),
         SET_TITLE => handle_set_title(state, msg),
         SET_APP_ID => handle_set_app_id(state, msg),
-        SET_PARENT | SHOW_WINDOW_MENU | MOVE | RESIZE => {
+        MOVE => handle_move(state, msg),
+        RESIZE => handle_resize(state, msg),
+        SET_PARENT | SHOW_WINDOW_MENU => {
             debug!(
                 "xdg_toplevel: interactive op {} (not yet implemented)",
                 msg.message.op_code
             );
         }
-        SET_MAX_SIZE | SET_MIN_SIZE => {
-            // Acknowledge but don't enforce yet
-        }
+        SET_MIN_SIZE => handle_set_size_hint(state, msg, SizeHint::Min),
+        SET_MAX_SIZE => handle_set_size_hint(state, msg, SizeHint::Max),
         SET_MAXIMIZED | UNSET_MAXIMIZED | SET_FULLSCREEN | UNSET_FULLSCREEN | SET_MINIMIZED => {
             debug!(
                 "xdg_toplevel: state change op {} (not yet implemented)",
@@ -91,7 +92,141 @@ fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
 }
 
 // `xdg_toplevel` state values
+/// Which end of a client's acceptable size range a request is setting.
+#[derive(Debug, Clone, Copy)]
+enum SizeHint {
+    Min,
+    Max,
+}
+
+/// Record a client's `set_min_size` or `set_max_size`.
+///
+/// Applied straight away rather than on the next commit as the protocol
+/// specifies. The difference is only visible to a client that sets a limit and
+/// starts a resize before committing, and the compositor keeps no other
+/// double-buffered toplevel state to hang this off.
+///
+/// A min larger than a max is not treated as an error here. The two arrive in
+/// separate requests, so a client raising both would momentarily look
+/// inconsistent through no fault of its own; the resize path resolves the
+/// overlap instead.
+fn handle_set_size_hint(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+    hint: SizeHint,
+) {
+    let mut args = ArgReader::new(&msg.message.args);
+    let (Some(width), Some(height)) = (args.i32(), args.i32()) else {
+        return;
+    };
+    let toplevel_id = msg.message.object_id;
+
+    if width < 0 || height < 0 {
+        if let Some(client) = state.clients.get(msg.client_id) {
+            // XDG_TOPLEVEL_ERROR_INVALID_SIZE = 2
+            client.send_error(
+                toplevel_id,
+                2,
+                "xdg_toplevel: size hint must not be negative",
+            );
+        }
+        return;
+    }
+
+    debug!("xdg_toplevel.set_{hint:?}_size: {width}x{height}");
+    if let Some(toplevel) = state.xdg_toplevels.get_mut(&(msg.client_id, toplevel_id)) {
+        match hint {
+            SizeHint::Min => toplevel.min_size = (width, height),
+            SizeHint::Max => toplevel.max_size = (width, height),
+        }
+    }
+}
+
+/// Start an interactive move, if the client is entitled to.
+fn handle_move(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let mut args = ArgReader::new(&msg.message.args);
+    // move args: object seat, uint serial
+    let (Some(_seat), Some(serial)) = (args.u32(), args.u32()) else {
+        return;
+    };
+    let Some(surface) = grab_target(state, msg.client_id, msg.message.object_id, serial) else {
+        return;
+    };
+    debug!("xdg_toplevel.move: toplevel_id={}", msg.message.object_id);
+    state.start_move_grab(surface);
+}
+
+/// Start an interactive resize, if the client is entitled to.
+fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let mut args = ArgReader::new(&msg.message.args);
+    // resize args: object seat, uint serial, uint edges
+    let (Some(_seat), Some(serial), Some(edges)) = (args.u32(), args.u32(), args.u32()) else {
+        return;
+    };
+    let Some(surface) = grab_target(state, msg.client_id, msg.message.object_id, serial) else {
+        return;
+    };
+    debug!(
+        "xdg_toplevel.resize: toplevel_id={} edges={}",
+        msg.message.object_id, edges
+    );
+    state.start_resize_grab(surface, ResizeEdges(edges));
+}
+
+/// Resolve a grab request to the window it should act on.
+///
+/// A client may only start a grab off the back of real user input, or any
+/// client could seize the pointer whenever it liked. The serial it quotes must
+/// be one we minted for a button press, and that button must still be down —
+/// a grab beginning after the user let go has nothing to follow.
+fn grab_target(
+    state: &CompositorState,
+    client_id: u32,
+    toplevel_id: u32,
+    serial: u32,
+) -> Option<ClientObjectId> {
+    if state.pressed_buttons.is_empty() {
+        debug!("xdg_toplevel grab refused: no button is held");
+        return None;
+    }
+    if state.last_button_serial.get(&client_id) != Some(&serial) {
+        debug!("xdg_toplevel grab refused: serial {serial} was not a recent press");
+        return None;
+    }
+    let xdg_surface_id = state
+        .xdg_toplevels
+        .get(&(client_id, toplevel_id))?
+        .xdg_surface_id;
+    let wl_surface_id = state
+        .xdg_surfaces
+        .get(&(client_id, xdg_surface_id))?
+        .wl_surface_id;
+    Some((client_id, wl_surface_id))
+}
+
 const STATE_ACTIVATED: u32 = 4;
+const STATE_RESIZING: u32 = 3;
+
+/// Ask a client to adopt a size during or at the end of an interactive resize.
+///
+/// The `resizing` state tells the client the drag is still in progress, which
+/// is its cue to favour speed over quality — skipping reflow it would only
+/// have to redo on the next motion event.
+pub fn send_resize_configure(
+    state: &mut CompositorState,
+    client_id: u32,
+    toplevel_id: u32,
+    width: i32,
+    height: i32,
+    resizing: bool,
+) {
+    let states: &[u32] = if resizing {
+        &[STATE_ACTIVATED, STATE_RESIZING]
+    } else {
+        &[STATE_ACTIVATED]
+    };
+    send_configure_with_states(state, client_id, toplevel_id, width, height, states);
+}
 
 /// Send `xdg_toplevel`.configure event (width, height, states array).
 pub fn send_configure(
@@ -189,3 +324,6 @@ pub fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32)
         let _ = client.send(message(toplevel_id, CLOSE, Vec::new()));
     }
 }
+
+#[cfg(test)]
+mod tests;

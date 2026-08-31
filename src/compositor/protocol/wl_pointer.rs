@@ -3,7 +3,7 @@
 //! Delivers pointer (mouse) events to focused clients: enter, leave,
 //! motion, button, and axis (scroll) events.
 
-use crate::protocol::ArgReader;
+use crate::compositor::protocol::ArgReader;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::next_serial;
@@ -149,6 +149,9 @@ pub fn send_motion(
 }
 
 /// Send `wl_pointer.button` to a client's pointer object.
+///
+/// Returns the serial, which the compositor records so a client can quote it
+/// when asking to start an interactive move or resize.
 pub fn send_button(
     state: &mut CompositorState,
     client_id: u32,
@@ -156,7 +159,7 @@ pub fn send_button(
     time_ms: u32,
     button: u32,
     pressed: bool,
-) {
+) -> u32 {
     let serial = next_serial();
     let btn_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
@@ -170,6 +173,7 @@ pub fn send_button(
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
+    serial
 }
 
 /// Send `wl_pointer.axis` to a client's pointer object.

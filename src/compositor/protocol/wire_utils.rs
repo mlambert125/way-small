@@ -94,14 +94,6 @@ pub fn f64_to_i32(val: f64) -> i32 {
     unsafe { f64::to_int_unchecked(val) }
 }
 
-pub fn f64_to_usize(val: f64) -> usize {
-    unsafe { f64::to_int_unchecked(val) }
-}
-
-pub fn usize_to_f64(val: usize) -> f64 {
-    f64::from(u32::try_from(val).expect("Value too large for f64 conversion"))
-}
-
 /// Cursor-based reader for parsing Wayland message arguments.
 pub struct ArgReader<'a> {
     buf: &'a [u8],
