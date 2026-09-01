@@ -10,7 +10,8 @@ use crate::shared::{
     OutputTransform,
 };
 use crate::shared::{
-    PixelFormat, Scene, SceneElement, TextureId, TextureImage, TexturePixels, TextureRect,
+    PixelFormat, Scene, SceneElement, TextureId, TextureImage, TextureRect, TextureSource,
+    UploadPixels,
 };
 use std::collections::VecDeque;
 use std::os::fd::IntoRawFd;
@@ -93,9 +94,10 @@ fn test_state(buffer_scale: i32) -> CompositorState {
     surface.buffer_id = Some(BUFFER_ID);
     surface.position = (0, 0);
     surface.buffer_scale = buffer_scale;
-    // Windows are only drawn on the output they belong to.
-    surface.output = Some(OUTPUT);
-    state.surface_stack.push((CLIENT, SURFACE_ID));
+    // A window lives in a workspace, and only the workspace showing on an
+    // output is drawn there.
+    state.sync_workspaces();
+    state.move_toplevel_to_output((CLIENT, SURFACE_ID), OUTPUT);
 
     state
 }
@@ -206,6 +208,31 @@ fn rect(x: i32, y: i32, width: i32, height: i32) -> TextureRect {
 }
 
 /// The buffer's texture, built through a cache that persists across calls.
+/// What an image says about the copy it is a patch against, and what changed.
+///
+/// Every image these tests build is an upload — there is no client here to
+/// hand over a GPU buffer — so a dma-buf means the test built the wrong thing.
+fn upload_of(image: &TextureImage) -> (Option<u64>, &[TextureRect]) {
+    match &image.source {
+        TextureSource::Upload {
+            previous_serial,
+            damage,
+            ..
+        } => (*previous_serial, damage),
+        TextureSource::Dmabuf(_) => panic!("expected an uploaded image, not a dma-buf"),
+    }
+}
+
+/// What changed in an image since the copy the backend holds.
+fn damage_of(image: &TextureImage) -> &[TextureRect] {
+    upload_of(image).1
+}
+
+/// The serial an image is a patch against, if it is one.
+fn previous_serial_of(image: &TextureImage) -> Option<u64> {
+    upload_of(image).0
+}
+
 fn texture_of(state: &CompositorState, cache: &mut SceneCache) -> Arc<TextureImage> {
     surface_element(&build(OUTPUT, state, cache))
         .texture
@@ -222,7 +249,7 @@ fn an_idle_surface_keeps_its_serial() {
     // A fresh handle each frame — there is no copy to reuse — but the same
     // serial, which is what tells the backend its texture is still good.
     assert_eq!(again.serial, first.serial);
-    assert_eq!(again.previous_serial, None);
+    assert_eq!(previous_serial_of(&again), None);
 
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[]);
     let after = texture_of(&state, &mut cache);
@@ -236,16 +263,16 @@ fn damage_rides_along_as_a_patch_on_the_previous_copy() {
 
     let first = texture_of(&state, &mut cache);
     // Nothing to patch against yet, so the whole image is the update.
-    assert_eq!(first.previous_serial, None);
-    assert!(first.damage.is_empty());
+    assert_eq!(previous_serial_of(&first), None);
+    assert!(damage_of(&first).is_empty());
     state.clear_buffer_damage();
 
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[rect(4, 5, 6, 7)]);
     let second = texture_of(&state, &mut cache);
     // Anchored to the copy the backend is holding, so it can patch rather
     // than re-upload.
-    assert_eq!(second.previous_serial, Some(first.serial));
-    assert_eq!(second.damage, vec![rect(4, 5, 6, 7)]);
+    assert_eq!(previous_serial_of(&second), Some(first.serial));
+    assert_eq!(damage_of(&second), [rect(4, 5, 6, 7)]);
 }
 
 #[test]
@@ -260,7 +287,7 @@ fn damage_accumulates_until_it_is_consumed() {
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[rect(0, 0, 4, 4)]);
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[rect(8, 8, 4, 4)]);
     let image = texture_of(&state, &mut cache);
-    assert_eq!(image.damage, vec![rect(0, 0, 4, 4), rect(8, 8, 4, 4)]);
+    assert_eq!(damage_of(&image), [rect(0, 0, 4, 4), rect(8, 8, 4, 4)]);
 }
 
 #[test]
@@ -275,7 +302,7 @@ fn undescribed_damage_widens_to_the_whole_buffer_and_stays_there() {
     // window back down, because the undescribed change is still in it.
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[]);
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[rect(8, 8, 4, 4)]);
-    assert!(texture_of(&state, &mut cache).damage.is_empty());
+    assert!(damage_of(&texture_of(&state, &mut cache)).is_empty());
 }
 
 #[test]
@@ -298,7 +325,7 @@ fn a_resized_buffer_cannot_be_patched() {
         0,
     );
     state.mark_buffer_damaged(CLIENT, BUFFER_ID, &[rect(0, 0, 4, 4)]);
-    assert!(texture_of(&state, &mut cache).damage.is_empty());
+    assert!(damage_of(&texture_of(&state, &mut cache)).is_empty());
 }
 
 #[test]
@@ -321,7 +348,13 @@ fn buffer_pixels_are_borrowed_from_the_client_mapping() {
     assert_eq!(texture.width, BUFFER_SIDE);
     assert_eq!(texture.height, BUFFER_SIDE);
     // Pointing at the client's pool, not at a copy of it.
-    assert!(matches!(texture.pixels, TexturePixels::Mapped { .. }));
+    assert!(matches!(
+        texture.source,
+        TextureSource::Upload {
+            pixels: UploadPixels::Mapped { .. },
+            ..
+        }
+    ));
 
     // SAFETY: the image is alive, so nothing has been released.
     let bytes = unsafe { texture.bytes() }.expect("image does not fit its mapping");
@@ -412,6 +445,9 @@ fn add_second_output(state: &mut CompositorState) {
     output.id = OUTPUT_B;
     output.geometry.x = OUTPUT_SIDE;
     state.outputs.push(output);
+    // The new output arrives with a workspace of its own, empty until a
+    // window is moved onto it.
+    state.sync_workspaces();
 }
 
 #[test]
@@ -441,8 +477,8 @@ fn a_window_is_drawn_in_its_own_outputs_coordinates() {
     add_second_output(&mut state);
 
     // Move it onto the second output, whose origin is OUTPUT_SIDE across.
+    state.move_toplevel_to_output((CLIENT, SURFACE_ID), OUTPUT_B);
     let surface = state.surfaces.get_mut(&(CLIENT, SURFACE_ID)).unwrap();
-    surface.output = Some(OUTPUT_B);
     surface.position = (OUTPUT_SIDE + 10, 20);
 
     let scene = build(OUTPUT_B, &state, &mut SceneCache::new());
@@ -526,16 +562,15 @@ fn a_window_larger_than_its_output_is_pinned_to_the_corner() {
 fn a_window_whose_output_vanished_is_rehomed() {
     let mut state = test_state(1);
     add_second_output(&mut state);
-    state
-        .surfaces
-        .get_mut(&(CLIENT, SURFACE_ID))
-        .unwrap()
-        .output = Some(OutputId(99));
+    // The output the window was on is unplugged, taking its workspace — and so
+    // the window's home — with it.
+    state.outputs.retain(|o| o.id != OUTPUT);
 
     assert!(state.confine_toplevels());
-    let output = state.surfaces[&(CLIENT, SURFACE_ID)].output;
-    assert!(
-        output == Some(OUTPUT) || output == Some(OUTPUT_B),
-        "should have been given a real output, got {output:?}"
+    let output = state.surface_output((CLIENT, SURFACE_ID));
+    assert_eq!(
+        output,
+        Some(OUTPUT_B),
+        "should have been re-homed onto the output that is left"
     );
 }

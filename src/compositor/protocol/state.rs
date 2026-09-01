@@ -3,6 +3,7 @@
 //! `CompositorState` holds everything shared across all clients: the client
 //! collection, shm pools, buffers, surfaces, and (eventually) outputs, etc.
 
+use super::super::workspace::{Workspace, Workspaces};
 use super::client::Clients;
 use super::wire_utils::f64_to_i32;
 use super::wl_pointer;
@@ -107,13 +108,6 @@ pub struct Surface {
     /// Outputs the client has been told this surface is on, via
     /// `wl_surface.enter`. Diffed each frame so only changes are sent.
     pub entered_outputs: HashSet<OutputId>,
-    /// Which output this window lives on.
-    ///
-    /// Only meaningful for a toplevel's root surface — the entries in
-    /// `surface_stack`. Popups and subsurfaces hang off a toplevel and inherit
-    /// its output along with its position. A window belongs to exactly one
-    /// output and is confined to it, so it is never drawn on any other.
-    pub output: Option<OutputId>,
 }
 
 #[derive(Debug)]
@@ -187,7 +181,7 @@ pub enum GrabKind {
 /// the grab instead of reaching the client, which is what "grab" means.
 #[derive(Debug, Clone, Copy)]
 pub struct PointerGrab {
-    /// The toplevel's `wl_surface`, the same key `surface_stack` uses.
+    /// The toplevel's `wl_surface`, the same key a workspace's stack uses.
     pub surface: ClientObjectId,
     /// The `xdg_toplevel` object, needed to configure a resize.
     pub toplevel: ClientObjectId,
@@ -416,12 +410,21 @@ pub struct CompositorState {
     pub surface_viewport: HashMap<ClientObjectId, u32>,
     /// Buffers to release on the next render (old buffers replaced by commit).
     pub buffers_pending_release: Vec<ClientObjectId>,
-    /// Next cascade position for a new window, per output, in coordinates
-    /// local to that output. Windows belong to one output, so the cascade
-    /// does too.
-    pub next_toplevel_position: HashMap<OutputId, (i32, i32)>,
-    /// Toplevel surface draw order, bottom to top.
-    pub surface_stack: Vec<ClientObjectId>,
+    /// dma-buf formats the backend can import, from
+    /// [`crate::shared::BackendMessage::DmabufSupport`].
+    ///
+    /// Empty until the backend has answered, and empty for good if it cannot
+    /// import at all — which is what `zwp_linux_dmabuf_v1` will be advertised
+    /// on. A compositor that offers dma-buf it cannot draw is worse than one
+    /// that offers none: the client allocates for it and then has nothing to
+    /// fall back to.
+    pub dmabuf_formats: Vec<crate::shared::DmabufFormat>,
+    /// The workspaces of every output, and the windows on them.
+    ///
+    /// Outputs own workspaces and workspaces own windows, so this is where a
+    /// toplevel's output, its stacking order and whether it is on screen at
+    /// all are all read from.
+    pub workspaces: Workspaces,
     /// Whether visual state has changed and a re-render is needed.
     pub dirty: bool,
     /// Per-client cursor: `client_id` -> `Some((surface_id, hotspot_x, hotspot_y))` or `None` (hidden).
@@ -481,8 +484,8 @@ impl CompositorState {
             viewports: HashMap::new(),
             surface_viewport: HashMap::new(),
             buffers_pending_release: Vec::new(),
-            next_toplevel_position: HashMap::new(),
-            surface_stack: Vec::new(),
+            dmabuf_formats: Vec::new(),
+            workspaces: Workspaces::new(),
             dirty: true,
             cursor_surfaces: HashMap::new(),
             pointer_enter_serial: HashMap::new(),
@@ -760,7 +763,7 @@ impl CompositorState {
 
     /// The output a new window should open on: the one under the pointer, or
     /// failing that whichever output comes first.
-    fn output_for_new_window(&self) -> Option<OutputId> {
+    pub fn output_for_new_window(&self) -> Option<OutputId> {
         let (x, y) = (f64_to_i32(self.cursor_x), f64_to_i32(self.cursor_y));
         self.outputs
             .iter()
@@ -778,18 +781,52 @@ impl CompositorState {
             .map_or((0, 0), |m| (m.dest_width, m.dest_height))
     }
 
-    /// Put a newly mapped window on an output, at the next cascade position.
+    /// Give every output the one workspace it starts with, and take back the
+    /// windows of any output that has gone. Returns true if anything changed.
+    ///
+    /// Called when outputs are added or removed, and again every tick, so no
+    /// path can leave an output without somewhere to put a window.
+    pub fn sync_workspaces(&mut self) -> bool {
+        self.workspaces.sync_outputs(&self.outputs)
+    }
+
+    /// Which output a window is on: the one owning the workspace it is in.
+    ///
+    /// `None` for a window waiting to be placed, and for anything that is not
+    /// a toplevel — popups and subsurfaces hang off a toplevel and take its
+    /// output along with its position.
+    pub fn surface_output(&self, surface_key: ClientObjectId) -> Option<OutputId> {
+        self.workspaces.output_of(surface_key)
+    }
+
+    /// The topmost window the user can currently see and click on: the top of
+    /// the workspace showing on the output under the pointer, or failing that
+    /// of the first output that has a window.
+    pub fn top_visible_toplevel(&self) -> Option<ClientObjectId> {
+        self.output_for_new_window()
+            .and_then(|output_id| self.workspaces.active(output_id))
+            .and_then(Workspace::top)
+            .or_else(|| {
+                self.outputs
+                    .iter()
+                    .filter_map(|o| self.workspaces.active(o.id))
+                    .find_map(Workspace::top)
+            })
+    }
+
+    /// Put a newly mapped window on the workspace showing on an output, at
+    /// that workspace's next cascade position.
     ///
     /// The window has no buffer yet, so its size is unknown here; the cascade
     /// only has to stay clear of the output's far edges, and
     /// [`Self::confine_toplevels`] pulls the window fully on-screen once its
     /// size is known.
-    fn place_toplevel(&mut self, surface_key: ClientObjectId, output_id: OutputId) {
-        const CASCADE_START: i32 = 50;
-        const CASCADE_STEP: i32 = 50;
-
+    ///
+    /// Returns false if the output has no workspace to put it on, which means
+    /// the compositor has not seen that output.
+    fn place_toplevel(&mut self, surface_key: ClientObjectId, output_id: OutputId) -> bool {
         let Some(output) = self.outputs.iter().find(|o| o.id == output_id) else {
-            return;
+            return false;
         };
         let (origin_x, origin_y) = (output.geometry.x, output.geometry.y);
         let (limit_x, limit_y) = (
@@ -797,23 +834,29 @@ impl CompositorState {
             output.geometry.physical_height / 2,
         );
 
-        let slot = self
-            .next_toplevel_position
-            .entry(output_id)
-            .or_insert((CASCADE_START, CASCADE_START));
-        let (local_x, local_y) = *slot;
-        // Restart rather than marching off the far side of the output.
-        let (local_x, local_y) = if local_x >= limit_x || local_y >= limit_y {
-            (CASCADE_START, CASCADE_START)
-        } else {
-            (local_x, local_y)
+        let Some(workspace) = self.workspaces.active_mut(output_id) else {
+            return false;
         };
-        *slot = (local_x + CASCADE_STEP, local_y + CASCADE_STEP);
+        let (local_x, local_y) = workspace.next_cascade_slot(limit_x, limit_y);
+        workspace.raise(surface_key);
 
         if let Some(surface) = self.surfaces.get_mut(&surface_key) {
-            surface.output = Some(output_id);
             surface.position = (origin_x + local_x, origin_y + local_y);
         }
+        true
+    }
+
+    /// Move a window to the workspace showing on another output, taking it off
+    /// the one it was on. Returns true if it ended up somewhere new.
+    pub fn move_toplevel_to_output(
+        &mut self,
+        surface_key: ClientObjectId,
+        output_id: OutputId,
+    ) -> bool {
+        if self.workspaces.output_of(surface_key) == Some(output_id) {
+            return false;
+        }
+        self.workspaces.place(output_id, surface_key)
     }
 
     /// Keep every window on an output that exists, and wholly inside it.
@@ -825,25 +868,24 @@ impl CompositorState {
     ///
     /// Returns true if anything moved.
     pub fn confine_toplevels(&mut self) -> bool {
-        if self.outputs.is_empty() {
-            return false;
+        // Outputs come and go without the workspaces hearing about it, so they
+        // are reconciled here too: a new output gets its workspace, and the
+        // windows of one that has gone come back as unplaced.
+        let mut moved = self.sync_workspaces();
+
+        for key in self.workspaces.take_unplaced() {
+            let placed = self
+                .output_for_new_window()
+                .is_some_and(|output_id| self.place_toplevel(key, output_id));
+            if placed {
+                moved = true;
+            } else {
+                // Still nowhere to put it: hold it until an output turns up.
+                self.workspaces.hold_unplaced(key);
+            }
         }
 
-        let mut moved = false;
-        for key in self.surface_stack.clone() {
-            let current = self.surfaces.get(&key).and_then(|s| s.output);
-            let known = current.is_some_and(|id| self.outputs.iter().any(|o| o.id == id));
-            if !known {
-                let Some(output_id) = self.output_for_new_window() else {
-                    continue;
-                };
-                self.place_toplevel(key, output_id);
-                moved = true;
-            }
-
-            let Some(output_id) = self.surfaces.get(&key).and_then(|s| s.output) else {
-                continue;
-            };
+        for (output_id, key) in self.workspaces.windows().collect::<Vec<_>>() {
             let (width, height) = self.surface_size(key);
             let Some(output) = self.outputs.iter().find(|o| o.id == output_id) else {
                 continue;
@@ -1012,7 +1054,6 @@ impl CompositorState {
                 input_region: None,
                 buffer_scale: 1,
                 entered_outputs: HashSet::new(),
-                output: None,
                 parent: None,
                 children: Vec::new(),
                 subsurface_position: (0, 0),
@@ -1075,14 +1116,14 @@ impl CompositorState {
         xdg_surface.role = Some(XdgRole::Toplevel(toplevel_id));
         let surface_key = (client_id, xdg_surface.wl_surface_id);
 
-        // Add to top of surface stack
-        self.surface_stack.retain(|k| *k != surface_key);
-        self.surface_stack.push(surface_key);
-        // Give it an output and somewhere on that output to sit. If there are
-        // no outputs yet the window stays unplaced and `confine_toplevels`
-        // picks it up once one appears.
-        if let Some(output_id) = self.output_for_new_window() {
-            self.place_toplevel(surface_key, output_id);
+        // A window opens on top of the workspace showing on its output. If
+        // there is no output yet it is held aside, and `confine_toplevels`
+        // places it once one appears.
+        let placed = self
+            .output_for_new_window()
+            .is_some_and(|output_id| self.place_toplevel(surface_key, output_id));
+        if !placed {
+            self.workspaces.hold_unplaced(surface_key);
         }
         self.dirty = true;
     }
@@ -1093,7 +1134,7 @@ impl CompositorState {
             if let Some(xdg_surface) = self.xdg_surfaces.get(&(client_id, toplevel.xdg_surface_id))
             {
                 let surface_key = (client_id, xdg_surface.wl_surface_id);
-                self.surface_stack.retain(|k| *k != surface_key);
+                self.workspaces.remove(surface_key);
                 if self.focused_surface == Some(surface_key) {
                     self.focused_surface = None;
                 }
@@ -1207,7 +1248,7 @@ impl CompositorState {
         if self.pointer_grab.is_some_and(|g| g.surface.0 == client_id) {
             self.pointer_grab = None;
         }
-        self.surface_stack.retain(|(cid, _)| *cid != client_id);
+        self.workspaces.remove_client(client_id);
         self.buffers_pending_release
             .retain(|(cid, _)| *cid != client_id);
         // Clear focus if it pointed to a surface owned by this client

@@ -19,7 +19,9 @@ use super::protocol::state::{ClientObjectId, DefaultCursor};
 use super::protocol::wire_utils::f64_to_i32;
 use super::protocol::wl_shm::FORMAT_XRGB8888;
 use crate::shared::{OUTPUT_MODE_CURRENT, Output, PoolMapping, output_contains};
-use crate::shared::{PixelFormat, Scene, SceneElement, TextureId, TextureImage, TexturePixels};
+use crate::shared::{
+    PixelFormat, Scene, SceneElement, TextureId, TextureImage, TextureSource, UploadPixels,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -142,15 +144,13 @@ pub fn build(
         // output they are on, so everything shifts by that output's origin.
         let (origin_x, origin_y) = (output.geometry.x, output.geometry.y);
 
-        for &key in &state.surface_stack {
+        // Only the workspace showing on this output is drawn, and it holds
+        // only that output's windows. Popups and subsurfaces come along with
+        // their toplevel.
+        for &key in state.workspaces.visible_stack(output_id) {
             let Some(surface) = state.surfaces.get(&key) else {
                 continue;
             };
-            // A window belongs to exactly one output and is never drawn on
-            // another. Popups and subsurfaces come along with their toplevel.
-            if surface.output != Some(output_id) {
-                continue;
-            }
             let (x, y) = surface.position;
             push_surface_tree(state, cache, &mut elements, key, x - origin_x, y - origin_y);
         }
@@ -301,19 +301,18 @@ fn ensure_buffer_image(
     // four cannot be described to it. Repacking is the only way to draw such a
     // buffer at all; no real toolkit produces one.
     let pixels = if stride.is_multiple_of(BYTES_PER_PIXEL) {
-        TexturePixels::Mapped {
+        UploadPixels::Mapped {
             guard: state.buffer_guards.get(&key)?.clone(),
             offset,
             stride,
         }
     } else {
-        TexturePixels::Owned(repack_rows(mapping, offset, stride, row_bytes, height)?)
+        UploadPixels::Owned(repack_rows(mapping, offset, stride, row_bytes, height)?)
     };
 
     let image = Arc::new(TextureImage {
         id: TextureId::Buffer(key.0, key.1),
         serial: buffer.content_serial,
-        previous_serial,
         width: buffer.width,
         height: buffer.height,
         format: if buffer.format == FORMAT_XRGB8888 {
@@ -321,8 +320,11 @@ fn ensure_buffer_image(
         } else {
             PixelFormat::Argb8888
         },
-        pixels,
-        damage,
+        source: TextureSource::Upload {
+            pixels,
+            previous_serial,
+            damage,
+        },
     });
     cache.buffers.insert(
         key,
@@ -454,13 +456,16 @@ fn ensure_cursor_image(
     let image = Arc::new(TextureImage {
         id,
         serial: cache.next_cursor_serial,
-        // Cursor images never change once built, so there is nothing to patch.
-        previous_serial: None,
         width,
         height,
         format: PixelFormat::Argb8888,
-        pixels: TexturePixels::Owned(argb_to_bytes(&argb)),
-        damage: Vec::new(),
+        source: TextureSource::Upload {
+            pixels: UploadPixels::Owned(argb_to_bytes(&argb)),
+            // Cursor images never change once built, so there is nothing to
+            // patch and nothing to patch against.
+            previous_serial: None,
+            damage: Vec::new(),
+        },
     });
     cache.cursors.insert(id, image.clone());
     Some(image)

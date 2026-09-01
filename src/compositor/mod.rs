@@ -8,8 +8,8 @@
 //! quads per output — see [`scene`] — and publishes it to the backend, which
 //! turns it into GPU work.
 
-use crate::shared::{BackendMessage, Frame, KeyState, MouseButton, PresentedAt};
-use crate::shared::{OutputId, output_contains};
+use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState, MouseButton};
+use crate::shared::{OutputId, PresentedAt, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
 use protocol::CompositorState;
 use protocol::state::{ClientObjectId, GrabKind, ResizeEdges, region_contains};
@@ -29,6 +29,7 @@ pub mod protocol;
 pub mod scene;
 #[cfg(test)]
 mod tests;
+pub mod workspace;
 
 /// Milliseconds between frames (~60fps)
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -59,7 +60,7 @@ enum Binding {
 /// Result of a hit test: which toplevel was hit, and which specific surface
 /// (possibly a subsurface) the pointer is actually over.
 struct HitResult {
-    /// The toplevel surface key (in `surface_stack`) — used for stacking/keyboard focus.
+    /// The toplevel surface key (in its workspace's stack) — used for stacking/keyboard focus.
     toplevel: ClientObjectId,
     /// The specific surface under the pointer (could be a subsurface) — used for pointer events.
     surface: ClientObjectId,
@@ -74,10 +75,21 @@ struct HitResult {
 pub async fn run_compositor(
     mut wayland_message_receiver: Receiver<WaylandSocketMessage>,
     mut backend_message_receiver: Receiver<BackendMessage>,
+    backend_requests: tokio::sync::mpsc::Sender<BackendRequest>,
     frame_sender: watch::Sender<Frame>,
     cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
     info!("Running compositor...");
+
+    // Asked once, up front: the answer decides whether clients are offered
+    // dma-buf at all, and the backend may not be able to give it until its own
+    // display is up. Nothing waits for it — it arrives as a `BackendMessage`.
+    if backend_requests
+        .try_send(BackendRequest::ProbeDmabuf)
+        .is_err()
+    {
+        warn!("could not ask the backend about dma-buf support");
+    }
 
     let mut state = protocol::CompositorState::new();
     state.default_cursor = scene::load_default_cursor();
@@ -132,7 +144,7 @@ pub async fn run_compositor(
                             state.dirty = true;
 
                             // Focus the next surface down the stack
-                            if was_focused && let Some(&new_key) = state.surface_stack.last() {
+                            if was_focused && let Some(new_key) = state.top_visible_toplevel() {
                                 switch_focus(&mut state, new_key);
                             }
                         }
@@ -165,6 +177,31 @@ pub async fn run_compositor(
                                 wl_registry::broadcast_output_global(&mut state, global_name);
                             }
                         }
+                        // A new output arrives with no workspace, and a window
+                        // opening before it has one would have nowhere to go.
+                        state.sync_workspaces();
+                    }
+                    BackendMessage::DmabufSupport { formats, probe } => {
+                        match probe {
+                            DmabufProbe::Passed | DmabufProbe::Untested(_) => {
+                                info!(
+                                    "backend imports dma-buf: {} format(s), e.g. {}",
+                                    formats.len(),
+                                    describe_formats(formats.iter().take(4)),
+                                );
+                                debug!("dma-buf formats: {}", describe_formats(formats.iter()));
+                            }
+                            DmabufProbe::Unsupported(ref reason) => {
+                                info!("backend cannot import dma-buf: {reason}");
+                            }
+                            DmabufProbe::Failed(ref reason) => {
+                                warn!("backend dma-buf import is broken: {reason}");
+                            }
+                        }
+                        // Kept for the protocol layer to advertise from. Empty
+                        // means no `zwp_linux_dmabuf_v1` global, which is the
+                        // honest answer when nothing can be imported.
+                        state.dmabuf_formats = formats;
                     }
                     BackendMessage::Closed => {
                         info!("Backend requested shutdown");
@@ -264,8 +301,7 @@ pub async fn run_compositor(
                             && alt_held(&state)
                             && let Some(hit) = hit_test(&state, state.cursor_x, state.cursor_y)
                         {
-                            state.surface_stack.retain(|k| *k != hit.toplevel);
-                            state.surface_stack.push(hit.toplevel);
+                            state.workspaces.raise(hit.toplevel);
                             switch_focus(&mut state, hit.toplevel);
                             match button {
                                 MouseButton::Left => state.start_move_grab(hit.toplevel),
@@ -297,9 +333,8 @@ pub async fn run_compositor(
                         let cx = state.cursor_x;
                         let cy = state.cursor_y;
                         if pressed && let Some(hit) = hit_test(&state, cx, cy) && state.focused_surface != Some(hit.toplevel) {
-                            // Raise to top of stack
-                            state.surface_stack.retain(|k| *k != hit.toplevel);
-                            state.surface_stack.push(hit.toplevel);
+                            // Raise to top of its workspace
+                            state.workspaces.raise(hit.toplevel);
                             state.dirty = true;
 
                             switch_focus(&mut state, hit.toplevel);
@@ -439,7 +474,7 @@ fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
 
     // Auto-focus the top surface if nothing is focused yet
     if state.focused_surface.is_none()
-        && let Some(&top_key) = state.surface_stack.last()
+        && let Some(top_key) = state.top_visible_toplevel()
         && state.surfaces.contains_key(&top_key)
     {
         switch_focus(state, top_key);
@@ -535,8 +570,9 @@ fn update_surface_outputs(state: &mut CompositorState) {
     let mut leaves: Vec<(u32, u32, OutputId)> = Vec::new();
 
     for (&(client_id, surface_id), surface) in &state.surfaces {
-        // An unmapped surface is on no output.
-        if surface.buffer_id.is_none() {
+        // An unmapped surface is on no output, and neither is one belonging to
+        // a window on a workspace that is not showing.
+        if surface.buffer_id.is_none() || !is_visible(state, (client_id, surface_id)) {
             leaves.extend(
                 surface
                     .entered_outputs
@@ -588,6 +624,46 @@ fn update_surface_outputs(state: &mut CompositorState) {
     }
 }
 
+/// Format names and modifier counts, for a log line.
+fn describe_formats<'a>(formats: impl Iterator<Item = &'a crate::shared::DmabufFormat>) -> String {
+    formats
+        .map(|f| {
+            format!(
+                "{} ({} modifier(s))",
+                fourcc_name(f.fourcc),
+                f.modifiers.len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether a surface is part of a window the user can currently see.
+///
+/// Popups and subsurfaces have no workspace of their own, so the question is
+/// really about the toplevel they hang off: walking up to the root surface is
+/// what turns one into the other. A surface with no toplevel above it — a
+/// cursor surface, or one whose role has not been assigned yet — is in no
+/// workspace and so not visible as a window.
+fn is_visible(state: &CompositorState, key: ClientObjectId) -> bool {
+    state.workspaces.is_visible(root_surface(state, key))
+}
+
+/// Walk up the parent chain to the surface at the root of the tree.
+fn root_surface(state: &CompositorState, key: ClientObjectId) -> ClientObjectId {
+    let (client_id, mut current) = key;
+    // Bounded by the number of surfaces: the parent links form a tree, and
+    // `wl_subcompositor` rejects a cycle when the link is made.
+    while let Some(parent) = state
+        .surfaces
+        .get(&(client_id, current))
+        .and_then(|s| s.parent)
+    {
+        current = parent;
+    }
+    (client_id, current)
+}
+
 /// The client's `wl_output` object ids that refer to a given output. A client
 /// may bind the same output more than once, and each binding is a distinct
 /// object the events have to be sent for.
@@ -618,15 +694,30 @@ fn close_focused_window(state: &mut CompositorState) {
 
 /// Move focus to the next toplevel, raising it to the top of the stack.
 ///
-/// `surface_stack` is ordered bottom to top, so taking the bottom entry and
+/// Cycling stays within one workspace — the one holding the focused window,
+/// or failing that the one showing on the output under the pointer. The other
+/// workspaces are not on screen, so tabbing into them would move focus to a
+/// window the user cannot see.
+///
+/// A workspace stack is ordered bottom to top, so taking the bottom entry and
 /// pushing it on top rotates through every window on repeated presses rather
 /// than toggling between the most recent two.
 fn cycle_focus(state: &mut CompositorState) {
-    if state.surface_stack.len() < 2 {
+    let Some(output_id) = state
+        .focused_surface
+        .and_then(|key| state.surface_output(key))
+        .or_else(|| state.output_for_new_window())
+    else {
+        return;
+    };
+    let Some(workspace) = state.workspaces.active_mut(output_id) else {
+        return;
+    };
+    if workspace.surface_stack.len() < 2 {
         return;
     }
-    let next = state.surface_stack.remove(0);
-    state.surface_stack.push(next);
+    let next = workspace.surface_stack.remove(0);
+    workspace.surface_stack.push(next);
     state.dirty = true;
     switch_focus(state, next);
 }
@@ -774,9 +865,7 @@ fn finish_buffer_releases(state: &mut CompositorState) {
 /// nothing.
 fn resize_limits(state: &CompositorState, surface: ClientObjectId) -> ((i32, i32), (i32, i32)) {
     let (display_width, display_height) = state
-        .surfaces
-        .get(&surface)
-        .and_then(|s| s.output)
+        .surface_output(surface)
         .and_then(|id| state.outputs.iter().find(|o| o.id == id))
         .map_or((i32::MAX, i32::MAX), |o| {
             (o.geometry.physical_width, o.geometry.physical_height)
@@ -821,11 +910,8 @@ fn update_grab(state: &mut CompositorState, x: f64, y: f64) -> bool {
                 .iter()
                 .find(|o| output_contains(o, f64_to_i32(x), f64_to_i32(y)))
                 .map(|o| o.id);
-            if let Some(output_id) = pointer_output
-                && let Some(surface) = state.surfaces.get_mut(&grab.surface)
-                && surface.output != Some(output_id)
-            {
-                surface.output = Some(output_id);
+            if let Some(output_id) = pointer_output {
+                state.move_toplevel_to_output(grab.surface, output_id);
             }
         }
         GrabKind::Resize {
@@ -967,13 +1053,30 @@ pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObject
     xdg_toplevel::send_activated(state, new_client, new_surface, true);
 }
 
-/// Hit-test the surface stack from top to bottom. Returns the toplevel and the
-/// specific surface (possibly a subsurface) under the pointer.
+/// Every window on screen, topmost first.
+///
+/// Only the workspace showing on each output contributes: a window on a
+/// workspace that is not displayed cannot be clicked. Windows are confined to
+/// their own output and never straddle two, so the order between outputs
+/// cannot matter — no two entries here overlap unless they share an output.
+fn visible_toplevels_top_down(state: &protocol::CompositorState) -> Vec<ClientObjectId> {
+    let mut keys: Vec<ClientObjectId> = state
+        .outputs
+        .iter()
+        .flat_map(|output| state.workspaces.visible_stack(output.id))
+        .copied()
+        .collect();
+    keys.reverse();
+    keys
+}
+
+/// Hit-test the visible windows from top to bottom. Returns the toplevel and
+/// the specific surface (possibly a subsurface) under the pointer.
 fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<HitResult> {
     let px = f64_to_i32(x);
     let py = f64_to_i32(y);
 
-    for &key in state.surface_stack.iter().rev() {
+    for key in visible_toplevels_top_down(state) {
         let Some(surface) = state.surfaces.get(&key) else {
             continue;
         };

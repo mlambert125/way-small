@@ -7,28 +7,31 @@
 //!
 //! The GL context is created and made current on the winit thread and never
 //! leaves it, which is why compositing lives here rather than in the
-//! compositor task. EGL is also what a future dmabuf import path needs, so a
-//! client-supplied GPU buffer will slot into the same renderer.
+//! compositor task. The same EGL display is what client GPU buffers are
+//! imported through — see [`super::dmabuf`] — so a dma-buf a client hands over
+//! is sampled by the same renderer, on the same thread, with no upload.
 
+use super::dmabuf::DmabufImporter;
 use super::gl_renderer::GlRenderer;
 use crate::shared::{
-    BackendMessage, ButtonState, Frame, KeyState, MouseButton, PresentedAt, Scene,
+    BackendMessage, BackendRequest, ButtonState, DmabufFormat, DmabufProbe, Frame, KeyState,
+    MouseButton, PresentedAt, Scene, fourcc_name,
 };
 use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId};
 use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
 };
-use glutin::display::{GetGlDisplay, GlDisplay};
+use glutin::display::{AsRawDisplay, GetGlDisplay, GlDisplay, RawDisplay};
 use glutin::surface::{GlSurface, Surface as GlSurfaceHandle, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -52,6 +55,10 @@ enum UserEvent {
     /// behind a slow frame collapse into one draw of the newest frame instead
     /// of a backlog of stale ones.
     FrameReady,
+    /// The compositor has asked the backend for something. Carried into the
+    /// event loop rather than handled where it arrives, because answering it
+    /// needs the GL context and that only exists on this thread.
+    Request(BackendRequest),
 }
 
 /// The window and everything bound to its GL context.
@@ -59,6 +66,10 @@ enum UserEvent {
 /// Created together in `resumed` because none of it is useful without the
 /// rest, and dropped together so the context outlives the renderer's textures.
 struct GlState {
+    /// What this driver can do with dma-bufs, worked out once when the context
+    /// was made. Stored rather than re-derived because probing costs a texture
+    /// round trip and the answer cannot change while the context lives.
+    dmabuf_support: (Vec<DmabufFormat>, DmabufProbe),
     /// The winit window
     window: Arc<Window>,
     /// The window GL surface
@@ -89,6 +100,11 @@ struct App {
     frames: watch::Receiver<Frame>,
     /// Last drawn frame, for repainting on resize
     last_frame: Option<Frame>,
+    /// A dma-buf probe that arrived before there was a GL context to answer it
+    /// with. Answered from `resumed` instead of being refused: the compositor
+    /// asks as it starts up, and a hosted backend has no context until its
+    /// window exists.
+    dmabuf_probe_pending: bool,
 }
 
 impl App {
@@ -181,6 +197,9 @@ impl App {
         // outlives the surface for the same reason as the context.
         let surface = unsafe { display.create_window_surface(&config, &surface_attributes)? };
         let context = not_current.make_current(&surface)?;
+        // Only one variant exists: glutin is built here with the EGL backend
+        // alone, which is also the only one a dma-buf can be imported through.
+        let RawDisplay::Egl(raw_display) = display.raw_display();
 
         // The compositor already paces frames on its own 16ms timer, so waiting
         // for vblank here would only stall the thread that handles input.
@@ -188,16 +207,80 @@ impl App {
             warn!("failed to disable vsync: {e}");
         }
 
+        // SAFETY: the display is the one the context above was made on, and it
+        // stays current on this thread for as long as the importer is used.
+        let importer =
+            unsafe { DmabufImporter::new(raw_display, &|symbol| display.get_proc_address(symbol)) };
+        let importer = match importer {
+            Ok(importer) => Some(importer),
+            Err(reason) => {
+                info!("dma-buf import unavailable: {reason}");
+                None
+            }
+        };
+
         // SAFETY: the context was just made current on this thread and stays
         // current for as long as the renderer lives.
-        let renderer = unsafe { GlRenderer::new(|symbol| display.get_proc_address(symbol))? };
+        let renderer =
+            unsafe { GlRenderer::new(|symbol| display.get_proc_address(symbol), importer)? };
+
+        // Ask the driver what it takes, and check that it means it. Done here,
+        // once, because it needs the context and nothing about the answer can
+        // change while that context lives.
+        let dmabuf_support = renderer.dmabuf_support();
+        report_dmabuf_support(&dmabuf_support);
 
         Ok(GlState {
+            dmabuf_support,
             window,
             surface,
             context,
             renderer,
         })
+    }
+
+    /// Answer a dma-buf probe, or remember to once there is a context.
+    fn answer_dmabuf_probe(&mut self) {
+        let Some(gl) = self.gl.as_ref() else {
+            self.dmabuf_probe_pending = true;
+            return;
+        };
+        self.dmabuf_probe_pending = false;
+        let (formats, probe) = &gl.dmabuf_support;
+        let _ = self
+            .backend_sender
+            .blocking_send(BackendMessage::DmabufSupport {
+                formats: formats.clone(),
+                probe: probe.clone(),
+            });
+    }
+}
+
+/// Log what the driver said about dma-buf, at the level the answer deserves.
+///
+/// A failed probe is a warning rather than a debug line: the extensions are
+/// there, so a client will be told dma-buf works, and it will not.
+fn report_dmabuf_support(support: &(Vec<DmabufFormat>, DmabufProbe)) {
+    let (formats, probe) = support;
+    match probe {
+        DmabufProbe::Passed => info!(
+            "dma-buf import working: {} format(s), e.g. {}",
+            formats.len(),
+            formats
+                .iter()
+                .take(4)
+                .map(|f| fourcc_name(f.fourcc))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        DmabufProbe::Unsupported(reason) => info!("dma-buf import unavailable: {reason}"),
+        DmabufProbe::Untested(reason) => info!(
+            "dma-buf import available for {} format(s) but unverified: {reason}",
+            formats.len(),
+        ),
+        DmabufProbe::Failed(reason) => {
+            warn!("dma-buf import is advertised by the driver but does not work: {reason}");
+        }
     }
 }
 
@@ -239,6 +322,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         // Report hardware capabilities
         let size = gl.window.inner_size();
+        let pending_probe = self.dmabuf_probe_pending;
         let _ = self
             .backend_sender
             .blocking_send(BackendMessage::SeatCapabilities {
@@ -274,6 +358,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         gl.window.set_cursor_visible(false);
         self.gl = Some(gl);
+
+        // A probe that arrived before there was a context to answer it with.
+        if pending_probe {
+            self.answer_dmabuf_probe();
+        }
 
         // Clear to the background so the window is not showing whatever was in
         // the buffer before the first scene arrives.
@@ -388,6 +477,7 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.exit();
             }
             UserEvent::FrameReady => self.present_pending_frames(),
+            UserEvent::Request(BackendRequest::ProbeDmabuf) => self.answer_dmabuf_probe(),
         }
     }
 }
@@ -399,6 +489,7 @@ pub fn run_winit_backend(
     cancel_token: &CancellationToken,
     ready_tx: tokio::sync::oneshot::Sender<()>,
     frame_rx: watch::Receiver<Frame>,
+    mut requests: Receiver<BackendRequest>,
 ) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_any_thread(true)
@@ -428,6 +519,21 @@ pub fn run_winit_backend(
         }
     });
 
+    // Requests are handled on the winit thread because answering them needs
+    // the GL context, so they come in as user events rather than being read
+    // where they arrive.
+    let request_proxy = proxy.clone();
+    rt.spawn(async move {
+        while let Some(request) = requests.recv().await {
+            if request_proxy
+                .send_event(UserEvent::Request(request))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let xkb_keymap = xkb::Keymap::new_from_names(
         &xkb_context,
@@ -450,6 +556,7 @@ pub fn run_winit_backend(
         xkb_state,
         frames: frame_rx,
         last_frame: None,
+        dmabuf_probe_pending: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

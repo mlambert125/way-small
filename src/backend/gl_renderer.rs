@@ -8,15 +8,19 @@
 //! Client pixels arrive as little-endian `0xAARRGGBB`, i.e. `[B, G, R, A]`.
 //! GLES has no guaranteed BGRA upload format, so the bytes go up as `RGBA`
 //! untouched and the fragment shader swizzles — no extension needed, and no
-//! second pass over the pixels on the CPU.
+//! second pass over the pixels on the CPU. A dma-buf is the exception: it is
+//! imported rather than uploaded, the driver is told the real format, and the
+//! swizzle would undo what the import got right — hence `u_swizzle`.
 
 use std::collections::HashMap;
 
 use glow::HasContext;
 use tracing::{debug, warn};
 
+use super::dmabuf::{DmabufImporter, EglImage};
 use crate::shared::{
-    BACKGROUND_COLOR, Frame, PixelFormat, Scene, TextureId, TextureImage, TextureRect,
+    BACKGROUND_COLOR, DmabufFormat, DmabufProbe, Frame, PixelFormat, Scene, TextureId,
+    TextureImage, TextureRect, TextureSource,
 };
 
 /// Vertex shader: puts one textured quad in place.
@@ -85,12 +89,15 @@ in vec2 v_texcoord;
 uniform sampler2D u_texture;
 // 1.0 when the source has no alpha channel (XRGB8888), 0.0 otherwise.
 uniform float u_ignore_alpha;
+// 1.0 for a texture uploaded as RGBA but laid out [B, G, R, A], 0.0 for an
+// imported dma-buf, which the driver already samples in the right order.
+uniform float u_swizzle;
 
 out vec4 f_color;
 
 void main() {
-    // Uploaded as RGBA but laid out [B, G, R, A], so swizzle back.
-    vec4 texel = texture(u_texture, v_texcoord).bgra;
+    vec4 sampled = texture(u_texture, v_texcoord);
+    vec4 texel = mix(sampled, sampled.bgra, u_swizzle);
     // XRGB8888's high byte is undefined; force it opaque. The colour channels
     // are already premultiplied in both cases, so nothing else changes.
     f_color = vec4(texel.rgb, mix(texel.a, 1.0, u_ignore_alpha));
@@ -105,6 +112,17 @@ const QUAD: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 struct CachedTexture {
     /// The texture
     texture: glow::Texture,
+    /// The imported `EGLImage` the texture samples, for a dma-buf.
+    ///
+    /// Kept rather than dropped after binding: the texture and the image are
+    /// siblings onto the same memory, and holding the handle is what makes the
+    /// import's lifetime something this cache decides rather than a side
+    /// effect of when a local went out of scope. `None` for an upload.
+    ///
+    /// Never read: it is held for its lifetime, and dropping it is what
+    /// releases the import.
+    #[allow(dead_code)]
+    imported: Option<EglImage>,
     /// Serial of the image last uploaded, so unchanged content is not re-sent,
     /// and so a partial update can check it is patching what it thinks it is.
     serial: u64,
@@ -151,21 +169,31 @@ pub struct GlRenderer {
     /// linker optimised out; a `None` simply makes the later set a no-op
     /// instead of an error.
     u_ignore_alpha: Option<glow::UniformLocation>,
+    /// Channel-order flag uniform, 1.0 for anything uploaded from CPU bytes.
+    u_swizzle: Option<glow::UniformLocation>,
     /// One GPU texture per `TextureId`, so a surface that has not changed
     /// costs no upload. Entries outlive the frame that created them and are
     /// pruned by `drop_unused_cached_textures`.
     textures: HashMap<TextureId, CachedTexture>,
+    /// The dma-buf import path, if this driver has one. `None` means client
+    /// GPU buffers cannot be drawn — nothing else changes.
+    dmabuf: Option<DmabufImporter>,
 }
 
 impl GlRenderer {
     /// Build the pipeline. `loader` resolves GL function pointers, and the
     /// caller must have made the context current first.
     ///
+    /// `dmabuf` is the import path for client GPU buffers, which a backend
+    /// builds from its own EGL display; `None` leaves those buffers undrawable
+    /// and everything else working.
+    ///
     /// # Safety
     /// `loader` must return valid GL entry points for the current context, and
     /// that context must stay current for as long as the renderer is used.
     pub unsafe fn new(
         loader: impl FnMut(&std::ffi::CStr) -> *const std::ffi::c_void,
+        dmabuf: Option<DmabufImporter>,
     ) -> anyhow::Result<Self> {
         let gl = unsafe { glow::Context::from_loader_function_cstr(loader) };
 
@@ -177,6 +205,7 @@ impl GlRenderer {
             let u_viewport = gl.get_uniform_location(program, "u_viewport");
             let u_src = gl.get_uniform_location(program, "u_src");
             let u_ignore_alpha = gl.get_uniform_location(program, "u_ignore_alpha");
+            let u_swizzle = gl.get_uniform_location(program, "u_swizzle");
             if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
                 gl.uniform_1_i32(Some(&loc), 0);
             }
@@ -217,9 +246,37 @@ impl GlRenderer {
                 u_viewport,
                 u_src,
                 u_ignore_alpha,
+                u_swizzle,
                 textures: HashMap::new(),
+                dmabuf,
             })
         }
+    }
+
+    /// What this renderer can do with dma-bufs: the formats it will take, and
+    /// what came of actually trying one.
+    ///
+    /// The formats are the driver's answer, not a guess, and the probe is what
+    /// separates "the extensions are there" from "importing works". A backend
+    /// reports both to the compositor, which advertises dma-buf to clients only
+    /// if there is something to advertise.
+    pub fn dmabuf_support(&self) -> (Vec<DmabufFormat>, DmabufProbe) {
+        let Some(importer) = self.dmabuf.as_ref() else {
+            return (
+                Vec::new(),
+                DmabufProbe::Unsupported("no EGL dma-buf import path on this driver".into()),
+            );
+        };
+        // SAFETY: the context is current on this thread for the life of the
+        // renderer, which is what the self-test needs to make its GL objects.
+        let probe = unsafe { importer.self_test(&self.gl) };
+        let formats = match probe {
+            // Nothing importable is worth advertising: a client that allocates
+            // against this list would only find out at commit time.
+            DmabufProbe::Failed(_) | DmabufProbe::Unsupported(_) => Vec::new(),
+            DmabufProbe::Passed | DmabufProbe::Untested(_) => importer.formats(),
+        };
+        (formats, probe)
     }
 
     /// Draw a scene into the currently bound framebuffer.
@@ -278,6 +335,8 @@ impl GlRenderer {
 
                 let ignore_alpha = f32::from(u8::from(image.format == PixelFormat::Xrgb8888));
                 gl.uniform_1_f32(self.u_ignore_alpha.as_ref(), ignore_alpha);
+                let swizzle = f32::from(u8::from(image.swizzle_bgra()));
+                gl.uniform_1_f32(self.u_swizzle.as_ref(), swizzle);
 
                 gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
             }
@@ -303,24 +362,37 @@ impl GlRenderer {
             return Some(cached.texture);
         }
 
+        // A GPU buffer is imported, not uploaded: there are no bytes here to
+        // send, and none of the damage machinery below applies — the client
+        // draws into memory this texture already samples.
+        let TextureSource::Upload {
+            previous_serial,
+            damage,
+            ..
+        } = &image.source
+        else {
+            return self.import(image);
+        };
+
         let patchable = cached.is_some_and(|cached| {
-            Some(cached.serial) == image.previous_serial
+            Some(cached.serial) == *previous_serial
                 && cached.width == image.width
                 && cached.height == image.height
-        }) && !image.damage.is_empty();
+        }) && !damage.is_empty();
 
         let gl = &self.gl;
         unsafe {
             if patchable {
                 let texture = self.textures[&image.id].texture;
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                for rect in &image.damage {
+                for rect in damage {
                     upload_region(gl, image, *rect);
                 }
                 self.textures.insert(
                     image.id,
                     CachedTexture {
                         texture,
+                        imported: None,
                         serial: image.serial,
                         width: image.width,
                         height: image.height,
@@ -391,6 +463,86 @@ impl GlRenderer {
                 image.id,
                 CachedTexture {
                     texture,
+                    imported: None,
+                    serial: image.serial,
+                    width: image.width,
+                    height: image.height,
+                },
+            );
+            Some(texture)
+        }
+    }
+
+    /// Import a client's GPU buffer and give back a texture that samples it.
+    ///
+    /// Nothing is copied and nothing is uploaded, so this costs the same for a
+    /// 4K surface as for a cursor. It happens once per buffer: a client
+    /// redrawing into memory the texture already points at changes what is
+    /// sampled without anything crossing back through here.
+    ///
+    /// A refusal is not fatal. Drivers reject buffers for reasons the
+    /// compositor cannot anticipate, and the surface simply goes undrawn — the
+    /// alternative would be tearing down a client for its driver's answer.
+    fn import(&mut self, image: &TextureImage) -> Option<glow::Texture> {
+        let dmabuf = image.dmabuf()?;
+        let Some(importer) = self.dmabuf.as_ref() else {
+            warn!("no dma-buf import path: cannot draw texture {:?}", image.id);
+            return None;
+        };
+        let egl_image = match importer.import(dmabuf) {
+            Ok(image) => image,
+            Err(e) => {
+                warn!("failed to import dma-buf for texture {:?}: {e}", image.id);
+                return None;
+            }
+        };
+
+        let gl = &self.gl;
+        // SAFETY: the context is current on this thread for as long as the
+        // renderer lives, and the image outlives the binding below because it
+        // is stored alongside the texture that samples it.
+        unsafe {
+            // The size can change under a stable id, and an imported texture's
+            // storage belongs to the image rather than to us, so there is
+            // nothing to reuse: take a fresh texture every time.
+            if let Some(old) = self.textures.remove(&image.id) {
+                gl.delete_texture(old.texture);
+            }
+            let texture = match gl.create_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("failed to create texture: {e}");
+                    return None;
+                }
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR.cast_signed(),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR.cast_signed(),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE.cast_signed(),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE.cast_signed(),
+            );
+            importer.bind_to_texture(&egl_image);
+
+            self.textures.insert(
+                image.id,
+                CachedTexture {
+                    texture,
+                    imported: Some(egl_image),
                     serial: image.serial,
                     width: image.width,
                     height: image.height,

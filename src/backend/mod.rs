@@ -11,6 +11,8 @@
 //! compositor task is not an option: a GL context is bound to one thread, and
 //! that thread is the backend's.
 
+/// Imports client GPU buffers through EGL, for the renderer to sample.
+pub mod dmabuf;
 /// Draws a `Scene` through GLES. Shared by every backend that displays
 /// anything; only the way the GL context is obtained differs between them.
 pub mod gl_renderer;

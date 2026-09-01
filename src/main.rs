@@ -7,7 +7,7 @@
 //! waits for shutdown.
 
 use crate::{
-    shared::{BackendMessage, Frame},
+    shared::{BackendMessage, BackendRequest, Frame},
     wayland_socket::WaylandSocketMessage,
 };
 use clap::{Parser, ValueEnum};
@@ -41,6 +41,49 @@ struct Args {
     /// The unix socket name/path to use for the Wayland wire protocol
     #[arg(short, long)]
     socket_path: Option<String>,
+}
+
+/// Start the chosen backend, and hand back the blocking task to join on if it
+/// runs on a thread of its own.
+///
+/// The winit backend has to own a thread: its event loop and GL context are
+/// bound to one, and both must be up before the socket is advertised — hence
+/// waiting on `ready_rx` here rather than letting the caller race it.
+async fn spawn_backend(
+    backend: Backend,
+    backend_message_tx: tokio::sync::mpsc::Sender<BackendMessage>,
+    backend_request_rx: tokio::sync::mpsc::Receiver<BackendRequest>,
+    frame_rx: watch::Receiver<Frame>,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    match backend {
+        Backend::Winit => {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::task::spawn_blocking(move || {
+                backend::winit::run_winit_backend(
+                    backend_message_tx,
+                    &cancel_token,
+                    ready_tx,
+                    frame_rx,
+                    backend_request_rx,
+                )
+            });
+            let _ = ready_rx.await;
+            Some(handle)
+        }
+        Backend::None => {
+            tokio::spawn(async move {
+                backend::null::run_null_backend(
+                    backend_message_tx,
+                    frame_rx,
+                    backend_request_rx,
+                    cancel_token,
+                )
+                .await
+            });
+            None
+        }
+    }
 }
 
 /// Main method (entry-point)
@@ -90,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
 
     let (wayland_message_tx, wayland_message_rx) = channel::<WaylandSocketMessage>(1000);
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(1000);
+    // The other direction: what the compositor asks the backend, for the
+    // questions only the thread holding the GL context can answer. Answers come
+    // back as `BackendMessage`s, so the compositor never waits on one.
+    let (backend_request_tx, backend_request_rx) = channel::<BackendRequest>(64);
     // A latest-frame slot rather than a queue: the backend only ever wants the
     // newest frame, and a frame it has not picked up yet is stale by definition.
     let (frame_tx, frame_rx) = watch::channel::<Frame>(Frame::new());
@@ -97,38 +144,22 @@ async fn main() -> anyhow::Result<()> {
 
     debug!("Spawning subsystem tasks");
 
-    let backend_handle = match backend {
-        Backend::Winit => {
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-            let handle = tokio::task::spawn_blocking({
-                let cancel_token = cancel_token.clone();
-                move || {
-                    backend::winit::run_winit_backend(
-                        backend_message_tx,
-                        &cancel_token,
-                        ready_tx,
-                        frame_rx,
-                    )
-                }
-            });
-            let _ = ready_rx.await;
-
-            unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-            Some(handle)
-        }
-        Backend::None => {
-            unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-            let cancel = cancel_token.clone();
-            tokio::spawn(async move {
-                backend::null::run_null_backend(backend_message_tx, frame_rx, cancel).await
-            });
-            None
-        }
-    };
+    let backend_handle = spawn_backend(
+        backend,
+        backend_message_tx,
+        backend_request_rx,
+        frame_rx,
+        cancel_token.clone(),
+    )
+    .await;
+    // Set once the backend is up, so a client cannot connect to a compositor
+    // that has nothing to show it.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
 
     let compositor_handle = tokio::spawn(compositor::run_compositor(
         wayland_message_rx,
         backend_message_rx,
+        backend_request_tx,
         frame_tx,
         cancel_token.clone(),
     ));

@@ -122,19 +122,26 @@ fn close_with_nothing_focused_is_a_no_op() {
     assert!(rx.try_recv().is_err());
 }
 
+/// The windows showing on the first output, bottom to top.
+fn stack(state: &CompositorState) -> Vec<ClientObjectId> {
+    state.workspaces.visible_stack(OutputId(1)).to_vec()
+}
+
 #[test]
 fn cycle_rotates_through_every_window() {
-    let mut state = CompositorState::new();
+    // Cycling works within one workspace, so the windows need an output to
+    // open on rather than being held aside as unplaced.
+    let mut state = state_with_two_outputs();
     let _rx = add_client(&mut state, 1);
     add_toplevel(&mut state, 1, 10, 11, 12);
     add_toplevel(&mut state, 1, 20, 21, 22);
     add_toplevel(&mut state, 1, 30, 31, 32);
     // create_xdg_toplevel pushes each new window on top, bottom-to-top.
-    assert_eq!(state.surface_stack, vec![(1, 10), (1, 20), (1, 30)]);
+    assert_eq!(stack(&state), vec![(1, 10), (1, 20), (1, 30)]);
 
     cycle_focus(&mut state);
     assert_eq!(state.focused_surface, Some((1, 10)));
-    assert_eq!(state.surface_stack, vec![(1, 20), (1, 30), (1, 10)]);
+    assert_eq!(stack(&state), vec![(1, 20), (1, 30), (1, 10)]);
 
     cycle_focus(&mut state);
     assert_eq!(state.focused_surface, Some((1, 20)));
@@ -145,14 +152,14 @@ fn cycle_rotates_through_every_window() {
 
 #[test]
 fn cycle_with_one_window_does_nothing() {
-    let mut state = CompositorState::new();
+    let mut state = state_with_two_outputs();
     let _rx = add_client(&mut state, 1);
     add_toplevel(&mut state, 1, 10, 11, 12);
     state.focused_surface = Some((1, 10));
 
     cycle_focus(&mut state);
 
-    assert_eq!(state.surface_stack, vec![(1, 10)]);
+    assert_eq!(stack(&state), vec![(1, 10)]);
     assert_eq!(state.focused_surface, Some((1, 10)));
 }
 
@@ -207,10 +214,10 @@ fn state_with_two_buffers() -> CompositorState {
     state.register_buffer(1, 102, 100, 256, 8, 8, 32, 0);
 
     state.create_surface(1, 200);
-    let surface = state.surfaces.get_mut(&(1, 200)).unwrap();
-    surface.buffer_id = Some(101);
-    surface.output = Some(OutputId(1));
-    state.surface_stack.push((1, 200));
+    state.surfaces.get_mut(&(1, 200)).unwrap().buffer_id = Some(101);
+    // A window is only drawn as part of the workspace showing on its output.
+    state.sync_workspaces();
+    state.move_toplevel_to_output((1, 200), OutputId(1));
     state
 }
 
@@ -289,6 +296,8 @@ fn state_with_two_outputs_sized(width: i32, height: i32) -> CompositorState {
             description: String::new(),
         });
     }
+    // An output starts life with one workspace, which is where its windows go.
+    state.sync_workspaces();
     state
 }
 
@@ -303,13 +312,33 @@ fn a_new_window_opens_on_the_output_under_the_pointer() {
     add_toplevel(&mut state, 1, 10, 11, 12);
 
     let surface = &state.surfaces[&(1, 10)];
-    assert_eq!(surface.output, Some(OutputId(2)));
+    assert_eq!(state.surface_output((1, 10)), Some(OutputId(2)));
     // Placed within that output, not at the global origin.
     assert!(
         surface.position.0 >= 100 && surface.position.0 < 200,
         "placed at {:?}, outside its own output",
         surface.position
     );
+}
+
+#[test]
+fn a_window_mapped_before_any_output_waits_for_one() {
+    let mut state = CompositorState::new();
+    let _rx = add_client(&mut state, 1);
+
+    // No output means no workspace, so there is nowhere to put it yet.
+    add_toplevel(&mut state, 1, 10, 11, 12);
+    assert_eq!(state.surface_output((1, 10)), None);
+    assert!(state.workspaces.iter().next().is_none());
+
+    // An output turns up, bringing a workspace with it, and the window is
+    // adopted on the next tick's confinement pass.
+    let outputs = state_with_two_outputs();
+    state.outputs = outputs.outputs;
+    assert!(state.confine_toplevels());
+
+    assert_eq!(state.surface_output((1, 10)), Some(OutputId(1)));
+    assert_eq!(state.workspaces.visible_stack(OutputId(1)), [(1, 10)]);
 }
 
 #[test]
@@ -341,7 +370,7 @@ fn the_cascade_restarts_rather_than_marching_off_the_output() {
         add_toplevel(&mut state, 1, 100 + i * 3, 101 + i * 3, 102 + i * 3);
     }
 
-    for key in &state.surface_stack {
+    for key in &stack(&state) {
         let position = state.surfaces[key].position;
         assert!(
             position.0 < 100 && position.1 < 100,
@@ -386,7 +415,6 @@ fn state_with_grabbable_window() -> CompositorState {
     let surface = state.surfaces.get_mut(&WINDOW).unwrap();
     surface.buffer_id = Some(13);
     surface.position = (10, 10);
-    surface.output = Some(OutputId(1));
     state
 }
 
@@ -420,7 +448,7 @@ fn dragging_a_window_onto_another_output_hands_it_over() {
     // Pointer crosses onto the second output, so the window goes with it
     // rather than straddling the two.
     update_grab(&mut state, f64::from(OUTPUT_W) + 50.0, 50.0);
-    assert_eq!(state.surfaces[&WINDOW].output, Some(OutputId(2)));
+    assert_eq!(state.surface_output(WINDOW), Some(OutputId(2)));
 }
 
 #[test]

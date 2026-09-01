@@ -11,19 +11,24 @@
 //! module depends on nothing in the crate, and everything else depends on it.
 
 pub mod buffer;
+pub mod dmabuf;
 pub mod output;
 pub mod scene;
 mod shm_guard;
 pub mod texture;
 
 pub use buffer::{BufferGuard, PoolMapping};
+pub use dmabuf::{
+    DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_XRGB8888, DmabufFormat, DmabufImage,
+    DmabufPlane, DmabufProbe, fourcc_name,
+};
 pub use output::{
     OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputGeometry, OutputId, OutputMode,
     OutputSubpixel, OutputTransform, cursor_bounds, output_contains,
 };
 pub use scene::{Frame, Scene, SceneElement};
 pub use shm_guard::patched_pages;
-pub use texture::{PixelFormat, TextureId, TextureImage, TexturePixels, TextureRect};
+pub use texture::{PixelFormat, TextureId, TextureImage, TextureRect, TextureSource, UploadPixels};
 
 /// Background color for compositor
 pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
@@ -82,6 +87,25 @@ impl PresentedAt {
             tv_nsec: ts.tv_nsec,
         }
     }
+}
+
+/// A request from the compositor to the backend.
+///
+/// The counterpart to [`BackendMessage`], and deliberately not a call: the
+/// compositor task blocks on nothing, so it asks and carries on, and the
+/// answer arrives later as a `BackendMessage` like any other backend event.
+/// Anything needing the GL context — which importing a dma-buf does — has to
+/// go this way round, because that context belongs to the backend thread and
+/// cannot be borrowed across.
+#[derive(Debug)]
+pub enum BackendRequest {
+    /// Report which dma-buf formats can be imported, having checked that
+    /// importing actually works. Answered with [`BackendMessage::DmabufSupport`].
+    ///
+    /// The backend may not be able to answer yet — a hosted backend has no GL
+    /// context until its window exists — in which case it answers as soon as
+    /// it can rather than refusing.
+    ProbeDmabuf,
 }
 
 /// A message from the backend to the compositor
@@ -162,6 +186,16 @@ pub enum BackendMessage {
         dx: f64,
         /// The change in the y axis of the scroll
         dy: f64,
+    },
+    /// What this backend can do with dma-bufs, in answer to
+    /// [`BackendRequest::ProbeDmabuf`].
+    DmabufSupport {
+        /// Formats and modifiers that can be imported. Empty when there is no
+        /// import path, which is what the compositor keys off: no formats
+        /// means nothing to advertise to clients.
+        formats: Vec<dmabuf::DmabufFormat>,
+        /// What came of actually trying it.
+        probe: dmabuf::DmabufProbe,
     },
     /// The host window has gained focus (winit only)
     FocusIn,

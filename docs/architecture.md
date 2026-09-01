@@ -26,14 +26,17 @@ src/
   main.rs            wiring: config, channels, task startup
   shared/            the vocabulary the subsystems share
     scene.rs         Frame, Scene, SceneElement
-    texture.rs       what a backend uploads
+    texture.rs       what a backend uploads or imports
     buffer.rs        client buffer memory, and its SIGBUS net
+    dmabuf.rs        client GPU buffers, described for import
     output.rs        how a backend describes displays
   wayland_socket/    the socket subsystem
   compositor/        the event loop
     scene.rs         scene building
+    workspace.rs     outputs, their workspaces, and the windows on them
     protocol/        request dispatch and all compositor state
   backend/           each backend, and the GL renderer they share
+    dmabuf.rs        importing client GPU buffers through EGL
 ```
 
 Every subsystem is a folder with a `mod.rs`, whether or not it has grown a second file yet.
@@ -234,6 +237,58 @@ it every frame.
 The drawable size comes from the backend, never from the scene.  During a resize the two disagree for a frame or two —
 the backend learns its new size before the compositor has composed for it — and the backend's answer is the correct one.
 
+#### Asking the backend a question
+
+Messages run backend to compositor.  A few questions run the other way, and `BackendRequest` is that direction: the
+compositor asks, and the answer arrives later as an ordinary `BackendMessage`.  It is deliberately not a call.  The
+compositor task blocks on nothing, and what makes these questions worth asking at all is that only the backend thread
+can answer them — anything touching the GL context has to run there, because a GL context belongs to one thread and
+cannot be borrowed across.
+
+A hosted backend may not be able to answer immediately: winit has no context until its window exists, so a request that
+arrives first is remembered and answered from `resumed`.  That shape is the point rather than an accident of startup —
+it is the same shape a client's `zwp_linux_buffer_params_v1.create` will need, where the compositor cannot say whether a
+buffer imported until the backend has tried.
+
+#### dma-buf
+
+A client that renders on the GPU has its pixels there already.  Handing them over as shm means reading them back,
+copying them through a shared mapping, and uploading them again — three trips for pixels that never needed to leave the
+card.  A dma-buf is the kernel's handle on that memory instead: the client passes a file descriptor, the backend imports
+it as a texture through `EGL_EXT_image_dma_buf_import`, and nothing is copied.
+
+A `TextureImage` is therefore a struct of what every texture has — id, size, and whether its alpha means anything —
+plus a `TextureSource` for the part that differs.  The fields that only an upload can have, `previous_serial` and
+`damage`, live inside that variant rather than beside it: an imported buffer has nothing to patch and nothing to patch
+against, and putting them at the top would mean giving them a meaningless value for half the images that exist.  The
+drawing path reads only the common fields and never asks which kind it has.
+
+The compositor never imports anything.  It knows a buffer's size, so it can lay it out in a scene, and treats the rest
+as opaque — the description travels to the backend as a `TextureSource::Dmabuf` and is imported there, on the thread
+that owns the context, exactly as the shm path already divides the work.  For the renderer this is one more source of a
+texture: a `TEXTURE_2D` bound to an imported `EGLImage` rather than one filled by `tex_image_2d`.  The `EGLImage` is
+kept alive alongside the texture that samples it, so the import's lifetime is something the texture cache decides
+rather than a side effect of a local going out of scope.
+
+Two things differ from an upload and both are in the shader.  An uploaded client buffer is `[B, G, R, A]` going up as
+`RGBA` and swizzled when sampled; an imported one is described to the driver by its real fourcc and comes back in the
+right order already, so `u_swizzle` turns the fix off for it.  Damage does not apply either: a client drawing into a
+dma-buf changes what the texture samples without anything crossing back through the compositor at all.
+
+What the driver will accept is enumerated with `EGL_EXT_image_dma_buf_import_modifiers` and filtered down to what can
+actually be drawn.  Modifiers marked `external_only` need `samplerExternalOES`, which this renderer has no program for,
+and a format left with no modifiers after that filtering is dropped entirely — on Mesa that removes every YUV layout,
+taking the list from 65 formats to 24.  A compositor that advertises what it cannot draw is worse than one that
+advertises nothing: the client allocates against the list and then has nothing to fall back to.
+
+For the same reason the format list is not taken on trust.  `EGL_MESA_image_dma_buf_export` runs the path backwards, so
+the backend can make a real dma-buf out of a texture it filled itself, import that back through the production path,
+and read the pixels out again.  That round trip runs once at startup and is the difference between "the entry points
+are there" and "importing works" — a driver can advertise the extension and still refuse every buffer.
+
+None of this is reachable by a client yet: `zwp_linux_dmabuf_v1` is not implemented, so nothing constructs a
+`TextureSource::Dmabuf`.  What exists is the path underneath it, proven end to end.
+
 #### Winit Backend
 
 The winit backend provides a backend for running the compositor inside of a normal window hosted in an existing
@@ -250,7 +305,7 @@ The DRM backend provides a backend for running the compositor on a linux system 
 is the "real" backend that allows the compositor to be used as a standalone compositor for a linux system.  It uses
 the Direct Rendering Manager (DRM) subsystem of the linux kernel to display the compositors output and capture input
 events using the evdev and libinput libraries.  Its GL context comes from EGL on a gbm device rather than from a host
-window, which is the same EGL that `linux-dmabuf` import needs; the renderer above it is unchanged.
+window, which is the same EGL the dma-buf import path above needs; the renderer above it is unchanged.
 
 #### Null Backend
 
@@ -272,7 +327,7 @@ and compose and display output frames to the backend. This includes things like:
 
 - A list of outputs (monitors) that the compositor is currently displaying on.
 - A list of input devices that the compositor is currently capturing input from.
-- A list of windows that the compositor is currently managing, including their position, size, and other metadata.
+- The workspaces of each output, and the windows on each workspace, including their position, size, and other metadata.
 - A list of surfaces that the compositor is currently managing, including their position, size, and other metadata.
 - A list of shared memory buffers that the compositor is currently managing, including their file descriptors, size, and other metadata.
 
@@ -353,23 +408,36 @@ The constraint is the union of the outputs, not their bounding box. Two outputs 
 a notch belonging to no display, and a pointer parked there would be exactly as lost. A position off every output snaps
 to the nearest point of the nearest one.
 
-#### Windows and outputs
+#### Outputs, workspaces and windows
 
-An `xdg_toplevel` belongs to exactly one output and is confined to it. There is no support for a window straddling two,
-and the model is deliberately simple: the window records which output it is on, and popups and subsurfaces hang off a
-toplevel and inherit that along with its position.
+The three nest: an output owns one or more workspaces, and a workspace owns the toplevel windows shown together on it.
+Exactly one workspace per output is on screen at a time, so the windows of the others keep their positions and stacking
+order in state while being drawn nowhere and hit-testable by nothing.
 
-A window opens on the output under the pointer, or on the first output if the pointer is not over one. Placement
-cascades from the top-left, per output, restarting rather than marching off the far edge. Positions are stored globally —
-so input hit-testing, subsurface trees and `wl_surface.enter` all keep working in one coordinate space — but the scene
-for an output contains only that output's windows, drawn relative to its origin. That is what stops every output showing
-the same top-left corner of the desktop.
+Every output gets one workspace when it appears, and nothing yet creates a second — there is no hotkey to add, remove or
+switch one. The collection is a `Vec` per output rather than a single field so that when there is, it is a question of
+policy rather than another change of shape.
 
-Windows are re-confined every tick, which covers a client resizing itself out of bounds, an output changing size, and a
-window whose output has gone away being re-homed. A window larger than its output is pinned to the top-left, since no
-position fits and the top-left is the part worth showing.
+An `xdg_toplevel` lives in exactly one workspace, and that membership is the only record of which output it is on:
+the workspace holding it belongs to one output, so there is nowhere for a second, disagreeing answer to be stored. A
+window is confined to that output and never straddles two; popups and subsurfaces hang off a toplevel and travel with
+it. Windows mapped while there is no output at all — the compositor hears about outputs from the backend, and a client
+could in principle map a window first — are held aside as unplaced and re-homed as soon as one appears.
 
-Stacking, focus and alt-tab remain global: one stack across all outputs, so cycling focus moves between them.
+A window opens on the workspace showing on the output under the pointer, or on the first output if the pointer is not
+over one. Placement cascades from the top-left, per workspace, restarting rather than marching off the far edge.
+Positions are stored globally — so input hit-testing, subsurface trees and `wl_surface.enter` all keep working in one
+coordinate space — but the scene for an output contains only the windows of the workspace it is showing, drawn relative
+to its origin. That is what stops every output showing the same top-left corner of the desktop.
+
+Windows are re-confined every tick, which covers a client resizing itself out of bounds, an output changing size, and an
+output being unplugged: its workspaces go with it and their windows come back as unplaced, to be re-homed on the same
+pass. A window larger than its output is pinned to the top-left, since no position fits and the top-left is the part
+worth showing.
+
+Stacking and focus follow the hierarchy rather than spanning it: each workspace has its own stack, and alt-tab cycles
+within one — the workspace holding the focused window, or the one showing under the pointer. Tabbing into another
+workspace would move focus to a window that is not on screen.
 
 #### Interactive move and resize
 
@@ -411,8 +479,8 @@ toplevel state to hang it off. A negative limit is refused with `invalid_size` r
 every later resize. A minimum above the current maximum is *not* an error: the two arrive in separate requests, so a
 client raising both would momentarily look inconsistent through no fault of its own.
 
-Dragging a window towards another output hands it over rather than letting it straddle: the window follows the pointer's
-output, and the tick's confinement then pulls it wholly inside the new one.
+Dragging a window towards another output hands it over rather than letting it straddle: the window moves to the
+workspace showing on the pointer's output, and the tick's confinement then pulls it wholly inside the new one.
 
 The same grabs are available without the client's cooperation, which is the only way to move a window whose decorations
 offer no handle: Alt+left-drag moves, and Alt+right-drag resizes from whichever corner of the window the pointer is
