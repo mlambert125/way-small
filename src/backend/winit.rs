@@ -185,9 +185,10 @@ impl App {
             // had no area. The scene is dealt with either way, and a backend
             // that went quiet here would strand every client waiting on a
             // frame callback.
-            let _ = self
-                .backend_sender
-                .try_send(BackendMessage::FramePresented(output_id, PresentedAt::now()));
+            let _ = self.backend_sender.try_send(BackendMessage::FramePresented(
+                output_id,
+                PresentedAt::now(),
+            ));
             // And the pacing: this output can take another frame once the host
             // says it is time to draw again. Asking only after presenting is
             // what bounds the compositor to one frame in flight per output.
@@ -495,8 +496,19 @@ impl ApplicationHandler<UserEvent> for App {
                     let mods_latched = self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED);
                     let mods_locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
                     let mods_group = self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+                    let raw_xkb_keycode = xkb_keycode.raw();
+
+                    /*
+                    info!("KEY_EVENT");
+                    info!("  KEYCODE: {raw_xkb_keycode}");
+                    info!("  MODS_DEPRESSED: {mods_depressed}");
+                    info!("  MODS_LATCHED: {mods_latched}");
+                    info!("  MODS_LOCKED: {mods_locked}");
+                    info!("  MODS_GROUP: {mods_group}");
+                    */
+
                     let _ = self.backend_sender.blocking_send(BackendMessage::KeyInput {
-                        keycode: xkb_keycode.raw(),
+                        keycode: raw_xkb_keycode,
                         state: key_state,
                         mods_depressed,
                         mods_latched,
