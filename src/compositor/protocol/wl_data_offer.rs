@@ -35,8 +35,6 @@ pub fn handle(
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }
         }
-        op => {
-            tracing::warn!("wl_data_offer: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_data_offer"),
     }
 }

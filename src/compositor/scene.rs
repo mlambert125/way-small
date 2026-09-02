@@ -15,10 +15,10 @@
 //! against it.
 
 use super::protocol::CompositorState;
-use super::protocol::state::{ClientObjectId, DefaultCursor};
+use super::protocol::state::{Buffer, BufferKind, ClientObjectId, DefaultCursor};
 use super::protocol::wire_utils::f64_to_i32;
 use super::protocol::wl_shm::FORMAT_XRGB8888;
-use crate::shared::{OUTPUT_MODE_CURRENT, Output, PoolMapping, output_contains};
+use crate::shared::{OUTPUT_MODE_CURRENT, Output, PoolMapping, output_contains, pixel_format};
 use crate::shared::{
     PixelFormat, Scene, SceneElement, TextureId, TextureImage, TextureSource, UploadPixels,
 };
@@ -124,13 +124,14 @@ impl SceneCache {
     /// reaped against live state rather than by explicit removal.
     pub fn gc(&mut self, state: &CompositorState) {
         self.buffers
-            .retain(|key, _| state.shm_buffers.contains_key(key));
+            .retain(|key, _| state.buffers.contains_key(key));
     }
 }
 
 /// Build the scene for one output.
 pub fn build(
     output_id: crate::shared::OutputId,
+    serial: u64,
     state: &CompositorState,
     cache: &mut SceneCache,
 ) -> Scene {
@@ -160,6 +161,7 @@ pub fn build(
 
     Scene {
         output_id,
+        serial,
         elements,
     }
 }
@@ -201,8 +203,8 @@ fn push_surface_tree(
             cache,
             elements,
             child_key,
-            offset_x + cx,
-            offset_y + cy,
+            offset_x.saturating_add(cx),
+            offset_y.saturating_add(cy),
         );
     }
 }
@@ -229,7 +231,7 @@ fn push_surface(
     let Some(mapping) = state.surface_buffer_mapping(surface_key) else {
         return;
     };
-    let Some(texture) = ensure_buffer_image(state, cache, (surface.client_id, buffer_id)) else {
+    let Some(texture) = ensure_image(state, cache, (surface.client_id, buffer_id)) else {
         return;
     };
 
@@ -238,6 +240,46 @@ fn push_surface(
         src: mapping.src,
         dst: (offset_x, offset_y, mapping.dest_width, mapping.dest_height),
     });
+}
+
+/// Build the texture for a client buffer, however its memory is held.
+///
+/// The one place the two kinds of buffer part company: an upload has to be
+/// read, bounds-checked and diffed against what the backend already has, while
+/// an imported one is handed over as a description and sampled where it lies.
+fn ensure_image(
+    state: &CompositorState,
+    cache: &mut SceneCache,
+    key: ClientObjectId,
+) -> Option<Arc<TextureImage>> {
+    match &state.buffers.get(&key)?.kind {
+        BufferKind::Shm(_) => ensure_buffer_image(state, cache, key),
+        BufferKind::Dmabuf(image) => Some(imported_image(key, state.buffers.get(&key)?, image)),
+        // Described, accepted, and then refused by the driver. It draws
+        // nothing rather than taking the client down for its driver's answer.
+        BufferKind::Failed => None,
+    }
+}
+
+/// Describe an already-imported buffer to the backend.
+///
+/// Nothing is read and nothing is cached: the texture the backend builds from
+/// this samples the client's own memory, so a client drawing into it changes
+/// what is on screen without anything passing through here. That is also why
+/// the serial never moves — see [`crate::compositor::protocol::state::Buffer`].
+fn imported_image(
+    key: ClientObjectId,
+    buffer: &Buffer,
+    image: &Arc<crate::shared::DmabufImage>,
+) -> Arc<TextureImage> {
+    Arc::new(TextureImage {
+        id: TextureId::Buffer(key.0, key.1),
+        serial: buffer.content_serial,
+        width: buffer.width,
+        height: buffer.height,
+        format: pixel_format(image.fourcc),
+        source: TextureSource::Dmabuf(image.clone()),
+    })
 }
 
 /// Build the texture for a client buffer, borrowing the client's mapping.
@@ -251,11 +293,14 @@ fn ensure_buffer_image(
     cache: &mut SceneCache,
     key: ClientObjectId,
 ) -> Option<Arc<TextureImage>> {
-    let buffer = state.shm_buffers.get(&key)?;
+    let buffer = state.buffers.get(&key)?;
+    // Only an upload comes through here. A dma-buf is imported instead, and
+    // none of the mapping, stride or damage reasoning below applies to it.
+    let shm = buffer.shm()?;
     if buffer.width <= 0 || buffer.height <= 0 {
         return None;
     }
-    let pool = state.shm_pools.get(&(key.0, buffer.pool_id))?;
+    let pool = state.shm_pools.get(&(key.0, shm.pool_id))?;
     let Some(mapping) = pool.mapping.as_ref() else {
         debug!("Pool has no valid mapping for buffer {key:?}");
         return None;
@@ -263,8 +308,8 @@ fn ensure_buffer_image(
 
     let width = buffer.width.unsigned_abs() as usize;
     let height = buffer.height.unsigned_abs() as usize;
-    let stride = buffer.stride.unsigned_abs() as usize;
-    let offset = buffer.offset.unsigned_abs() as usize;
+    let stride = shm.stride.unsigned_abs() as usize;
+    let offset = shm.offset.unsigned_abs() as usize;
     let row_bytes = width * BYTES_PER_PIXEL;
     if stride < row_bytes {
         debug!("Buffer stride {stride} is shorter than its rows for {key:?}");
@@ -291,7 +336,7 @@ fn ensure_buffer_image(
     let unchanged = previous.is_some_and(|p| p.serial == buffer.content_serial);
     let damage = match previous {
         Some(p) if !unchanged && p.width == buffer.width && p.height == buffer.height => {
-            buffer.damage.clone().unwrap_or_default()
+            shm.damage.clone().unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -315,7 +360,7 @@ fn ensure_buffer_image(
         serial: buffer.content_serial,
         width: buffer.width,
         height: buffer.height,
-        format: if buffer.format == FORMAT_XRGB8888 {
+        format: if shm.format == FORMAT_XRGB8888 {
             PixelFormat::Xrgb8888
         } else {
             PixelFormat::Argb8888

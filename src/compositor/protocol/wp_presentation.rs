@@ -30,9 +30,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             }
         }
         FEEDBACK => handle_feedback(state, msg),
-        op => {
-            tracing::warn!("wp_presentation: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wp_presentation"),
     }
 }
 
@@ -43,6 +41,7 @@ fn handle_feedback(state: &mut CompositorState, msg: &WaylandProtocolMessageWith
     };
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(surface_id), Some(callback_id)) = (args.u32(), args.new_id()) else {
+        super::malformed_request(state, msg, "wp_presentation");
         return;
     };
 

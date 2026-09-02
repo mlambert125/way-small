@@ -1,15 +1,13 @@
 //! `wl_callback` protocol handler.
 //!
 //! Callbacks are one-shot objects created by the compositor (e.g. for
-//! `wl_display.sync` or `wl_surface.frame).` Clients should never send
-//! requests to them — any request is a protocol error.
+//! `wl_display.sync` or `wl_surface.frame).` The interface has no requests at
+//! all, so anything arriving here is a protocol error.
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-pub fn handle(msg: &WaylandProtocolMessageWithClientInfo) {
-    tracing::warn!(
-        "client {}: unexpected request on wl_callback id={}",
-        msg.client_id,
-        msg.message.object_id,
-    );
+use super::state::CompositorState;
+
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    super::unknown_request(state, msg, "wl_callback");
 }

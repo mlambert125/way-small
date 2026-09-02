@@ -18,6 +18,14 @@ const SET_ANCHOR: u16 = 3;
 const SET_GRAVITY: u16 = 4;
 const SET_CONSTRAINT_ADJUSTMENT: u16 = 5;
 const SET_OFFSET: u16 = 6;
+// Since version 3. Advertised — xdg_wm_base goes out at version 5 — so they
+// must be in the match even though nothing acts on them yet; an opcode a
+// client is entitled to send has to be told apart from one that does not
+// exist. Popups here are positioned once and not repositioned, so a reactive
+// popup simply stays where it was put.
+const SET_REACTIVE: u16 = 7;
+const SET_PARENT_SIZE: u16 = 8;
+const SET_PARENT_CONFIGURE: u16 = 9;
 
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
@@ -28,9 +36,10 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         SET_GRAVITY => handle_set_gravity(state, msg),
         SET_CONSTRAINT_ADJUSTMENT => handle_set_constraint_adjustment(state, msg),
         SET_OFFSET => handle_set_offset(state, msg),
-        op => {
-            tracing::warn!("xdg_positioner: unhandled opcode {}", op);
+        SET_REACTIVE | SET_PARENT_SIZE | SET_PARENT_CONFIGURE => {
+            // Accepted but not acted upon yet
         }
+        _ => super::unknown_request(state, msg, "xdg_positioner"),
     }
 }
 
@@ -47,6 +56,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 fn handle_set_size(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(width), Some(height)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;
@@ -60,6 +70,7 @@ fn handle_set_anchor_rect(state: &mut CompositorState, msg: &WaylandProtocolMess
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(x), Some(y), Some(w), Some(h)) = (args.i32(), args.i32(), args.i32(), args.i32())
     else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;
@@ -71,6 +82,7 @@ fn handle_set_anchor_rect(state: &mut CompositorState, msg: &WaylandProtocolMess
 fn handle_set_anchor(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(anchor) = args.u32() else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;
@@ -82,6 +94,7 @@ fn handle_set_anchor(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
 fn handle_set_gravity(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(gravity) = args.u32() else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;
@@ -97,6 +110,7 @@ fn handle_set_constraint_adjustment(
 ) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(adjustment) = args.u32() else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;
@@ -109,6 +123,7 @@ fn handle_set_constraint_adjustment(
 fn handle_set_offset(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(x), Some(y)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "xdg_positioner");
         return;
     };
     let id = msg.message.object_id;

@@ -11,6 +11,9 @@ use super::ObjectType;
 use super::state::CompositorState;
 use super::wire_utils::ArgReader;
 
+#[cfg(test)]
+mod tests;
+
 // Request opcodes
 const DESTROY: u16 = 0;
 const GET_SUBSURFACE: u16 = 1;
@@ -25,9 +28,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             }
         }
         GET_SUBSURFACE => handle_get_subsurface(state, msg),
-        op => {
-            tracing::warn!("wl_subcompositor: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_subcompositor"),
     }
 }
 
@@ -69,6 +70,27 @@ fn handle_get_subsurface(state: &mut CompositorState, msg: &WaylandProtocolMessa
         subsurface_id, surface_id, parent_id
     );
 
+    // A surface may not end up its own ancestor. The tree is walked to find a
+    // surface's global position and recursed to hit-test and compose it, so a
+    // cycle is not a wrong answer but a hang or a blown stack — and it takes
+    // every other client with it. Two requests is all it costs a client to
+    // build one, so the check is here rather than left to the walkers.
+    if is_ancestor(state, client_id, surface_id, parent_id) {
+        if let Some(client) = state.clients.get(client_id) {
+            // wl_subcompositor.error.bad_parent = 1
+            client.send_error(
+                msg.message.object_id,
+                1,
+                "wl_subcompositor.get_subsurface: parent is a descendant of the surface",
+            );
+        }
+        return;
+    }
+
+    let Some(client) = state.clients.get(client_id) else {
+        return;
+    };
+
     // Register before touching any surface state: a rejected id must not leave
     // a half-built parent-child relationship behind.
     if client
@@ -90,4 +112,29 @@ fn handle_get_subsurface(state: &mut CompositorState, msg: &WaylandProtocolMessa
     state
         .subsurface_map
         .insert((client_id, subsurface_id), surface_id);
+}
+
+/// Whether `surface_id` is `candidate_id` or one of its ancestors.
+///
+/// Bounded by the parent chain, which is acyclic precisely because this runs
+/// before every link is added.
+fn is_ancestor(
+    state: &CompositorState,
+    client_id: u32,
+    surface_id: u32,
+    candidate_id: u32,
+) -> bool {
+    let mut current = candidate_id;
+    loop {
+        if current == surface_id {
+            return true;
+        }
+        let Some(surface) = state.surfaces.get(&(client_id, current)) else {
+            return false;
+        };
+        let Some(parent) = surface.parent else {
+            return false;
+        };
+        current = parent;
+    }
 }

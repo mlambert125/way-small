@@ -20,9 +20,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
     match msg.message.op_code {
         CREATE_DATA_SOURCE => handle_create_data_source(state, msg),
         GET_DATA_DEVICE => handle_get_data_device(state, msg),
-        op => {
-            tracing::warn!("wl_data_device_manager: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_data_device_manager"),
     }
 }
 

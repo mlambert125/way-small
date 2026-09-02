@@ -42,9 +42,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
                 client.unregister(keyboard_id);
             }
         }
-        op => {
-            tracing::warn!("wl_keyboard: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_keyboard"),
     }
 }
 

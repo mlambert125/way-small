@@ -25,6 +25,9 @@ use tracing::{debug, info};
 /// The atomic client ID counter, assigned as clients connect
 static NEXT_CLIENT_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Maximum number of pending clients on the unix socket
+const SOCKET_CLIENT_BACKLOG: u32 = 1024;
+
 /// Size of the ancillary buffer used when receiving file descriptors.
 const MAX_FDS_IN: usize = 28;
 
@@ -91,7 +94,7 @@ pub async fn run_wayland_socket(
     let socket = UnixSocket::new_stream()?;
     socket.bind(&socket_path)?;
 
-    let listener = socket.listen(1024)?;
+    let listener = socket.listen(SOCKET_CLIENT_BACKLOG)?;
 
     debug!("Wayland socket listening on {}", socket_path);
 
@@ -124,9 +127,11 @@ pub async fn run_wayland_socket(
         }
     }
 
+    debug!("Waiting for client socket threads to terminate");
     for handle in client_handles {
         let _ = handle.await;
     }
+
     info!("Wayland socket shutting down...");
     if let Err(e) = std::fs::remove_file(&socket_path) {
         debug!("Failed to remove socket file: {}", e);
@@ -150,8 +155,6 @@ fn handle_client(
         let (socket_send_tx, socket_send_rx) =
             channel::<WaylandProtocolMessage>(CLIENT_SEND_QUEUE_LIMIT);
 
-        // A child of the global token: cancelled by shutdown, but also
-        // cancellable on its own so the compositor can drop this client alone.
         let cancel_token = cancel_token.child_token();
 
         compositor_message_channel
@@ -197,7 +200,7 @@ fn handle_client(
                                     debug!("Error waiting for writable: {}", e);
                                     return;
                                 }
-                                let fds_to_send = if fds_sent { &[][..] } else { &raw_fds[..] };
+                                let fds_to_send = if fds_sent { &[] } else { &raw_fds[..] };
                                 match sender_stream.try_io(tokio::io::Interest::WRITABLE, || {
                                     sender_stream.send_with_fd(&buffer[bytes_sent..], fds_to_send)
                                 }) {
@@ -265,8 +268,6 @@ fn handle_client(
                             // the recvmsg, but way-small never forks, so there is
                             // no window for it to leak into a child.
                             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-                            // The kernel just handed us these descriptors, so this
-                            // is the point ownership transfers to us.
                             pending_fds.push_back(unsafe { OwnedFd::from_raw_fd(fd) });
                         }
                         if pending_fds.len() > MAX_PENDING_FDS {
@@ -275,7 +276,7 @@ fn handle_client(
                                 pending_fds.len(),
                                 MAX_PENDING_FDS,
                             );
-                            // Dropping the queued `OwnedFd`s closes them.
+                            // Close all of the fds and exit
                             pending_fds.clear();
                             drop(pending_fds);
                             cancel_token.cancel();
@@ -324,9 +325,11 @@ fn handle_client(
                             object_id,
                             op_code,
                             args: args_buffer,
-                            fds: vec![], // FDs are not included in the message struct, they are
-                                         // read separately and accessed via the pending_fds queue
-                                         // in the WaylandNewClientMessage
+                            // FDs are not included in incoming messages, they have to be read
+                            // from the pending_queue (we can't know what FDs belong to
+                            // what message without looking at the message and registry
+                            // and those are owned/managed by the compositor thread.)
+                            fds: vec![],
                         };
 
                         if let Err(e) = compositor_message_channel

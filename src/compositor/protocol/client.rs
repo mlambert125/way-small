@@ -13,6 +13,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tokio_util::sync::CancellationToken;
 
+/// The first object id the compositor may hand out.
+///
+/// Wayland splits the id space: a client allocates from below this line and the
+/// compositor from above it, so neither has to ask the other what is free. The
+/// halves are why `wl_display.delete_id` exists only for the client's own ids —
+/// the compositor recycles its own without telling anyone.
+pub const SERVER_ID_BASE: u32 = 0xff00_0000;
+
+/// Whether an object id belongs to the compositor's half of the id space.
+pub fn is_server_id(id: u32) -> bool {
+    id >= SERVER_ID_BASE
+}
+
 /// State specific to an individual wayland client
 pub struct ClientState {
     /// Maps object id -> object type/state for every object this client has created.
@@ -26,6 +39,8 @@ pub struct ClientState {
     /// Cancels this client's socket tasks. Triggered when the client stops
     /// draining its socket and its outgoing queue overflows.
     pub cancel_token: CancellationToken,
+    /// Next id to hand out from the compositor's half of the id space.
+    next_server_id: u32,
 }
 
 impl ClientState {
@@ -45,6 +60,7 @@ impl ClientState {
             sender,
             fd_queue,
             cancel_token,
+            next_server_id: SERVER_ID_BASE,
         }
     }
 
@@ -69,11 +85,28 @@ impl ClientState {
             tracing::warn!("Client reused live object id {}, disconnecting it", id);
             // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
             self.send_error(id, 0, &format!("object id {id} is already in use"));
-            self.cancel_token.cancel();
             return Err(());
         }
         self.objects.insert(id, object_type);
         Ok(())
+    }
+
+    /// Take the next id from the compositor's half of the id space and
+    /// register an object under it.
+    ///
+    /// Used where the protocol has the compositor name an object rather than
+    /// the client — `zwp_linux_buffer_params_v1.created` carries a `wl_buffer`
+    /// the compositor allocates. `None` once the half is exhausted, which takes
+    /// sixteen million objects on one connection and is a client with a leak.
+    pub fn allocate_id(&mut self, object_type: ObjectType) -> Option<u32> {
+        let id = self.next_server_id;
+        if id == u32::MAX {
+            tracing::warn!("client has exhausted the server id space");
+            return None;
+        }
+        self.next_server_id += 1;
+        self.objects.insert(id, object_type);
+        Some(id)
     }
 
     /// Registers a new wayland object with wayland protocol version information
@@ -98,7 +131,13 @@ impl ClientState {
     pub fn unregister(&mut self, id: u32) {
         self.objects.remove(&id);
         self.object_versions.remove(&id);
-        // Notify the client so it can recycle this object id.
+        // Only the client's own ids are announced: it allocates those, so only
+        // it needs telling one is free again. An id from the compositor's half
+        // is the compositor's to recycle, and announcing it would invite the
+        // client to reuse an id it never owned.
+        if is_server_id(id) {
+            return;
+        }
         let args = ArgWriter::new().u32(id).build();
         let _ = self.send(message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args));
     }
@@ -135,7 +174,25 @@ impl ClientState {
         }
     }
 
-    /// Send a `wl_display.error` to this client.
+    /// Send a `wl_display.error` to this client and disconnect it.
+    ///
+    /// There is no other kind. `wl_display.error` is fatal by definition — the
+    /// spec has the client disconnect on receiving one, and libwayland
+    /// destroys the connection as it posts it — so the disconnect belongs here
+    /// rather than at each call site, where it was previously remembered about
+    /// four times in thirty-odd. An error the compositor sent and then carried
+    /// on from is the worst of both: the client is entitled to consider the
+    /// connection dead, while the compositor keeps state for it and keeps
+    /// answering requests it may still have in flight.
+    ///
+    /// A condition the client can recover from is not this. Those are
+    /// interface-specific events — `zwp_linux_buffer_params_v1.failed` is one
+    /// — and go out as ordinary messages.
+    ///
+    /// Cancelling stops this client's socket tasks; the read task then reports
+    /// the disconnect, and the client's resources are cleaned up through the
+    /// same path any other disconnect takes. Callers only need to stop what
+    /// they were doing.
     pub fn send_error(&self, object_id: u32, code: u32, msg: &str) {
         let args = ArgWriter::new()
             .u32(object_id)
@@ -143,6 +200,7 @@ impl ClientState {
             .string(msg)
             .build();
         let _ = self.send(message(wl_display::OBJECT_ID, wl_display::ERROR, args));
+        self.cancel_token.cancel();
     }
 }
 

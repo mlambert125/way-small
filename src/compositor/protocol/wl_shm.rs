@@ -32,9 +32,7 @@ pub fn handle(
 ) {
     match msg.message.op_code {
         CREATE_POOL => handle_create_pool(state, msg, fds),
-        op => {
-            tracing::warn!("wl_shm: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_shm"),
     }
 }
 

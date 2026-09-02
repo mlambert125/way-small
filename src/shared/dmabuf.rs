@@ -32,6 +32,10 @@ pub const DRM_FORMAT_ARGB8888: u32 = fourcc(*b"AR24");
 /// undefined and the image treated as opaque.
 pub const DRM_FORMAT_XRGB8888: u32 = fourcc(*b"XR24");
 
+/// The modifier meaning "no modifier": a plain linear layout, where a row is
+/// `stride` bytes after the one above it and the extent can be worked out from
+/// the outside.
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// The modifier meaning "unspecified".
 ///
 /// Not a layout at all but the absence of a claim about one: the buffer's real
@@ -64,6 +68,20 @@ pub fn fourcc_name(code: u32) -> String {
             }
         })
         .collect()
+}
+
+/// How a fourcc's pixels should be blended.
+///
+/// The renderer needs one thing from a format that the driver's own sampling
+/// does not settle: whether the alpha channel means anything. An `X` format
+/// leaves it undefined and must be treated as opaque, or a window renders with
+/// whatever garbage its unused byte happened to hold.
+pub fn pixel_format(fourcc: u32) -> super::PixelFormat {
+    if fourcc == DRM_FORMAT_XRGB8888 {
+        super::PixelFormat::Xrgb8888
+    } else {
+        super::PixelFormat::Argb8888
+    }
 }
 
 /// One plane of a dma-buf image.
@@ -140,6 +158,6 @@ pub enum DmabufProbe {
     /// no way to make a dma-buf of its own to try. Not a failure and not a
     /// pass: the first client to hand one over is what will settle it.
     Untested(String),
-    /// The path exists and did not work, which is a real fault worth reporting.
+    /// The path exists and failed.
     Failed(String),
 }

@@ -20,9 +20,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
     match msg.message.op_code {
         CREATE_SURFACE => handle_create_surface(state, msg),
         CREATE_REGION => handle_create_region(state, msg),
-        op => {
-            tracing::warn!("wl_compositor: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_compositor"),
     }
 }
 

@@ -62,22 +62,24 @@ fn add_toplevel(
 
 #[test]
 fn buffer_scale_shrinks_the_hit_testable_area() {
-    use crate::compositor::protocol::state::ShmBuffer;
+    use crate::compositor::protocol::state::{Buffer, BufferKind, ShmBuffer};
     let mut state = CompositorState::new();
     let _rx = add_client(&mut state, 1);
     state.create_surface(1, 10);
-    state.shm_buffers.insert(
+    state.buffers.insert(
         (1, 11),
-        ShmBuffer {
+        Buffer {
             client_id: 1,
-            pool_id: 0,
-            offset: 0,
             width: 200,
             height: 100,
-            stride: 800,
-            format: 0,
             content_serial: 1,
-            damage: None,
+            kind: BufferKind::Shm(ShmBuffer {
+                pool_id: 0,
+                offset: 0,
+                stride: 800,
+                format: 0,
+                damage: None,
+            }),
         },
     );
     let surface = state.surfaces.get_mut(&(1, 10)).unwrap();
@@ -227,7 +229,7 @@ fn a_replaced_buffer_waits_for_its_last_reader() {
     let mut cache = scene::SceneCache::new();
 
     // A frame is drawn from buffer 101, so something is reading it.
-    let frame = scene::build(OutputId(1), &state, &mut cache);
+    let frame = scene::build(OutputId(1), 1, &state, &mut cache);
 
     // The client swaps to 102, which retires 101.
     state.surfaces.get_mut(&(1, 200)).unwrap().buffer_id = Some(102);
@@ -382,7 +384,9 @@ fn the_cascade_restarts_rather_than_marching_off_the_output() {
 use super::{
     MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, edges_for_point, end_grab, resize_limits, update_grab,
 };
-use crate::compositor::protocol::state::{ClientObjectId, GrabKind, ResizeEdges, ShmBuffer};
+use crate::compositor::protocol::state::{
+    Buffer, BufferKind, ClientObjectId, GrabKind, ResizeEdges, ShmBuffer,
+};
 
 const WINDOW: ClientObjectId = (1, 10);
 const WINDOW_W: i32 = 200;
@@ -398,18 +402,20 @@ fn state_with_grabbable_window() -> CompositorState {
     let mut state = state_with_two_outputs_sized(OUTPUT_W, OUTPUT_H);
     let _rx = add_client(&mut state, 1);
     add_toplevel(&mut state, 1, 10, 11, 12);
-    state.shm_buffers.insert(
+    state.buffers.insert(
         (1, 13),
-        ShmBuffer {
+        Buffer {
             client_id: 1,
-            pool_id: 0,
-            offset: 0,
             width: WINDOW_W,
             height: WINDOW_H,
-            stride: WINDOW_W * 4,
-            format: 0,
             content_serial: 1,
-            damage: None,
+            kind: BufferKind::Shm(ShmBuffer {
+                pool_id: 0,
+                offset: 0,
+                stride: WINDOW_W * 4,
+                format: 0,
+                damage: None,
+            }),
         },
     );
     let surface = state.surfaces.get_mut(&WINDOW).unwrap();
@@ -528,7 +534,7 @@ fn a_clamped_resize_keeps_the_anchored_edge_where_it_was() {
 fn a_window_larger_than_its_display_is_brought_within_it_by_a_resize() {
     let mut state = state_with_grabbable_window();
     // A client can make itself any size; a drag brings it back in bounds.
-    state.shm_buffers.get_mut(&(1, 13)).unwrap().width = OUTPUT_W * 2;
+    state.buffers.get_mut(&(1, 13)).unwrap().width = OUTPUT_W * 2;
     state.cursor_x = 10.0 + f64::from(OUTPUT_W) * 2.0;
     state.cursor_y = 80.0;
     state.start_resize_grab(WINDOW, ResizeEdges(ResizeEdges::RIGHT));
@@ -650,4 +656,197 @@ fn a_client_minimum_larger_than_the_display_wins() {
         drag_corner_to(&mut state, -9000.0, -9000.0),
         (OUTPUT_W * 2, OUTPUT_H * 2)
     );
+}
+
+use crate::shared::{DRM_FORMAT_XRGB8888, DmabufImage, DmabufPlane};
+use std::os::fd::OwnedFd;
+
+/// A dma-buf description over a real descriptor.
+///
+/// Nothing compositor-side imports it — that needs the GL context only a
+/// backend has — so a `memfd` is as good as a buffer from a driver for
+/// everything the compositor does with one.
+fn test_dmabuf(width: i32, height: i32) -> Arc<DmabufImage> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::memfd_create(c"dmabuf-test".as_ptr().cast(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    Arc::new(DmabufImage {
+        width,
+        height,
+        fourcc: DRM_FORMAT_XRGB8888,
+        modifier: crate::shared::DRM_FORMAT_MOD_INVALID,
+        planes: vec![DmabufPlane {
+            fd: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
+            offset: 0,
+            stride: width.unsigned_abs() * 4,
+        }],
+    })
+}
+
+/// Put a dma-buf backed `wl_buffer` in the registry, as the protocol layer
+/// will once a client can send one.
+///
+/// Takes the image by value because the count of live `Arc`s is exactly what
+/// decides when the buffer may be released: a test holding one of its own
+/// would look like a frame still drawing it.
+fn add_dmabuf_buffer(state: &mut CompositorState, key: ClientObjectId, image: Arc<DmabufImage>) {
+    state.buffers.insert(
+        key,
+        Buffer {
+            client_id: key.0,
+            width: image.width,
+            height: image.height,
+            content_serial: 1,
+            kind: BufferKind::Dmabuf(image),
+        },
+    );
+}
+
+/// Borrow a registered dma-buf the way the scene does when it builds a texture.
+fn borrow_dmabuf(state: &CompositorState, key: ClientObjectId) -> Arc<DmabufImage> {
+    match &state.buffers[&key].kind {
+        BufferKind::Dmabuf(image) => image.clone(),
+        _ => panic!("expected a dma-buf buffer"),
+    }
+}
+
+#[test]
+fn a_dmabuf_is_not_released_while_something_is_reading_it() {
+    let mut state = CompositorState::new();
+    let _rx = add_client(&mut state, 1);
+    add_dmabuf_buffer(&mut state, (1, 200), test_dmabuf(8, 8));
+
+    // Idle: state holds the only handle on it.
+    assert!(!state.buffer_is_being_read((1, 200)));
+
+    // A frame borrows it, exactly as the scene does when it builds a texture.
+    let borrowed = borrow_dmabuf(&state, (1, 200));
+    assert!(
+        state.buffer_is_being_read((1, 200)),
+        "a dma-buf has no mapping guard, so answering from `buffer_guards` \
+         alone would call it idle and release it out from under the frame"
+    );
+
+    drop(borrowed);
+    assert!(!state.buffer_is_being_read((1, 200)));
+}
+
+#[test]
+fn drawing_into_a_dmabuf_does_not_invalidate_the_import() {
+    let mut state = CompositorState::new();
+    let _rx = add_client(&mut state, 1);
+    add_dmabuf_buffer(&mut state, (1, 200), test_dmabuf(8, 8));
+    let serial = state.buffers[&(1, 200)].content_serial;
+
+    // What a commit does. For an shm buffer this is the signal to re-upload;
+    // for a dma-buf the backend is already sampling the memory the client drew
+    // into, and a new serial would only make it throw away a good import.
+    state.mark_buffer_damaged(1, 200, &[]);
+
+    assert_eq!(state.buffers[&(1, 200)].content_serial, serial);
+}
+
+#[test]
+fn a_dmabuf_surface_has_a_size_like_any_other() {
+    let mut state = CompositorState::new();
+    let _rx = add_client(&mut state, 1);
+    add_dmabuf_buffer(&mut state, (1, 200), test_dmabuf(64, 32));
+    state.create_surface(1, 10);
+    state.surfaces.get_mut(&(1, 10)).unwrap().buffer_id = Some(200);
+
+    // Layout asks a buffer how big it is and nothing else, so both kinds must
+    // answer — a dma-buf window that reported no size would be invisible to
+    // hit-testing and confinement as well as to the scene.
+    assert_eq!(state.surface_size((1, 10)), (64, 32));
+    assert_eq!(super::surface_dimensions(&state, (1, 10)), (64, 32));
+}
+
+#[test]
+fn an_output_is_composed_only_once_it_has_asked() {
+    let mut state = state_with_two_outputs();
+    let (frames, mut rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
+    let mut pacer = super::FramePacer::new();
+
+    // Something changed, but no display has said it can show anything.
+    // Composing now would be work thrown away, and would have the compositor
+    // guessing at a rate no display told it.
+    state.dirty = true;
+    pacer.publish(&mut state, &frames);
+    assert!(!rx.has_changed().unwrap(), "nothing was asked for");
+
+    pacer.request(OutputId(1));
+    pacer.publish(&mut state, &frames);
+
+    let frame = rx.borrow_and_update();
+    assert_eq!(frame.len(), 1);
+    assert_eq!(frame[0].output_id, OutputId(1));
+}
+
+#[test]
+fn a_standing_request_is_served_the_moment_something_changes() {
+    let mut state = state_with_two_outputs();
+    let (frames, rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
+    let mut pacer = super::FramePacer::new();
+
+    // The display is ready and nothing has changed, so there is nothing to
+    // send it. The request has to outlive this moment: dropping it would make
+    // the next change wait for the display to ask again.
+    state.dirty = false;
+    pacer.request(OutputId(1));
+    pacer.publish(&mut state, &frames);
+    assert!(!rx.has_changed().unwrap());
+
+    state.dirty = true;
+    pacer.publish(&mut state, &frames);
+    assert!(rx.has_changed().unwrap());
+}
+
+#[test]
+fn serving_one_output_keeps_the_other_ones_scene() {
+    let mut state = state_with_two_outputs();
+    let (frames, mut rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
+    let mut pacer = super::FramePacer::new();
+
+    state.dirty = true;
+    pacer.request(OutputId(1));
+    pacer.request(OutputId(2));
+    pacer.publish(&mut state, &frames);
+    let first: Vec<u64> = rx.borrow_and_update().iter().map(|s| s.serial).collect();
+    assert_eq!(first.len(), 2);
+
+    // Only the faster display comes back for another. The slot holds one
+    // value, so a frame carrying just this output would drop a scene the
+    // backend had not drawn yet.
+    state.dirty = true;
+    pacer.request(OutputId(1));
+    pacer.publish(&mut state, &frames);
+
+    let frame = rx.borrow_and_update();
+    assert_eq!(frame.len(), 2, "both outputs must still be in the frame");
+    let recomposed = frame
+        .iter()
+        .filter(|s| !first.contains(&s.serial))
+        .collect::<Vec<_>>();
+    assert_eq!(recomposed.len(), 1, "only the output that asked");
+    assert_eq!(recomposed[0].output_id, OutputId(1));
+}
+
+#[test]
+fn an_output_that_goes_away_is_forgotten() {
+    let mut state = state_with_two_outputs();
+    let (frames, _rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
+    let mut pacer = super::FramePacer::new();
+
+    state.dirty = true;
+    pacer.request(OutputId(1));
+    pacer.request(OutputId(2));
+    pacer.publish(&mut state, &frames);
+
+    state.outputs.retain(|o| o.id == OutputId(1));
+    pacer.forget_gone_outputs(&state);
+
+    // Its scene would otherwise be republished with every frame for the rest
+    // of the session, holding on to the client buffers it references.
+    assert_eq!(pacer.published.len(), 1);
+    assert!(pacer.published.contains_key(&OutputId(1)));
 }

@@ -11,6 +11,9 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 pub use wire_utils::{ArgReader, ArgWriter, message};
 
+#[cfg(test)]
+mod tests;
+
 pub mod client;
 pub mod state;
 pub mod wire_utils;
@@ -43,6 +46,8 @@ pub mod xdg_surface;
 pub mod xdg_system_bell;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
+pub mod zwp_linux_buffer_params;
+pub mod zwp_linux_dmabuf;
 
 /// Atomic serial number used throughout the compositor to track
 /// event and operation ordering
@@ -51,6 +56,76 @@ static NEXT_SERIAL: AtomicU32 = AtomicU32::new(1);
 /// Helper method for getting the next atomic number
 pub fn next_serial() -> u32 {
     NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `wl_display.error` codes. Every one of them is fatal — see
+/// [`ClientState::send_error`].
+///
+/// The object named does not exist, or the client is not allowed to name it.
+pub const ERROR_INVALID_OBJECT: u32 = 0;
+/// The object exists, but the request named is not one of its own.
+pub const ERROR_INVALID_METHOD: u32 = 1;
+
+/// Reject a request whose opcode the interface does not have.
+///
+/// Being lenient here was tempting and is wrong. An opcode outside an
+/// interface's range means the client and the compositor disagree about what
+/// object this id is, or about what version of the interface it is speaking —
+/// and every later request on that connection is decoded against the same
+/// disagreement. Logging and continuing leaves the client believing its
+/// request was honoured, and turns one recognisable fault into arbitrary
+/// behaviour some distance away.
+///
+/// The compositor's side of the bargain is that a request in an interface's
+/// advertised version is always in the match: a request accepted but not yet
+/// acted on gets an arm of its own that does nothing, so "not implemented" and
+/// "not a request" never look alike from here.
+pub fn unknown_request(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+    interface: &str,
+) {
+    let op_code = msg.message.op_code;
+    let object_id = msg.message.object_id;
+    tracing::warn!(
+        "client {}: {interface} has no request {op_code} (object {object_id})",
+        msg.client_id,
+    );
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.send_error(
+            object_id,
+            ERROR_INVALID_METHOD,
+            &format!("{interface} has no request {op_code}"),
+        );
+    }
+}
+
+/// Reject a request whose arguments do not decode.
+///
+/// A request that is short of the arguments its opcode carries is not a client
+/// being economical — the wire format is fixed-width per argument, so the
+/// bytes were either never written or the sender is out of step with the
+/// interface it thinks it is calling. Either way the compositor cannot know
+/// what was meant, and returning quietly leaves the client waiting on the
+/// effect of a request that never happened.
+pub fn malformed_request(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+    interface: &str,
+) {
+    let op_code = msg.message.op_code;
+    let object_id = msg.message.object_id;
+    tracing::warn!(
+        "client {}: malformed arguments for {interface} request {op_code} (object {object_id})",
+        msg.client_id,
+    );
+    if let Some(client) = state.clients.get(msg.client_id) {
+        client.send_error(
+            object_id,
+            ERROR_INVALID_METHOD,
+            &format!("malformed arguments for {interface} request {op_code}"),
+        );
+    }
 }
 
 /// The type of a Wayland protocol object.
@@ -86,6 +161,8 @@ pub enum ObjectType {
     WpPresentationFeedback,
     WpViewporter,
     WpViewport,
+    ZwpLinuxDmabuf,
+    ZwpLinuxBufferParams,
 }
 
 /// A global interface that clients can bind via `wl_registry`.
@@ -157,7 +234,8 @@ pub static GLOBALS: &[Global] = &[
 fn request_fd_count(obj_type: ObjectType, op_code: u16) -> usize {
     match (obj_type, op_code) {
         (ObjectType::WlShm, wl_shm::CREATE_POOL)
-        | (ObjectType::WlDataOffer, wl_data_offer::RECEIVE) => 1,
+        | (ObjectType::WlDataOffer, wl_data_offer::RECEIVE)
+        | (ObjectType::ZwpLinuxBufferParams, zwp_linux_buffer_params::ADD) => 1,
         _ => 0,
     }
 }
@@ -198,7 +276,6 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
                 );
                 // WL_DISPLAY_ERROR_INVALID_METHOD = 1
                 client.send_error(object_id, 1, "request is missing its file descriptor");
-                client.cancel_token.cancel();
                 return;
             }
             request_fds = queue.drain(..count).collect();
@@ -213,7 +290,7 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
             wl_registry::handle(state, message);
         }
         Some(ObjectType::WlCallback) => {
-            wl_callback::handle(message);
+            wl_callback::handle(state, message);
         }
         Some(ObjectType::WlShm) => {
             wl_shm::handle(state, message, request_fds);
@@ -293,6 +370,12 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
         Some(ObjectType::WpViewport) => {
             wp_viewport::handle(state, message);
         }
+        Some(ObjectType::ZwpLinuxDmabuf) => {
+            zwp_linux_dmabuf::handle(state, message);
+        }
+        Some(ObjectType::ZwpLinuxBufferParams) => {
+            zwp_linux_buffer_params::handle(state, message, request_fds);
+        }
         None => {
             tracing::warn!(
                 "client {}: unknown object_id={}, op_code={}",
@@ -300,12 +383,14 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
                 object_id,
                 message.message.op_code,
             );
-            // WL_DISPLAY_ERROR_INVALID_OBJECT = 0
-            client.send_error(object_id, 0, &format!("invalid object {object_id}"));
-            // Fatal by spec. Also necessary here: we cannot know how many fds an
-            // unknown object's request carried, so anything it attached is
+            // Fatal by spec. Also necessary here: we cannot know how many fds
+            // an unknown object's request carried, so anything it attached is
             // already orphaned on the queue and would mispair later requests.
-            client.cancel_token.cancel();
+            client.send_error(
+                object_id,
+                ERROR_INVALID_OBJECT,
+                &format!("invalid object {object_id}"),
+            );
         }
     }
 }

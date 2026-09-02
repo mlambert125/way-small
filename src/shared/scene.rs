@@ -15,22 +15,27 @@ pub struct SceneElement {
 }
 
 /// Everything to draw for one output, back to front.
-///
-/// Carries no size of its own: the quads are in the output's pixel
-/// coordinates, and how big the drawable actually is right now is known only
-/// to the backend that owns it. During a resize the two disagree for a frame
-/// or two, and the backend's answer is the correct one.
 #[derive(Debug)]
 pub struct Scene {
     /// The target output
     pub output_id: OutputId,
+    /// Distinguishes this scene from the last one composed for the same
+    /// output, and rises with every one.
+    ///
+    /// Outputs are paced apart — each is composed when the backend says it can
+    /// show another frame for it — so a published frame is a mixture of scenes
+    /// composed at different moments, most of which the backend has already
+    /// drawn. This is what tells it which one it has not.
+    pub serial: u64,
     /// The elements to draw
     pub elements: Vec<SceneElement>,
 }
 
-/// One frame: the scene for every output, as of a single compositor tick.
+/// One frame: the newest scene for every output.
 ///
-/// Outputs travel together because a frame is a moment in time rather than a
-/// per-output event, and because only a whole frame can be meaningfully
-/// superseded by a newer one.
+/// Not a moment in time — the scenes in it were composed at whatever moment
+/// their own output last asked for one. It is a slot holding the latest state
+/// of every output at once, so that publishing a new scene for one output
+/// cannot drop an unshown scene belonging to another. The serial on each scene
+/// is what a backend uses to tell what is new to it.
 pub type Frame = Vec<Arc<Scene>>;

@@ -94,9 +94,19 @@ pub fn f64_to_24_8_fixed(val: f64) -> i32 {
     f64_to_i32(val * 256.0)
 }
 
-// Convert a f64 to i32 without any scaling
+/// Convert an `f64` to `i32` without any scaling.
+///
+/// Saturating, and deliberately so. Every value that reaches here has come
+/// from a client one way or another — a pointer coordinate is the cursor
+/// position less a surface origin the client chose, and a surface origin is
+/// whatever a `wl_subsurface.set_position` said it was. `to_int_unchecked` is
+/// undefined behaviour for NaN or anything outside the range, which makes the
+/// soundness of this function a property of arithmetic several modules away.
+/// Rust's `as` clamps to the bounds and maps NaN to zero, which costs nothing
+/// measurable and cannot be wrong.
+#[allow(clippy::cast_possible_truncation)]
 pub fn f64_to_i32(val: f64) -> i32 {
-    unsafe { f64::to_int_unchecked(val) }
+    val as i32
 }
 
 /// Cursor-based reader for parsing Wayland message arguments.

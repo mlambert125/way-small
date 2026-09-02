@@ -1,14 +1,4 @@
 //! The vocabulary the subsystems share.
-//!
-//! Everything here crosses between the compositor and a backend: what the
-//! backend reports (`BackendMessage`), what the compositor publishes to be
-//! drawn (`Frame`), and the types those reach through — textures, the client
-//! buffer memory behind them, and the outputs they land on.
-//!
-//! It lives above both because it belongs to neither. `Frame` is produced by
-//! the compositor and consumed by a backend, so putting it in either would
-//! make one depend on the other's internals for a type it owns half of. This
-//! module depends on nothing in the crate, and everything else depends on it.
 
 pub mod buffer;
 pub mod dmabuf;
@@ -19,8 +9,8 @@ pub mod texture;
 
 pub use buffer::{BufferGuard, PoolMapping};
 pub use dmabuf::{
-    DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_XRGB8888, DmabufFormat, DmabufImage,
-    DmabufPlane, DmabufProbe, fourcc_name,
+    DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888,
+    DmabufFormat, DmabufImage, DmabufPlane, DmabufProbe, fourcc_name, pixel_format,
 };
 pub use output::{
     OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputGeometry, OutputId, OutputMode,
@@ -106,6 +96,20 @@ pub enum BackendRequest {
     /// context until its window exists — in which case it answers as soon as
     /// it can rather than refusing.
     ProbeDmabuf,
+    /// Try importing one client buffer and report whether it took, answered
+    /// with [`BackendMessage::DmabufImported`] carrying the same token.
+    ///
+    /// A client is waiting on this — `zwp_linux_buffer_params_v1.create`
+    /// cannot say `created` or `failed` until the driver has actually tried —
+    /// so it must always be answered, including by a backend that has no way
+    /// to try.
+    ImportDmabuf {
+        /// Identifies this import. Never reused, so a late answer cannot be
+        /// mistaken for the answer to a later question.
+        token: u64,
+        /// The buffer to try.
+        image: std::sync::Arc<dmabuf::DmabufImage>,
+    },
 }
 
 /// A message from the backend to the compositor
@@ -126,14 +130,25 @@ pub enum BackendMessage {
     /// A message that the backend host has closed.  Only applicable to winit backend
     /// or other future backends that can be closed by an externality
     Closed,
-    /// A published frame has been put on screen.
+    /// The backend is ready to show another frame on this output, and is
+    /// asking for one.
     ///
-    /// Clients pace themselves on `wl_surface.frame`, so this is what that
-    /// callback should follow — not the earlier moment the compositor handed
-    /// the frame over. Every backend sends it, including the headless one:
-    /// a backend that never reported presenting would leave every client
-    /// waiting forever for a callback that could not arrive.
-    FramePresented(PresentedAt),
+    /// This is what paces rendering, and it comes from the backend because
+    /// only the backend knows when a display can take a frame: a page flip has
+    /// completed, or a host compositor has said now is the time to draw. A
+    /// request stands until it is answered, so an output that asks while
+    /// nothing has changed is served the moment something does.
+    ///
+    /// One output asking says nothing about any other. Two displays at
+    /// different refresh rates ask at different times, and there is no rate the
+    /// compositor could pick that would be right for both.
+    FrameRequested(OutputId),
+    /// A scene has reached the screen on this output.
+    ///
+    /// Carries the output because frame callbacks and presentation feedback
+    /// belong to the surfaces that were shown, and on a second display those
+    /// are different surfaces at a different moment.
+    FramePresented(OutputId, PresentedAt),
     /// An output has been resized
     Resized(OutputId, i32, i32),
     /// A key has changed state (pressed/released)
@@ -151,22 +166,14 @@ pub enum BackendMessage {
         /// The active keyboard layout group index
         mods_group: u32,
     },
-    /// The mouse has been moved
-    /// The pointer is now at this position, in global coordinates.
-    ///
-    /// What a hosted backend reports, because the host owns the pointer and
-    /// tells us where it put it, and what a touchscreen or a tablet produces.
+    /// The mouse has been moved (absolute)
     MouseMovedTo {
         /// The new x coordinate
         x: f64,
         /// The new y coordinate
         y: f64,
     },
-    /// The pointer has moved by this much.
-    ///
-    /// What a mouse produces: at the `libinput` layer a mouse has no position
-    /// at all, only movement. The compositor owns the position, accumulates
-    /// these into it, and is responsible for keeping it on an output.
+    /// The mouse has moved by this much. (relative)
     MouseMovedBy {
         /// The delta of x
         dx: f64,
@@ -196,6 +203,13 @@ pub enum BackendMessage {
         formats: Vec<dmabuf::DmabufFormat>,
         /// What came of actually trying it.
         probe: dmabuf::DmabufProbe,
+    },
+    /// What came of a [`BackendRequest::ImportDmabuf`].
+    DmabufImportResult {
+        /// The token from the request.
+        token: u64,
+        /// Whether the driver took the buffer.
+        imported: bool,
     },
     /// The host window has gained focus (winit only)
     FocusIn,

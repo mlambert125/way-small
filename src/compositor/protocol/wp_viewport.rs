@@ -21,9 +21,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         DESTROY => handle_destroy(state, msg),
         SET_SOURCE => handle_set_source(state, msg),
         SET_DESTINATION => handle_set_destination(state, msg),
-        op => {
-            tracing::warn!("wp_viewport: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wp_viewport"),
     }
 }
 
@@ -44,6 +42,7 @@ fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
     let (Some(x), Some(y), Some(width), Some(height)) =
         (args.fixed(), args.fixed(), args.fixed(), args.fixed())
     else {
+        super::malformed_request(state, msg, "wp_viewport");
         return;
     };
 
@@ -68,6 +67,7 @@ fn handle_set_source(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
 fn handle_set_destination(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(width), Some(height)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "wp_viewport");
         return;
     };
 

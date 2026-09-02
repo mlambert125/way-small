@@ -1,8 +1,17 @@
 # TODO Next...
 
-- dma-buf: `zwp_linux_dmabuf_v1` and `zwp_linux_buffer_params_v1`, so a client can actually send one (the import path
-  underneath is done and proven; what is missing is the protocol, and a `wl_buffer` that can be either kind)
-- dma-buf: an external-sampler program, for the YUV formats a video decoder produces
+- DRM backend.  The frame loop it needs is in place — outputs are paced individually by `FrameRequested`, so a page
+  flip completing becomes a request for that output and nothing assumes a shared rate.  What is left is the hardware:
+  `libseat` for the session and the DRM master lease, connector enumeration and modesetting, hotplug, `libinput` for
+  input, and giving the device up and taking it back across a VT switch.
+- Integration tests that drive the compositor through its socket.  Everything today is a unit test; conformance
+  against real clients is established by hand (`wayland-info`, `foot`, `gtk4-demo`), which is not something CI can do.
+- dma-buf: `zwp_linux_dmabuf_feedback_v1` (version 4+), which needs a format table over a descriptor and the DRM device
+  as a `dev_t`; version 3 is advertised today and clients fall back to it cleanly
+- dma-buf: an external-sampler program, for the YUV formats a video decoder produces — also needs
+  `wp_color_representation_v1` to know which matrix and range to convert with
+- dma-buf: `y_invert`, currently refused. It is a `TextureSource::Dmabuf { image, y_invert }` field and a swap of the
+  two v coordinates in the `u_src` uniform
 - Workspace hotkeys: add, remove and switch the workspaces on an output (the hierarchy is there, the policy is not)
 - Client provided mouse cursors
 - Themed server mouse cursor support (hardcoded white arrow right now)

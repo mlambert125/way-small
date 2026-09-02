@@ -26,9 +26,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         PLACE_BELOW => handle_place_below(state, msg),
         SET_SYNC => handle_set_sync(state, msg, true),
         SET_DESYNC => handle_set_sync(state, msg, false),
-        op => {
-            tracing::warn!("wl_subsurface: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_subsurface"),
     }
 }
 
@@ -65,6 +63,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(x), Some(y)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "wl_subsurface");
         return;
     };
 
@@ -73,7 +72,7 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
     if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id))
         && let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id))
     {
-        surface.subsurface_position = (x, y);
+        surface.subsurface_position = super::state::clamp_surface_offset(x, y);
         state.dirty = true;
     }
 }
@@ -81,6 +80,7 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
 fn handle_place_above(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(sibling_id) = args.u32() else {
+        super::malformed_request(state, msg, "wl_subsurface");
         return;
     };
 
@@ -110,6 +110,7 @@ fn handle_place_above(state: &mut CompositorState, msg: &WaylandProtocolMessageW
 fn handle_place_below(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(sibling_id) = args.u32() else {
+        super::malformed_request(state, msg, "wl_subsurface");
         return;
     };
 

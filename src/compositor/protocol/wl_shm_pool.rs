@@ -22,9 +22,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         CREATE_BUFFER => handle_create_buffer(state, msg),
         DESTROY => handle_destroy(state, msg),
         RESIZE => handle_resize(state, msg),
-        op => {
-            tracing::warn!("wl_shm_pool: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_shm_pool"),
     }
 }
 
@@ -86,6 +84,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(new_size) = args.i32() else {
+        super::malformed_request(state, msg, "wl_shm_pool");
         return;
     };
     let pool_id = msg.message.object_id;

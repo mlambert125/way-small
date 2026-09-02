@@ -21,9 +21,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         DESTROY => handle_destroy(state, msg),
         ADD => handle_add(state, msg),
         SUBTRACT => handle_subtract(state, msg),
-        op => {
-            tracing::warn!("wl_region: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_region"),
     }
 }
 
@@ -57,6 +55,7 @@ fn push_rect(
     let (Some(x), Some(y), Some(width), Some(height)) =
         (args.i32(), args.i32(), args.i32(), args.i32())
     else {
+        super::malformed_request(state, msg, "wl_region");
         return;
     };
     let region_id = msg.message.object_id;

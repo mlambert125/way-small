@@ -8,9 +8,18 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
 
-pub fn handle(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
-    tracing::warn!(
-        "wp_presentation_feedback: unexpected request opcode {}",
-        msg.message.op_code
-    );
+// Event opcodes
+/// `sync_output(output: object<wl_output>)`. Optional, and never sent: it
+/// names the output a frame was synchronised to, which this compositor does
+/// not track per frame.
+#[allow(dead_code)]
+pub const SYNC_OUTPUT: u16 = 0;
+/// `presented(tv_sec_hi, tv_sec_lo, tv_nsec, refresh, seq_hi, seq_lo, flags)`.
+pub const PRESENTED: u16 = 1;
+/// `discarded()`, for a frame that never made it to screen.
+#[allow(dead_code)]
+pub const DISCARDED: u16 = 2;
+
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    super::unknown_request(state, msg, "wp_presentation_feedback");
 }

@@ -9,15 +9,16 @@
 //! turns it into GPU work.
 
 use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState, MouseButton};
-use crate::shared::{OutputId, PresentedAt, fourcc_name, output_contains};
+use crate::shared::{OutputId, PresentedAt, Scene, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
 use protocol::CompositorState;
 use protocol::state::{ClientObjectId, GrabKind, ResizeEdges, region_contains};
 use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use protocol::{
-    wl_keyboard, wl_pointer, wl_registry, wl_surface, xdg_popup, xdg_surface, xdg_toplevel,
+    wl_keyboard, wl_pointer, wl_registry, wl_surface, wp_presentation_feedback, xdg_popup,
+    xdg_surface, xdg_toplevel,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
@@ -31,8 +32,15 @@ pub mod scene;
 mod tests;
 pub mod workspace;
 
-/// Milliseconds between frames (~60fps)
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How often the compositor does the work that no display paces.
+///
+/// This is not frame pacing. Rendering is driven by the backend asking for a
+/// frame on a particular output — see [`BackendMessage::FrameRequested`] — and
+/// the compositor has no opinion on when a display can take one. What is left
+/// here is upkeep that has to happen whether or not anything is on screen:
+/// noticing that a buffer has stopped being read, re-confining windows to
+/// their outputs, and pacing the clients whose surfaces no display is showing.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(16);
 
 // evdev keycode for TAB (used for now for hard-coded keymap)
 const KEY_TAB: u32 = 15;
@@ -70,6 +78,132 @@ struct HitResult {
     surface_y: i32,
 }
 
+/// Which outputs are owed a scene, and what each was last given.
+///
+/// A scene is composed for an output when two things are true at once: the
+/// backend has said it can show another frame there, and what that output was
+/// last given no longer reflects compositor state. Either half can become true
+/// at any time — a page flip completing, a client committing — so the decision
+/// is made in one place after every pass of the loop rather than in whichever
+/// arm happened to settle the second half.
+struct FramePacer {
+    /// The newest scene composed for each output.
+    ///
+    /// Kept so that every publication can carry all of them. The frame slot
+    /// holds one value and a new publication replaces it, so a frame carrying
+    /// only the output being served would drop the scene of an output whose
+    /// backend had not drawn it yet.
+    published: HashMap<OutputId, Arc<Scene>>,
+    /// Outputs whose published scene is out of date.
+    stale: HashSet<OutputId>,
+    /// Outputs whose backend has asked for a frame and not been given one.
+    ///
+    /// A request outlives the moment it was made. An output that asks while
+    /// nothing has changed is not turned away — it is served as soon as
+    /// something does, which is what keeps an idle desktop from waiting a
+    /// whole refresh period to show the first thing that moves.
+    waiting: HashSet<OutputId>,
+    /// Source of scene serials. Rises forever, so a backend comparing a scene
+    /// against what it last drew on that output cannot be fooled by reuse.
+    next_serial: u64,
+    /// Textures kept between scenes.
+    cache: scene::SceneCache,
+}
+
+impl FramePacer {
+    fn new() -> Self {
+        Self {
+            published: HashMap::new(),
+            stale: HashSet::new(),
+            waiting: HashSet::new(),
+            next_serial: 1,
+            cache: scene::SceneCache::new(),
+        }
+    }
+
+    /// Note that compositor state has moved on, so every output's scene is out
+    /// of date.
+    ///
+    /// State is tracked as one flag rather than per output because almost
+    /// everything that changes it — a commit, a focus change, the pointer
+    /// moving — could affect any output, and working out which ones it really
+    /// touched costs more than composing a scene nobody was waiting for.
+    fn invalidate(&mut self, state: &CompositorState) {
+        self.stale.extend(state.outputs.iter().map(|o| o.id));
+    }
+
+    /// Record that a backend is ready for another frame on this output.
+    fn request(&mut self, output_id: OutputId) {
+        self.waiting.insert(output_id);
+    }
+
+    /// Drop everything remembered about outputs that no longer exist.
+    fn forget_gone_outputs(&mut self, state: &CompositorState) {
+        let live: HashSet<OutputId> = state.outputs.iter().map(|o| o.id).collect();
+        self.published.retain(|id, _| live.contains(id));
+        self.stale.retain(|id| live.contains(id));
+        self.waiting.retain(|id| live.contains(id));
+    }
+
+    /// Compose for every output that is both waiting and out of date, and
+    /// publish the result.
+    ///
+    /// Never awaited, in line with the rule that the compositor task blocks on
+    /// nothing: the slot holds one frame and a backend that has not kept up
+    /// gets the newest.
+    fn publish(&mut self, state: &mut CompositorState, frames: &watch::Sender<Frame>) {
+        if state.dirty {
+            self.invalidate(state);
+            state.dirty = false;
+        }
+
+        let due: Vec<OutputId> = self
+            .stale
+            .intersection(&self.waiting)
+            .copied()
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+
+        self.cache.gc(state);
+        for output_id in due {
+            let serial = self.next_serial;
+            self.next_serial += 1;
+            let scene = Arc::new(scene::build(output_id, serial, state, &mut self.cache));
+            self.published.insert(output_id, scene);
+            self.stale.remove(&output_id);
+            self.waiting.remove(&output_id);
+        }
+
+        // Every output draws through one backend and one texture cache, keyed
+        // by the buffer's content serial, so a buffer another output has not
+        // been composed with yet is either already uploaded or absent — and an
+        // absent texture is uploaded whole rather than patched. Carrying the
+        // damage forward for that output would therefore change nothing, while
+        // an output that stopped asking for frames would grow the list without
+        // bound.
+        state.clear_buffer_damage();
+
+        let frame: Frame = self.published.values().map(Arc::clone).collect();
+        drop(frames.send_replace(frame));
+    }
+}
+
+/// Whose frame callbacks a presentation settles.
+#[derive(Debug, Clone, Copy)]
+enum FrameTarget {
+    /// The surfaces shown on one output, because that output presented.
+    Output(OutputId),
+    /// The surfaces no output is showing.
+    ///
+    /// A client waiting on `wl_surface.frame` for one of these would otherwise
+    /// wait forever, and it is not always a window the user has hidden: a
+    /// client's first commit typically carries no buffer and a frame request,
+    /// and it will not draw anything until that callback comes back.
+    Offscreen,
+}
+
 /// Run the compositor thread
 #[allow(clippy::too_many_lines)]
 pub async fn run_compositor(
@@ -92,15 +226,18 @@ pub async fn run_compositor(
     }
 
     let mut state = protocol::CompositorState::new();
+    // Protocol handlers need this too: a client asking for a dma-buf buffer
+    // cannot be answered until the backend has tried to import it.
+    state.backend_sender = Some(backend_requests.clone());
     state.default_cursor = scene::load_default_cursor();
     if state.default_cursor.is_none() {
         info!("No cursor theme found, using built-in cursor");
     }
-    let mut scene_cache = scene::SceneCache::new();
+    let mut pacer = FramePacer::new();
     // High-water mark for pages the SIGBUS net has blanked, so each new one is
     // reported once.
     let mut reported_patched_pages = 0usize;
-    let mut render_timer = tokio::time::interval(FRAME_INTERVAL);
+    let mut housekeeping_timer = tokio::time::interval(HOUSEKEEPING_INTERVAL);
     let start_time = Instant::now();
 
     // Keys whose press the compositor consumed for a binding. Their release is
@@ -174,7 +311,12 @@ pub async fn run_compositor(
                                 state.next_global_number += 1;
                                 state.output_global_names.insert(new_output.id, global_name);
                                 state.outputs.push(new_output);
-                                wl_registry::broadcast_output_global(&mut state, global_name);
+                                wl_registry::broadcast_global(
+                                    &mut state,
+                                    global_name,
+                                    "wl_output",
+                                    protocol::WL_OUTPUT_VERSION,
+                                );
                             }
                         }
                         // A new output arrives with no workspace, and a window
@@ -202,6 +344,30 @@ pub async fn run_compositor(
                         // means no `zwp_linux_dmabuf_v1` global, which is the
                         // honest answer when nothing can be imported.
                         state.dmabuf_formats = formats;
+
+                        // The global appears the moment there is something
+                        // behind it, which may be after clients have connected
+                        // — hence the broadcast as well as the listing every
+                        // later client gets. Guarded so a second answer cannot
+                        // advertise the same interface twice.
+                        if !state.dmabuf_formats.is_empty()
+                            && state.dmabuf_global_name.is_none()
+                        {
+                            let global_name = state.next_global_number;
+                            state.next_global_number += 1;
+                            state.dmabuf_global_name = Some(global_name);
+                            wl_registry::broadcast_global(
+                                &mut state,
+                                global_name,
+                                protocol::zwp_linux_dmabuf::INTERFACE,
+                                protocol::zwp_linux_dmabuf::VERSION,
+                            );
+                        }
+                    }
+                    BackendMessage::DmabufImportResult { token, imported } => {
+                        protocol::zwp_linux_buffer_params::resolve_import(
+                            &mut state, token, imported,
+                        );
                     }
                     BackendMessage::Closed => {
                         info!("Backend requested shutdown");
@@ -392,47 +558,55 @@ pub async fn run_compositor(
                     BackendMessage::FocusOut => {
                         debug!("Focus out");
                     }
-                    BackendMessage::FramePresented(presented_at) => {
+                    BackendMessage::FrameRequested(output_id) => {
+                        // The backend can show another frame here. Whether one
+                        // gets composed is settled at the bottom of the loop,
+                        // where both halves of that decision are in view.
+                        pacer.request(output_id);
+                    }
+                    BackendMessage::FramePresented(output_id, presented_at) => {
                         // Clients pace themselves on this, so it follows the
                         // frame reaching the screen rather than the compositor
                         // handing it over. Callbacks live in surface state
                         // until fired, so a frame the backend skipped costs a
                         // client latency but never a lost callback.
+                        //
+                        // Only the surfaces this output was showing: a client
+                        // with a window on each of two displays is paced by
+                        // each of them separately, which is the whole point of
+                        // the output being named here.
                         let timestamp_ms =
                             u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-                        fire_frame_callbacks(&mut state, timestamp_ms, presented_at);
+                        fire_frame_callbacks(
+                            &mut state,
+                            timestamp_ms,
+                            FrameTarget::Output(output_id),
+                            Some(presented_at),
+                        );
                     }
                 }
             }
-            _ = render_timer.tick() => {
+            _ = housekeeping_timer.tick() => {
                 update_surface_outputs(&mut state);
                 // Windows belong to one output and stay inside it, so a client
                 // resizing itself or an output changing size can move them.
                 if state.confine_toplevels() {
                     state.dirty = true;
                 }
-                if state.dirty {
-                    scene_cache.gc(&state);
-                    // TODO: track per-output dirty flags to avoid rebuilding
-                    // scenes for outputs that haven't changed.
-                    let output_ids: Vec<OutputId> = state.outputs.iter().map(|o| o.id).collect();
-                    let mut frame = Frame::with_capacity(output_ids.len());
-                    for output_id in output_ids {
-                        frame.push(Arc::new(scene::build(output_id, &state, &mut scene_cache)));
-                    }
-                    // The scenes just built account for everything reported so
-                    // far, so the next frame starts from a clean slate.
-                    state.clear_buffer_damage();
-                    // Never awaited, in line with the rule that the compositor
-                    // task blocks on nothing: a backend that has not kept up
-                    // gets the newest frame, and the one it missed is dropped
-                    // here rather than queued in front of it.
-                    drop(frame_sender.send_replace(frame));
-                    state.dirty = false;
-                }
-                // Both independent of `dirty`: a buffer becomes free when the
-                // last frame referencing it goes, which can happen on a tick
-                // where nothing has changed.
+                pacer.forget_gone_outputs(&state);
+
+                // Surfaces no display is showing are paced from here, because
+                // nothing else will pace them: no output will ever report
+                // presenting them. Their presentation feedback is `discarded`
+                // rather than `presented`, which is what it is — nothing
+                // reached a screen.
+                let timestamp_ms =
+                    u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                fire_frame_callbacks(&mut state, timestamp_ms, FrameTarget::Offscreen, None);
+
+                // Both independent of the frame path: a buffer becomes free
+                // when the last frame referencing it goes, which can happen on
+                // a tick where nothing has changed.
                 start_buffer_releases(&mut state);
                 finish_buffer_releases(&mut state);
 
@@ -452,6 +626,14 @@ pub async fn run_compositor(
                 break;
             }
         }
+
+        // Composing happens here rather than in any one arm. An output is owed
+        // a scene when it is both waiting for one and out of date, and those
+        // two halves are settled by different messages arriving at different
+        // times — a page flip on one side, a client commit on the other. Asking
+        // once per pass is what keeps the answer from depending on which of
+        // them happened to arrive second.
+        pacer.publish(&mut state, &frame_sender);
     }
 
     Ok(())
@@ -568,6 +750,10 @@ fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding>
 fn update_surface_outputs(state: &mut CompositorState) {
     let mut enters: Vec<(u32, u32, OutputId)> = Vec::new();
     let mut leaves: Vec<(u32, u32, OutputId)> = Vec::new();
+    // What is actually on screen, which is not what the client has been told:
+    // an output it has not bound is one it cannot be told about. Collected
+    // here and stored below, since the loop only has the surfaces borrowed.
+    let mut visible: Vec<((u32, u32), HashSet<OutputId>)> = Vec::new();
 
     for (&(client_id, surface_id), surface) in &state.surfaces {
         // An unmapped surface is on no output, and neither is one belonging to
@@ -579,23 +765,35 @@ fn update_surface_outputs(state: &mut CompositorState) {
                     .iter()
                     .map(|&output_id| (client_id, surface_id, output_id)),
             );
+            visible.push(((client_id, surface_id), HashSet::new()));
             continue;
         }
 
         let (x, y) = surface_global_position(state, client_id, surface_id);
         let (w, h) = surface_dimensions(state, (client_id, surface_id));
 
+        let mut on = HashSet::new();
         for output in &state.outputs {
             let geometry = &output.geometry;
             let overlaps = x < geometry.x + geometry.physical_width
-                && x + w > geometry.x
+                && x.saturating_add(w) > geometry.x
                 && y < geometry.y + geometry.physical_height
-                && y + h > geometry.y;
+                && y.saturating_add(h) > geometry.y;
+            if overlaps {
+                on.insert(output.id);
+            }
             match (overlaps, surface.entered_outputs.contains(&output.id)) {
                 (true, false) => enters.push((client_id, surface_id, output.id)),
                 (false, true) => leaves.push((client_id, surface_id, output.id)),
                 _ => {}
             }
+        }
+        visible.push(((client_id, surface_id), on));
+    }
+
+    for (key, on) in visible {
+        if let Some(surface) = state.surfaces.get_mut(&key) {
+            surface.visible_on = on;
         }
     }
 
@@ -722,14 +920,34 @@ fn cycle_focus(state: &mut CompositorState) {
     switch_focus(state, next);
 }
 
-/// Fire all pending frame callbacks and presentation feedbacks.
+/// Fire the pending frame callbacks and presentation feedbacks of the surfaces
+/// `target` covers.
 ///
-/// Called when a backend reports that a frame reached the screen.
-fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32, presented_at: PresentedAt) {
+/// `presented_at` is the moment the backend put the frame on screen, and
+/// `None` says nothing was put anywhere — which is the honest answer for a
+/// surface no output is showing, and makes its presentation feedback
+/// `discarded` rather than a `presented` naming a time nothing happened.
+fn fire_frame_callbacks(
+    state: &mut CompositorState,
+    timestamp_ms: u32,
+    target: FrameTarget,
+    presented_at: Option<PresentedAt>,
+) {
     let mut callbacks: Vec<(u32, u32)> = Vec::new(); // (client_id, callback_id)
     let mut presentation: Vec<(u32, u32)> = Vec::new(); // (client_id, feedback_id)
 
     for surface in state.surfaces.values_mut() {
+        // `visible_on` rather than `entered_outputs`: the latter is what the
+        // client has been told, and a client that never bound `wl_output` has
+        // been told nothing. Pacing it on that would leave it waiting on a
+        // callback that could not arrive.
+        let covered = match target {
+            FrameTarget::Output(output_id) => surface.visible_on.contains(&output_id),
+            FrameTarget::Offscreen => surface.visible_on.is_empty(),
+        };
+        if !covered {
+            continue;
+        }
         if let Some(callback_id) = surface.frame_callback.take() {
             callbacks.push((surface.client_id, callback_id));
         }
@@ -752,6 +970,24 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32, presente
         }
     }
 
+    // Nothing reached a screen, so every feedback is discarded rather than
+    // presented. A client hearing `presented` with a timestamp for a frame
+    // that was never shown would be told a straightforward untruth, and the
+    // protocol exists precisely to be accurate about this.
+    let Some(presented_at) = presented_at else {
+        for (client_id, feedback_id) in presentation {
+            if let Some(client) = state.clients.get(client_id) {
+                let _ = client.send(message(
+                    feedback_id,
+                    wp_presentation_feedback::DISCARDED,
+                    Vec::new(),
+                ));
+                client.unregister(feedback_id);
+            }
+        }
+        return;
+    };
+
     // Fire wp_presentation_feedback.presented events
     if !presentation.is_empty() {
         // The backend's own clock reading, taken when it presented, rather than
@@ -761,7 +997,6 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32, presente
         let tv_sec_lo = u32::try_from(presented_at.tv_sec).unwrap_or(0);
         let tv_nsec = u32::try_from(presented_at.tv_nsec).unwrap_or(0);
 
-        // wp_presentation_feedback.presented event (opcode 0)
         // flags: 0x1 = WP_PRESENTATION_FEEDBACK_KIND_VSYNC
         let flags: u32 = 0x1;
         for (client_id, feedback_id) in presentation {
@@ -775,7 +1010,15 @@ fn fire_frame_callbacks(state: &mut CompositorState, timestamp_ms: u32, presente
                 .u32(flags)
                 .build();
             if let Some(client) = state.clients.get(client_id) {
-                let _ = client.send(message(feedback_id, 0, args));
+                // Opcode 1. Sending this payload as opcode 0 makes the
+                // client decode it as `sync_output`, whose single argument is
+                // a non-nullable object — a zero there is a fatal decode error
+                // that takes the connection down.
+                let _ = client.send(message(
+                    feedback_id,
+                    wp_presentation_feedback::PRESENTED,
+                    args,
+                ));
                 client.unregister(feedback_id);
             } else {
                 debug!(
@@ -1116,7 +1359,14 @@ fn hit_test_surface_tree(
         };
         let (cx, cy) = child.subsurface_position;
         if let Some(result) =
-            hit_test_surface_tree(state, child_key, offset_x + cx, offset_y + cy, px, py)
+            hit_test_surface_tree(
+                state,
+                child_key,
+                offset_x.saturating_add(cx),
+                offset_y.saturating_add(cy),
+                px,
+                py,
+            )
         {
             return Some(result);
         }
@@ -1127,7 +1377,11 @@ fn hit_test_surface_tree(
     if w == 0 || h == 0 {
         return None;
     }
-    if px < offset_x || py < offset_y || px >= offset_x + w || py >= offset_y + h {
+    if px < offset_x
+        || py < offset_y
+        || px >= offset_x.saturating_add(w)
+        || py >= offset_y.saturating_add(h)
+    {
         return None;
     }
 
@@ -1135,7 +1389,11 @@ fn hit_test_surface_tree(
     // of it accept pointer input. Clients drawing their own decorations use this
     // to let clicks fall through the drop shadow around the window.
     if let Some(input_region) = &surface.input_region
-        && !region_contains(input_region, px - offset_x, py - offset_y)
+        && !region_contains(
+            input_region,
+            px.saturating_sub(offset_x),
+            py.saturating_sub(offset_y),
+        )
     {
         return None;
     }
@@ -1164,7 +1422,7 @@ fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) ->
     let Some(buffer_id) = surface.buffer_id else {
         return (0, 0);
     };
-    let Some(buf) = state.shm_buffers.get(&(client_id, buffer_id)) else {
+    let Some(buf) = state.buffers.get(&(client_id, buffer_id)) else {
         return (0, 0);
     };
     // The buffer is in physical pixels; hit-testing and layout work in
@@ -1226,14 +1484,14 @@ fn surface_global_position(state: &CompositorState, client_id: u32, surface_id: 
         let Some(surface) = state.surfaces.get(&(client_id, current)) else {
             break;
         };
-        x += surface.subsurface_position.0;
-        y += surface.subsurface_position.1;
+        x = x.saturating_add(surface.subsurface_position.0);
+        y = y.saturating_add(surface.subsurface_position.1);
         if let Some(parent_id) = surface.parent {
             current = parent_id;
         } else {
             // Root surface — add its global position
-            x += surface.position.0;
-            y += surface.position.1;
+            x = x.saturating_add(surface.position.0);
+            y = y.saturating_add(surface.position.1);
             break;
         }
     }

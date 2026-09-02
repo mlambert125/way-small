@@ -3,11 +3,17 @@
 //! Displays nothing and captures no input. Useful for testing protocol logic
 //! without a display server or GPU.
 //!
-//! It does still consume frames and report them presented. Discarding them
-//! silently would leave clients waiting forever on `wl_surface.frame`, and
-//! would pin the buffers of the last frame so they were never released.
+//! It reports no outputs, and so never asks for a frame and never presents
+//! one: rendering is paced per output by the backend that owns it, and this
+//! backend owns none. Clients still get their `wl_surface.frame` callbacks —
+//! the compositor paces the surfaces no output is showing itself, which under
+//! this backend is all of them.
+//!
+//! The frame slot is still drained. Nothing should arrive in it with no
+//! outputs to compose for, but holding a frame borrowed would pin the client
+//! buffers it references and keep them from being released.
 
-use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, PresentedAt};
+use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +52,20 @@ pub async fn run_null_backend(
                             break;
                         }
                     }
+                    // No GPU to import onto. Answered rather than dropped: a
+                    // client is blocked on this one.
+                    Some(BackendRequest::ImportDmabuf { token, .. }) => {
+                        if backend_sender
+                            .send(BackendMessage::DmabufImportResult {
+                                token,
+                                imported: false,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     None => break,
                 }
             }
@@ -54,15 +74,10 @@ pub async fn run_null_backend(
                     break;
                 }
                 // Take the frame and drop it at once: nothing draws it, but it
-                // must not stay borrowed.
+                // must not stay borrowed. No presentation is reported, because
+                // none happened — there is no output here that could have made
+                // one, and a presentation names the output it was made on.
                 drop(frames.borrow_and_update());
-                if backend_sender
-                    .send(BackendMessage::FramePresented(PresentedAt::now()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
             }
         }
     }

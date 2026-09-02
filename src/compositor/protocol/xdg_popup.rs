@@ -28,9 +28,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         REPOSITION => {
             debug!("xdg_popup.reposition: not yet implemented");
         }
-        op => {
-            tracing::warn!("xdg_popup: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "xdg_popup"),
     }
 }
 

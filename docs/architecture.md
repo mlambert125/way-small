@@ -14,8 +14,22 @@ The primary goals:
   architecture (e.g. OOP, ECS, etc).
 - To demonstrate good stewardship of an open source software project, including:
     - Documentation, including design documentation and code comments.
-    - Testing, including unit tests, integration tests, and end-to-end tests.
+    - Testing.  Today that means unit tests, run with `cargo test` and living beside the code they cover.  Integration
+      and end-to-end testing against real clients is a goal and is not yet built: nothing in the repository drives the
+      compositor through its socket, so conformance is currently established by running clients against it by hand.
     - Code quality, including readability, maintainability, and adherence to rust idioms and best practices.
+
+### What is built, and what is not
+
+This document describes a design, and parts of that design are ahead of the code.  Sections describing something not
+yet written say so where they begin.  As of now:
+
+- **Built**: the socket subsystem, the protocol layer and compositor state, scene building, the GL renderer, shm with
+  zero-copy and damage tracking, dma-buf import, and the winit and null backends.
+- **Not built**: the DRM backend, and with it every part of running on bare hardware — session management, `libinput`,
+  and modesetting.  There is no clipboard or drag and drop; `wl_data_device.start_drag` and `set_selection` are
+  accepted and do nothing.  Subsurface `set_sync` is recorded but does not cache commits.  There is no XWayland, no
+  layer shell, no decoration protocol, and no touch or tablet input.
 
 ## Source Layout
 
@@ -239,7 +253,8 @@ the backend learns its new size before the compositor has composed for it — an
 
 #### Asking the backend a question
 
-Messages run backend to compositor.  A few questions run the other way, and `BackendRequest` is that direction: the
+Messages run backend to compositor — including the one that drives rendering, since when a display can take a frame is
+something only the backend knows.  A few questions run the other way, and `BackendRequest` is that direction: the
 compositor asks, and the answer arrives later as an ordinary `BackendMessage`.  It is deliberately not a call.  The
 compositor task blocks on nothing, and what makes these questions worth asking at all is that only the backend thread
 can answer them — anything touching the GL context has to run there, because a GL context belongs to one thread and
@@ -256,6 +271,11 @@ A client that renders on the GPU has its pixels there already.  Handing them ove
 copying them through a shared mapping, and uploading them again — three trips for pixels that never needed to leave the
 card.  A dma-buf is the kernel's handle on that memory instead: the client passes a file descriptor, the backend imports
 it as a texture through `EGL_EXT_image_dma_buf_import`, and nothing is copied.
+
+A `wl_buffer` is likewise a struct of what every buffer has — size, owner, and a serial identifying its contents — plus
+a `BufferKind` for the part that differs.  Only an shm buffer's serial ever moves: a dma-buf is sampled where it lies,
+so a client drawing into one changes the screen without anything crossing to the backend, and bumping the serial there
+would have it throw away a good import once per committed frame.
 
 A `TextureImage` is therefore a struct of what every texture has — id, size, and whether its alpha means anything —
 plus a `TextureSource` for the part that differs.  The fields that only an upload can have, `previous_serial` and
@@ -286,8 +306,46 @@ the backend can make a real dma-buf out of a texture it filled itself, import th
 and read the pixels out again.  That round trip runs once at startup and is the difference between "the entry points
 are there" and "importing works" — a driver can advertise the extension and still refuse every buffer.
 
-None of this is reachable by a client yet: `zwp_linux_dmabuf_v1` is not implemented, so nothing constructs a
-`TextureSource::Dmabuf`.  What exists is the path underneath it, proven end to end.
+##### The protocol on top
+
+`zwp_linux_dmabuf_v1` is advertised at version 3.  On bind a client is told what can be imported: `modifier` events
+carrying format and layout together, or plain `format` events for a client that bound version 1 or 2 and has no way to
+be told about layouts.  Version 4 forbids both and replaces them with `zwp_linux_dmabuf_feedback_v1` — a format table
+over a descriptor, a main device, per-surface tranches — which every client falls back from cleanly, so it can wait.
+
+The global is not in the static `GLOBALS` table, because whether there is anything to advertise is not known at
+startup: it depends on what the driver says, and the driver can only be asked once the backend has a GL context.  It is
+allocated a name and broadcast when the probe comes back, and listed for clients that connect later — the same
+two-path shape `wl_output` uses.  Nothing is advertised if nothing can be imported.
+
+A client describes a buffer through `zwp_linux_buffer_params_v1`, one `add` per plane, and then asks for a `wl_buffer`.
+Several planes does not mean YUV: a compressed RGB layout keeps its metadata in a second plane and is still sampled as
+one ordinary texture, which is what a Vulkan swapchain on Intel hardware offers.  What would need a different sampler is
+YUV, and those formats are excluded where the advertised list is built.
+
+Refusals split in two, and the split is the whole design.  A malformed request — a plane index past the last, a plane
+set twice, a gap in the planes, a buffer with no area, planes disagreeing about the layout — is a fatal protocol error,
+because the client is broken.  "The driver will not take this" is the non-fatal `failed` event, because that is
+something a client can recover from by falling back to shm.  Putting a case on the wrong side of that line either kills
+clients that did nothing wrong or lets a bad request through.
+
+The one bound the compositor can put on what a client makes the driver read is that a plane fits inside its descriptor,
+which a dma-buf answers with `lseek(SEEK_END)`.  That check only means anything for a linear layout: under tiling or
+compression a row is not `stride` bytes after the one above it, and the later planes are metadata with their own
+geometry entirely.  So it is applied to the first plane of a linear or implicit buffer and skipped otherwise, where the
+driver knows the real layout and does its own checking.
+
+`create` and `create_immed` differ in who names the `wl_buffer` and therefore in what can still be refused.  `create`
+lets the compositor answer with an id of its own — from the top of the id space, which is the compositor's half and
+which `wl_display.delete_id` must never announce — so it can wait for the backend to try the import and answer
+`created` or `failed` honestly.  `create_immed` has the client name the id up front, so there is nothing left to refuse:
+a buffer that turns out not to import is registered anyway, as a buffer that draws nothing.  Tearing the object down
+instead would leave the client owning an id the compositor has forgotten, and the next request naming it would
+disconnect it.
+
+That verdict arrives some frames after the request, by which time the client may have destroyed the params object,
+destroyed the buffer, or disconnected, so each is checked rather than assumed — and a buffer id that has been destroyed
+and reused since is caught by the content serial the pending import was stamped with.
 
 #### Winit Backend
 
@@ -296,16 +354,34 @@ compositor (or x session.)  This is useful for development and testing, as it al
 without needing to set up a full wayland session.
 
 It gets its GL context from glutin: an EGL display off the winit window, a GLES 3.0 context, and a window surface, all
-created and made current on the winit thread.  Vsync is off, because the compositor already paces frames on its own
-16ms timer and waiting for vblank here would only stall the thread handling input.
+created and made current on the winit thread.
+
+It is also where the frame pacing described under [Rendering](#rendering) comes from in a hosted session.  A window on
+someone else's compositor has no vblank of its own; what it has is `RedrawRequested`, which is the host saying that a
+frame drawn now will be shown.  So that is what becomes a frame request, and a new one is asked for only after a frame
+has been presented — which is what holds this backend to one frame in flight.  Vsync is off, because the pacing is
+already in that loop and blocking the swap on vblank as well would only stall the thread handling input.
 
 #### DRM Backend
 
-The DRM backend provides a backend for running the compositor on a linux system without an existing compositor.  This
-is the "real" backend that allows the compositor to be used as a standalone compositor for a linux system.  It uses
-the Direct Rendering Manager (DRM) subsystem of the linux kernel to display the compositors output and capture input
-events using the evdev and libinput libraries.  Its GL context comes from EGL on a gbm device rather than from a host
-window, which is the same EGL the dma-buf import path above needs; the renderer above it is unchanged.
+*Not built.*  This section is a design, not a description of code that exists — `src/backend/` holds the winit and null
+backends and nothing else.
+
+The DRM backend is what would let the compositor run on a linux system with no compositor under it.  It would use the
+Direct Rendering Manager subsystem of the kernel to drive the displays and `libinput` over evdev for input.  Its GL
+context would come from EGL on a gbm device rather than from a host window — the same EGL the dma-buf import path
+above already needs — and the renderer above it would be unchanged.
+
+Frame pacing is the part that already has its shape decided.  A page flip completing on a CRTC is exactly the signal
+`RedrawRequested` is in the winit backend: it says this output can take another frame.  It becomes a
+`FrameRequested` for that output, and the answer comes back as a scene for that output alone.  This is why rendering
+is paced per output rather than on a timer — see [Rendering](#rendering) — and it is the reason to have settled that
+before writing this backend rather than after.  Two displays at different refresh rates have no shared rate to be
+driven at, and a compositor that had assumed one would have to be unpicked everywhere it had assumed it.
+
+Beyond the frame loop, this backend is where the rest of running on hardware lives, none of which the hosted backends
+need: taking the session and the DRM master lease (`libseat`), enumerating connectors and choosing modes, handling
+hotplug, and giving up and reclaiming the device across a VT switch.
 
 #### Null Backend
 
@@ -313,6 +389,10 @@ The null backend provides a backend that does not display anything and does not 
 useful for testing and benchmarking, as it allows us to run the compositor without needing to set up any graphical
 output or input devices.  It has no GL context and drops the scenes it is sent; there is no software rasteriser to fall
 back to, so a backend that cannot get a context has nothing to display and shuts down rather than run blind.
+
+It reports no outputs, so it never asks for a frame and never presents one — a presentation names the output it
+happened on, and this backend has none.  Its clients are still paced: with no output showing anything, every surface
+falls to the offscreen path described under [Rendering](#rendering) and is served from the housekeeping timer.
 
 ## Compositor Architecture
 
@@ -383,6 +463,31 @@ events as they come in.  The events include:
 Wayland messages are processed by looking at the message's object ID and op code, and dispatching to the appropriate handler
 function based on the object type and op code.  The handler function will then update the compositor's state as necessary, and
 send any messages back to the client through the wayland socket subsystem as necessary.
+
+##### When a request cannot be honoured
+
+There are two ways a request can fail to make sense, and both end the connection:
+
+- an **opcode the interface does not have**, which means the client and the compositor disagree about what object that
+  id is, or about which version of the interface it is speaking;
+- **arguments that do not decode**, which for a fixed-width wire format means the bytes were never written or the
+  sender is out of step with the interface it thinks it is calling.
+
+Neither is survivable by carrying on.  Every later request on that connection is decoded against the same disagreement,
+so logging and continuing turns one recognisable fault into arbitrary behaviour some distance away, with the client
+believing all the while that it was understood.
+
+This follows from what `wl_display.error` already means rather than being a policy on top of it: the spec has a client
+disconnect on receiving one, and libwayland destroys the connection as it posts it.  So the disconnect lives in
+`ClientState::send_error` and there is no way to send an error without it.  A condition a client can recover from is a
+different thing entirely and is not an error — those are interface-specific events, of which
+`zwp_linux_buffer_params_v1.failed` is the one this compositor sends.
+
+The compositor's half of the bargain is that a request within an interface's advertised version is always in the
+handler's match, whether or not anything acts on it yet.  A request accepted and ignored gets an arm of its own, so
+"not implemented" and "not a request" never look alike from the dispatcher.  Advertising a version whose requests are
+not all in the match would disconnect clients that had done nothing wrong — `xdg_positioner.set_reactive` under the
+`xdg_wm_base` version advertised here is exactly such a case.
 
 #### Backend Message Processing
 
@@ -488,18 +593,51 @@ nearest.
 
 #### Rendering
 
-Rendering is triggered at 60 fps and looks at the current state of the compositor, but the compositor subsystem does not
-rasterise anything itself.  It builds a *scene* per output: a flat, back-to-front list of textured quads, each one a
-source rectangle in some texture paired with a destination rectangle in output pixels.  Surface position, subsurface
-offsets, `wp_viewport` cropping and scaling, and buffer scale are all resolved here, into that pair of rectangles.
+The compositor subsystem does not rasterise anything itself.  It builds a *scene* per output: a flat, back-to-front list
+of textured quads, each one a source rectangle in some texture paired with a destination rectangle in output pixels.
+Surface position, subsurface offsets, `wp_viewport` cropping and scaling, and buffer scale are all resolved here, into
+that pair of rectangles.
 
-A frame is every output's scene from one tick, published together, because a frame is a moment in time rather than a
-per-output event — and because only a whole frame can be meaningfully superseded by a newer one.
+##### What paces it
 
-The frame goes to the backend, which draws it on the GPU.  What crosses is a notification, not the frame itself: the
-backend is woken and reads the slot when it is ready to draw, so wake-ups that arrive while it is busy collapse into a
-single draw of the newest frame rather than a backlog of stale ones.  This matters more than it looks, because a queued
-frame pins the shm pixel copies it references; bounding the queue at one bounds that memory too.
+The backend does, per output.  A scene is composed for an output when two things are true at once: the backend has said
+that output can show another frame — `BackendMessage::FrameRequested` — and what it was last given no longer reflects
+compositor state.
+
+Only a backend can know the first of those.  A display takes a frame when a page flip completes, and a hosted window
+takes one when the host says so; neither is a rate the compositor could pick.  Two displays at different refresh rates
+make that concrete, because there is no single rate that is right for both, and a compositor that had picked one would
+be wrong on at least one display forever.  The earlier design here ran a 16ms timer and composed every output against
+it, which is the assumption that does not survive contact with real hardware — hence settling it before the DRM backend
+rather than after.
+
+A request outlives the moment it is made.  An output that asks while nothing has changed is not turned away; it is
+served as soon as something does, so the first thing that moves on an idle desktop is not made to wait a refresh period
+for the display to ask again.
+
+The two halves are checked together once per pass of the event loop rather than in whichever arm settled the second of
+them, because either one — a page flip, a client commit — can be the one that completes the pair.
+
+##### What crosses to the backend
+
+A `Frame` is the newest scene for *every* output.  It is not a moment in time: outputs are paced apart, so the scenes in
+one frame were composed at whatever moment each output last asked.  It carries them all because the slot holds a single
+value and a new publication replaces it — a frame carrying only the output being served would drop the scene of an
+output whose backend had not drawn it yet.
+
+Each scene carries a serial that rises with every one composed, and that is how a backend tells the one scene that is
+new to it from the ones being carried along.  A backend draws a scene whose serial it has not drawn, and skips the rest:
+redrawing them would cost a swap for no change, and would have that output report a presentation it did not make —
+which is what fires its clients' frame callbacks.
+
+What crosses is a notification, not the frame itself: the backend is woken and reads the slot when it is ready to draw,
+so wake-ups that arrive while it is busy collapse into a single draw of the newest frame rather than a backlog of stale
+ones.  This matters more than it looks, because a queued frame pins the shm pixel copies it references; bounding the
+queue at one bounds that memory too.
+
+Rendering being paced by the backend leaves work that no display paces — noticing a buffer has stopped being read,
+re-confining windows to their outputs — with nothing to run it.  That is what the compositor's own 16ms timer is now
+for, and it is upkeep rather than frame pacing.
 
 The split is forced by GL: a context belongs to one thread, and that thread is the backend's.  It is also the useful
 split, because everything that needs compositor state is on this side and everything that needs a GPU is on the other.
@@ -584,6 +722,18 @@ and an upload of just the changed rows on the backend side.
 Frame callbacks follow presentation, not hand-off.  A backend reports `FramePresented` once a frame has reached the
 screen, and that is what fires `wl_surface.frame` and `wp_presentation_feedback.presented`; the timestamp a client is
 told is the one the backend read at that moment, not one measured a channel hop later.
+
+That report names an output, and settles only the callbacks of the surfaces that output was showing.  A client with a
+window on each of two displays is paced by each of them separately, which is what per-output pacing is for.  Which
+surfaces those are is `Surface::visible_on`, which is what the compositor knows rather than `entered_outputs`, which is
+what the client has been *told* — a client is only told about an output it has bound, so pacing on the latter would
+leave a client that never binds `wl_output` waiting on a callback that could not arrive.
+
+Surfaces no output is showing are settled from the housekeeping timer instead, since no output will ever report
+presenting them.  This is not only windows the user has hidden: a client's first commit typically carries no buffer and
+a frame request, and it draws nothing until that callback comes back.  Their presentation feedback is `discarded`
+rather than `presented`, which is what it is — nothing reached a screen, and a `presented` naming a time would be a
+plain untruth about the one thing this protocol exists to be accurate about.
 
 Callbacks live in surface state until they fire, which is what makes this safe against the single-slot frame channel: a
 frame that is superseded before the backend draws it costs a client some latency, never a lost callback.  Every backend

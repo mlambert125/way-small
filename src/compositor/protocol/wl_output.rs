@@ -33,9 +33,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
                 tracing::warn!("Received message from unknown client {}", msg.client_id);
             }
         }
-        op => {
-            tracing::warn!("wl_output: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_output"),
     }
 }
 

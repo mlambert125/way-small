@@ -1,11 +1,6 @@
 #![warn(clippy::pedantic)]
 
 //! Entry point for way-small.
-//!
-//! Parses CLI args and config, selects a backend, wires up channels between
-//! the Wayland socket listener, compositor loop, and display backend, then
-//! waits for shutdown.
-
 use crate::{
     shared::{BackendMessage, BackendRequest, Frame},
     wayland_socket::WaylandSocketMessage,
@@ -25,7 +20,6 @@ mod wayland_socket;
 enum Backend {
     // Winit backend for testing / running as a child compositor
     Winit,
-
     // Null backend (logging only)
     None,
 }
@@ -131,15 +125,16 @@ async fn main() -> anyhow::Result<()> {
 
     debug!("Creating channels");
 
+    // Socket -> Compositor
     let (wayland_message_tx, wayland_message_rx) = channel::<WaylandSocketMessage>(1000);
+    // Backend -> Compositor
     let (backend_message_tx, backend_message_rx) = channel::<BackendMessage>(1000);
-    // The other direction: what the compositor asks the backend, for the
-    // questions only the thread holding the GL context can answer. Answers come
-    // back as `BackendMessage`s, so the compositor never waits on one.
+    // Compositor -> Backend
     let (backend_request_tx, backend_request_rx) = channel::<BackendRequest>(64);
-    // A latest-frame slot rather than a queue: the backend only ever wants the
-    // newest frame, and a frame it has not picked up yet is stale by definition.
+    // Compositor -> Backend (Latest only - watch::channel)
     let (frame_tx, frame_rx) = watch::channel::<Frame>(Frame::new());
+
+    // Top-level cancellation token
     let cancel_token = tokio_util::sync::CancellationToken::new();
 
     debug!("Spawning subsystem tasks");
@@ -152,8 +147,7 @@ async fn main() -> anyhow::Result<()> {
         cancel_token.clone(),
     )
     .await;
-    // Set once the backend is up, so a client cannot connect to a compositor
-    // that has nothing to show it.
+
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
 
     let compositor_handle = tokio::spawn(compositor::run_compositor(

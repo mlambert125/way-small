@@ -250,3 +250,35 @@ mod cursor {
         assert_eq!(at(&state), (40.0, 40.0));
     }
 }
+
+/// A disconnecting client must take its pools with it.
+mod disconnect {
+    use super::pool_file;
+    use crate::compositor::protocol::CompositorState;
+
+    const CLIENT: u32 = 1;
+    const POOL: u32 = 100;
+    const BUFFER: u32 = 101;
+
+    #[test]
+    fn a_disconnecting_clients_pools_are_freed() {
+        let mut state = CompositorState::new();
+        let size = 4096;
+        assert!(state.register_shm_pool(CLIENT, POOL, pool_file(size, 0xcd, true), size));
+        state.register_buffer(CLIENT, BUFFER, POOL, 0, 8, 8, 32, 0);
+        assert!(state.shm_pools.contains_key(&(CLIENT, POOL)));
+
+        state.remove_client_resources(CLIENT);
+
+        // A pool is freed only once nothing references it, so its buffers have
+        // to go first. Tearing down in the other order leaves the pool marked
+        // dead and never collected — its mapping alive and its descriptor open
+        // for the rest of the compositor's life, once per client that ever
+        // connected.
+        assert!(
+            !state.shm_pools.contains_key(&(CLIENT, POOL)),
+            "the pool outlived the client that owned it"
+        );
+        assert!(state.buffers.is_empty());
+    }
+}

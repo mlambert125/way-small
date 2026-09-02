@@ -30,9 +30,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         CREATE_POSITIONER => handle_create_positioner(state, msg),
         GET_XDG_SURFACE => handle_get_xdg_surface(state, msg),
         PONG => handle_pong(msg),
-        op => {
-            tracing::warn!("xdg_wm_base: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "xdg_wm_base"),
     }
 }
 

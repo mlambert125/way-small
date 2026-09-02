@@ -6,7 +6,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
-async fn a_published_frame_is_reported_presented() {
+async fn a_backend_with_no_outputs_presents_nothing() {
     let (backend_tx, mut backend_rx) = channel(8);
     let (frames_tx, frames_rx) = watch::channel(Frame::new());
     let (_requests_tx, requests_rx) = channel(8);
@@ -20,10 +20,13 @@ async fn a_published_frame_is_reported_presented() {
 
     drop(frames_tx.send_replace(Frame::new()));
 
-    // Even with nothing to draw on, the frame has to be acknowledged:
-    // frame callbacks and buffer releases both hang off this.
-    let message = backend_rx.recv().await.expect("backend went quiet");
-    assert!(matches!(message, BackendMessage::FramePresented(_)));
+    // A presentation names the output it happened on, and this backend has
+    // none — it never asks for a frame, so nothing is ever composed for it.
+    // The clients' frame callbacks are the compositor's job here, fired
+    // against the surfaces no output is showing. Claiming a presentation
+    // would fire them against an output that does not exist.
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(50), backend_rx.recv()).await;
+    assert!(quiet.is_err(), "the backend should have nothing to report");
 
     cancel.cancel();
     backend.await.unwrap().unwrap();

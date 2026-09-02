@@ -34,9 +34,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             handle_sync(client, msg);
         }
         GET_REGISTRY => handle_get_registry(state, msg),
-        op => {
-            tracing::warn!("wl_display: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_display"),
     }
 }
 

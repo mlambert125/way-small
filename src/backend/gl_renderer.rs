@@ -279,6 +279,17 @@ impl GlRenderer {
         (formats, probe)
     }
 
+    /// Whether this driver will take a client's buffer.
+    ///
+    /// The import is thrown away again: this answers a question the compositor
+    /// has to put to the driver before it can tell a client whether its buffer
+    /// worked. The buffer is imported again for real when it is first drawn.
+    pub fn verify_import(&self, image: &crate::shared::DmabufImage) -> bool {
+        self.dmabuf
+            .as_ref()
+            .is_some_and(|importer| importer.import(image).is_ok())
+    }
+
     /// Draw a scene into the currently bound framebuffer.
     ///
     /// `width`/`height` are the real drawable size, which can differ from the

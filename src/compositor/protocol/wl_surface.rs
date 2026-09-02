@@ -80,9 +80,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             // Acknowledged but not acted upon yet
         }
         COMMIT => handle_commit(state, msg),
-        op => {
-            tracing::warn!("wl_surface: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_surface"),
     }
 }
 
@@ -100,6 +98,7 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     let mut args = ArgReader::new(&msg.message.args);
     // attach args: object buffer (id or 0 for null), int32 x, int32 y
     let (Some(buffer_id), Some(_x), Some(_y)) = (args.u32(), args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "wl_surface");
         return;
     };
 
@@ -135,6 +134,7 @@ fn handle_damage(
     let (Some(x), Some(y), Some(width), Some(height)) =
         (args.i32(), args.i32(), args.i32(), args.i32())
     else {
+        super::malformed_request(state, msg, "wl_surface");
         return;
     };
 
@@ -161,6 +161,7 @@ fn handle_frame(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCli
     let mut args = ArgReader::new(&msg.message.args);
     // frame args: new_id callback
     let Some(callback_id) = args.new_id() else {
+        super::malformed_request(state, msg, "wl_surface");
         return;
     };
 
@@ -349,7 +350,7 @@ fn committed_damage(
     if damage_surface.is_empty() && damage_buffer.is_empty() {
         return Vec::new();
     }
-    let Some(buffer) = state.shm_buffers.get(&(key.0, buffer_id)) else {
+    let Some(buffer) = state.buffers.get(&(key.0, buffer_id)) else {
         return Vec::new();
     };
     let (width, height) = (buffer.width, buffer.height);

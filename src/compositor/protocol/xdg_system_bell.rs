@@ -2,7 +2,7 @@
 //!
 //! Enables clients to ring the system bell
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
@@ -12,7 +12,7 @@ use super::state::CompositorState;
 const DESTROY: u16 = 0;
 const RING: u16 = 1;
 
-pub fn handle(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         DESTROY => {
             debug!("xdg_system_bell: destroy");
@@ -20,8 +20,6 @@ pub fn handle(_state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
         RING => {
             info!("xdg_system_bell: ring");
         }
-        op => {
-            warn!("xdg_system_bell: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "xdg_system_bell_v1"),
     }
 }

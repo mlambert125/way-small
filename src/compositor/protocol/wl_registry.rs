@@ -10,7 +10,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
 use super::wire_utils::{ArgReader, ArgWriter, message};
-use super::{GLOBALS, ObjectType, wl_output, wl_seat, wl_shm};
+use super::{GLOBALS, ObjectType, wl_output, wl_seat, wl_shm, zwp_linux_dmabuf};
 use crate::shared::OutputId;
 
 // Request opcodes
@@ -22,9 +22,7 @@ pub const GLOBAL: u16 = 0;
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         BIND => handle_bind(state, msg),
-        op => {
-            tracing::warn!("wl_registry: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_registry"),
     }
 }
 
@@ -35,6 +33,7 @@ fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
         .iter()
         .map(|(&id, &name)| (name, id))
         .collect();
+    let dmabuf_global = state.dmabuf_global_name;
 
     let Some(client) = state.clients.get(msg.client_id) else {
         tracing::warn!("Received message from unknown client {}", msg.client_id);
@@ -93,6 +92,17 @@ fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
             }
             _ => {}
         }
+    } else if dmabuf_global == Some(global_name) {
+        let bound_version = version.min(zwp_linux_dmabuf::VERSION);
+        if client
+            .register_with_version(new_id, ObjectType::ZwpLinuxDmabuf, bound_version)
+            .is_err()
+        {
+            return;
+        }
+        // NLL: client borrow ends here. The format list lives in state, which
+        // is why this cannot be sent through the borrow above.
+        zwp_linux_dmabuf::send_formats(state, msg.client_id, new_id);
     } else if let Some(&(_, output_id)) =
         output_globals.iter().find(|(name, _)| *name == global_name)
     {
@@ -122,6 +132,7 @@ fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
 pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_id: u32) {
     // Collect output global names before borrowing client.
     let output_globals: Vec<u32> = state.output_global_names.values().copied().collect();
+    let dmabuf_global = state.dmabuf_global_name;
 
     let Some(client) = state.clients.get(client_id) else {
         return;
@@ -133,6 +144,19 @@ pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_i
             .u32(id)
             .string(global.interface)
             .u32(global.version)
+            .build();
+        if client.send(message(registry_id, GLOBAL, args)).is_err() {
+            return;
+        }
+    }
+
+    // Advertised only once the backend has said it can import one, which may
+    // be after this client connected — hence the broadcast path as well.
+    if let Some(global_name) = dmabuf_global {
+        let args = ArgWriter::new()
+            .u32(global_name)
+            .string(zwp_linux_dmabuf::INTERFACE)
+            .u32(zwp_linux_dmabuf::VERSION)
             .build();
         if client.send(message(registry_id, GLOBAL, args)).is_err() {
             return;
@@ -152,15 +176,26 @@ pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_i
     }
 }
 
-/// Broadcast a new output global to all connected clients that have a registry.
-pub fn broadcast_output_global(state: &mut CompositorState, global_name: u32) {
+/// Broadcast a global that has appeared since the clients did.
+///
+/// Most globals exist before any client connects and are listed in
+/// `advertise_globals`. Some cannot: an output arrives when the display is
+/// plugged in, and dma-buf support is only known once the backend has a GL
+/// context to ask. Those are announced to whoever is already connected here,
+/// and by `advertise_globals` to whoever connects later.
+pub fn broadcast_global(
+    state: &mut CompositorState,
+    global_name: u32,
+    interface: &str,
+    version: u32,
+) {
     for (_, client) in state.clients.iter() {
         for (obj_id, obj_type) in &client.objects {
             if *obj_type == ObjectType::WlRegistry {
                 let args = ArgWriter::new()
                     .u32(global_name)
-                    .string("wl_output")
-                    .u32(super::WL_OUTPUT_VERSION)
+                    .string(interface)
+                    .u32(version)
                     .build();
                 let _ = client.send(message(*obj_id, GLOBAL, args));
             }

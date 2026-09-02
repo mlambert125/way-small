@@ -22,8 +22,6 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
                 client.unregister(msg.message.object_id);
             }
         }
-        op => {
-            tracing::warn!("wl_data_source: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wl_data_source"),
     }
 }

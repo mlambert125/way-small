@@ -4,6 +4,11 @@
 //! renderer then binds as an ordinary GL texture. Nothing is copied: the
 //! texture samples the memory the client already rendered into.
 //!
+//! A buffer may have several planes without needing anything special to sample:
+//! a compressed RGB layout carries its metadata in a second plane and is still
+//! one texture. What would need a different sampler is YUV, and those layouts
+//! are excluded where the formats are chosen rather than here.
+//!
 //! The entry points are all extensions, loaded by name through the same
 //! `eglGetProcAddress` the rest of GL comes in on, so this needs no new
 //! dependency — only the constants from the extension specs, which are
@@ -20,16 +25,17 @@
 //! Everything here must run on the thread holding the GL context, like the
 //! rest of the renderer.
 
-use std::ffi::{CStr, c_char, c_void};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Arc;
-
-use glow::HasContext;
-use tracing::debug;
-
 use crate::shared::{
     DRM_FORMAT_MOD_INVALID, DmabufFormat, DmabufImage, DmabufPlane, DmabufProbe, fourcc_name,
 };
+use glow::HasContext;
+use std::ffi::{CStr, c_char, c_void};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+use tracing::debug;
+
+#[cfg(test)]
+mod tests;
 
 // EGL types, as the headers define them.
 type EGLDisplay = *const c_void;
@@ -54,19 +60,28 @@ const EGL_IMAGE_PRESERVED_KHR: EGLint = 0x30D2;
 // EGL_KHR_gl_image, for exporting a texture in the self-test.
 const EGL_GL_TEXTURE_2D_KHR: EGLenum = 0x30B1;
 
-// EGL_EXT_image_dma_buf_import. Only plane 0 is named here: a multi-planar
-// image cannot be sampled with the `sampler2D` this renderer has — YUV needs
-// `samplerExternalOES` and a second program — so `import` refuses one, and the
-// plane 1..3 attributes would have no caller.
+// EGL_EXT_image_dma_buf_import, and the modifier attributes from
+// EGL_EXT_image_dma_buf_import_modifiers.
 const EGL_LINUX_DMA_BUF_EXT: EGLenum = 0x3270;
 const EGL_LINUX_DRM_FOURCC_EXT: EGLint = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: EGLint = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: EGLint = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: EGLint = 0x3274;
-// EGL_EXT_image_dma_buf_import_modifiers. A modifier is 64 bits and an
-// attribute value is 32, which is why it arrives in halves.
-const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: EGLint = 0x3443;
-const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: EGLint = 0x3444;
+
+/// Per-plane attribute names: fd, offset, pitch, modifier low, modifier high.
+///
+/// More than one plane does not mean YUV. A compressed RGB layout — Intel's
+/// `Y_TILED_*_CCS`, which is what a Vulkan swapchain on this hardware asks for
+/// — puts its compression metadata in a second plane and is still sampled as
+/// one ordinary texture. Formats that genuinely need `samplerExternalOES` are
+/// excluded earlier, by the `external_only` filter in [`advertisable_format`].
+///
+/// A modifier is 64 bits and an attribute value is 32, which is why it goes in
+/// halves. The enum values are not contiguous between planes, hence a table
+/// rather than arithmetic.
+const PLANE_ATTRIBUTES: [[EGLint; 5]; 4] = [
+    [0x3272, 0x3273, 0x3274, 0x3443, 0x3444],
+    [0x3275, 0x3276, 0x3277, 0x3445, 0x3446],
+    [0x3278, 0x3279, 0x327A, 0x3447, 0x3448],
+    [0x3440, 0x3441, 0x3442, 0x3449, 0x344A],
+];
 
 /// Side of the image [`DmabufImporter::self_test`] round-trips.
 ///
@@ -296,12 +311,9 @@ impl DmabufImporter {
     /// Failure is ordinary rather than exceptional: a client can describe a
     /// buffer this driver will not take, and the answer is to not draw it.
     pub fn import(&self, image: &DmabufImage) -> Result<EglImage, String> {
-        let [plane] = image.planes.as_slice() else {
-            return Err(format!(
-                "{} plane(s): only single-plane images can be sampled by this renderer",
-                image.planes.len()
-            ));
-        };
+        if image.planes.is_empty() || image.planes.len() > PLANE_ATTRIBUTES.len() {
+            return Err(format!("{} plane(s) is not a buffer", image.planes.len()));
+        }
         if image.width <= 0 || image.height <= 0 {
             return Err(format!("empty image: {}x{}", image.width, image.height));
         }
@@ -313,27 +325,33 @@ impl DmabufImporter {
             image.height,
             EGL_LINUX_DRM_FOURCC_EXT,
             image.fourcc.cast_signed(),
-            EGL_DMA_BUF_PLANE0_FD_EXT,
-            plane.fd.as_raw_fd(),
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            plane.offset.cast_signed(),
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            plane.stride.cast_signed(),
         ];
         // An explicit modifier is only legal to pass when the driver
         // understands modifiers at all; without that extension the layout is
-        // whatever the two sides agreed out of band.
-        if image.modifier != DRM_FORMAT_MOD_INVALID && self.query.is_some() {
+        // whatever the two sides agreed out of band. It goes on every plane,
+        // which is what the client described and what EGL expects.
+        let explicit = (image.modifier != DRM_FORMAT_MOD_INVALID && self.query.is_some())
+            .then_some(image.modifier);
+        for (plane, names) in image.planes.iter().zip(PLANE_ATTRIBUTES) {
+            let [fd, offset, pitch, modifier_lo, modifier_hi] = names;
             attributes.extend_from_slice(&[
-                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-                u32::try_from(image.modifier & 0xffff_ffff)
-                    .unwrap_or(0)
-                    .cast_signed(),
-                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-                u32::try_from(image.modifier >> 32)
-                    .unwrap_or(0)
-                    .cast_signed(),
+                fd,
+                plane.fd.as_raw_fd(),
+                offset,
+                plane.offset.cast_signed(),
+                pitch,
+                plane.stride.cast_signed(),
             ]);
+            if let Some(modifier) = explicit {
+                attributes.extend_from_slice(&[
+                    modifier_lo,
+                    u32::try_from(modifier & 0xffff_ffff)
+                        .unwrap_or(0)
+                        .cast_signed(),
+                    modifier_hi,
+                    u32::try_from(modifier >> 32).unwrap_or(0).cast_signed(),
+                ]);
+            }
         }
         attributes.push(EGL_NONE);
 
@@ -780,6 +798,3 @@ unsafe fn load<T: Copy>(loader: &dyn Fn(&CStr) -> *const c_void, symbol: &CStr) 
 fn has_extension(extensions: &str, wanted: &str) -> bool {
     extensions.split_whitespace().any(|e| e == wanted)
 }
-
-#[cfg(test)]
-mod tests;

@@ -8,7 +8,8 @@ use super::client::Clients;
 use super::wire_utils::f64_to_i32;
 use super::wl_pointer;
 use crate::shared::{
-    BufferGuard, Output, OutputId, PoolMapping, TextureRect, cursor_bounds, output_contains,
+    BufferGuard, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping, TextureRect,
+    cursor_bounds, output_contains,
 };
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
@@ -37,30 +38,89 @@ pub struct ShmPool {
     pub dead: bool,
 }
 
-/// An individual buffer in some `ShmPool`
+/// A client `wl_buffer`, whatever kind of memory is behind it.
+///
+/// The fields here are the ones every buffer has, and they are what almost
+/// everything asks for: how big it is, whose it is, and whether its contents
+/// have changed. Where the pixels actually live is [`BufferKind`], mirroring
+/// the same split [`crate::shared::TextureImage`] makes for the texture it
+/// eventually becomes.
 #[derive(Debug)]
-#[allow(dead_code)]
-pub struct ShmBuffer {
+pub struct Buffer {
     /// Client owning the buffer
     pub client_id: u32,
-    /// Pool Id that this buffer points into
-    pub pool_id: u32,
-    /// Offset into the pool where this buffer begins
-    pub offset: i32,
     /// Width of this buffer in pixels
     pub width: i32,
     /// Height of this buffer in pixels
     pub height: i32,
-    /// Actual byte length of each row in this buffer (includes padding, etc.)
-    pub stride: i32,
-    /// Format of this buffer
-    pub format: u32,
     /// Identifies the current contents of this buffer.
     ///
     /// Drawn from a counter that never repeats, so a buffer id reused after
     /// destruction cannot collide with the old one, and anything holding a
     /// copy can tell whether it is still current by comparing serials alone.
+    ///
+    /// Only an shm buffer's serial ever changes. A dma-buf is sampled where it
+    /// lies, so a client drawing into one changes what is on screen without
+    /// anything crossing to the backend — and bumping the serial there would
+    /// make the backend re-import a buffer it already holds, every frame.
     pub content_serial: u64,
+    /// Where the pixels live.
+    pub kind: BufferKind,
+}
+
+impl Buffer {
+    /// The shm details, for the pool bookkeeping that only applies to those.
+    pub fn shm(&self) -> Option<&ShmBuffer> {
+        match &self.kind {
+            BufferKind::Shm(shm) => Some(shm),
+            BufferKind::Dmabuf(_) | BufferKind::Failed => None,
+        }
+    }
+
+    /// The shm details, for modification.
+    pub fn shm_mut(&mut self) -> Option<&mut ShmBuffer> {
+        match &mut self.kind {
+            BufferKind::Shm(shm) => Some(shm),
+            BufferKind::Dmabuf(_) | BufferKind::Failed => None,
+        }
+    }
+}
+
+/// What kind of memory is behind a `wl_buffer`.
+#[derive(Debug)]
+pub enum BufferKind {
+    /// Client memory the compositor maps and the backend uploads from.
+    Shm(ShmBuffer),
+    /// A GPU buffer the backend imports and samples in place. Shared so that
+    /// the count of live readers is the count of `Arc`s, which is what holds
+    /// `wl_buffer.release` back — the same trick the shm path plays with
+    /// [`crate::shared::BufferGuard`].
+    #[allow(dead_code)]
+    Dmabuf(Arc<crate::shared::DmabufImage>),
+    /// A buffer the compositor could not make good on: the client named a
+    /// dma-buf the driver would not import, after it had already been given
+    /// the object id and so could not be refused.
+    ///
+    /// It draws nothing. Tearing the object down instead would be worse than
+    /// useless — the client still owns that id and will destroy it later, and
+    /// an id the compositor has forgotten disconnects the client on sight.
+    #[allow(dead_code)]
+    Failed,
+}
+
+/// An individual buffer in some `ShmPool`
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ShmBuffer {
+    /// Pool Id that this buffer points into
+    pub pool_id: u32,
+    /// Offset into the pool where this buffer begins
+    pub offset: i32,
+    /// Actual byte length of each row in this buffer (includes padding, etc.)
+    pub stride: i32,
+    /// Format of this buffer, in `wl_shm`'s numbering rather than the DRM
+    /// fourcc a dma-buf carries.
+    pub format: u32,
     /// What changed since the damage was last consumed, in buffer pixels.
     ///
     /// `None` means "assume everything" — the client told us nothing, the
@@ -68,6 +128,8 @@ pub struct ShmBuffer {
     /// *not* change, so anything uncertain has to widen to the whole buffer.
     /// `Some` is exact, and an empty `Some` means nothing has changed since it
     /// was last read, which is why the two cannot share a representation.
+    ///
+    /// Only meaningful for an upload: a dma-buf has nothing to re-send.
     pub damage: Option<Vec<TextureRect>>,
 }
 
@@ -84,6 +146,30 @@ pub struct SurfacePending {
     pub input_region: PendingInputRegion,
     /// Pending `wl_surface.set_buffer_scale`.
     pub buffer_scale: Option<i32>,
+}
+
+/// The furthest a surface may sit from its parent, in either direction.
+///
+/// A `wl_subsurface.set_position` is a raw `i32` from the client, and the
+/// protocol puts no bound on it. Those offsets accumulate down a subsurface
+/// tree and are then added to an output origin, so an unclamped one overflows
+/// the arithmetic that hit-tests and composes the tree — a panic in a debug
+/// build, which takes every client down with it, and a wrapped coordinate in a
+/// release build, which is worse for being quiet.
+///
+/// A megapixel in each direction is orders of magnitude past any desktop and
+/// still leaves room for a thousand levels of nesting before an accumulated
+/// offset could reach `i32::MAX`. Positions beyond it are clamped rather than
+/// refused: the protocol allows them, and a surface placed a million pixels
+/// away is off-screen either way.
+pub const MAX_SURFACE_OFFSET: i32 = 1 << 20;
+
+/// Bring a client-chosen surface offset within [`MAX_SURFACE_OFFSET`].
+pub fn clamp_surface_offset(x: i32, y: i32) -> (i32, i32) {
+    (
+        x.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
+        y.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
+    )
 }
 
 #[derive(Debug)]
@@ -108,6 +194,65 @@ pub struct Surface {
     /// Outputs the client has been told this surface is on, via
     /// `wl_surface.enter`. Diffed each frame so only changes are sent.
     pub entered_outputs: HashSet<OutputId>,
+    /// Outputs actually showing this surface.
+    ///
+    /// Not the same thing as [`Self::entered_outputs`], and the difference
+    /// matters: a client is only told about an output it has bound, so a
+    /// client that never binds `wl_output` has an empty `entered_outputs` for
+    /// a surface in plain view. This is what the compositor knows rather than
+    /// what the client has been told, which is what deciding whose frame
+    /// callbacks an output's presentation settles has to be based on. Empty
+    /// means no display is showing it — unmapped, or on a workspace that is
+    /// not on screen.
+    pub visible_on: HashSet<OutputId>,
+}
+
+/// The most planes a buffer can have, per `zwp_linux_buffer_params_v1`.
+pub const MAX_DMABUF_PLANES: usize = 4;
+
+/// One plane of a buffer a client is describing.
+#[derive(Debug)]
+pub struct PendingPlane {
+    /// The descriptor and its layout.
+    pub plane: DmabufPlane,
+    /// The modifier the client gave for *this* plane. The protocol carries one
+    /// per plane while a buffer has a single layout, so they must all agree.
+    pub modifier: u64,
+}
+
+/// A `zwp_linux_buffer_params_v1`: a buffer being described one plane at a time.
+#[derive(Debug, Default)]
+pub struct BufferParams {
+    /// Planes by index, as the client set them. Sparse until `create`, which is
+    /// where a gap becomes an error.
+    pub planes: [Option<PendingPlane>; MAX_DMABUF_PLANES],
+    /// Set by `create`/`create_immed`. The object is single-use, so everything
+    /// after that is a protocol error — including a second create, which is why
+    /// this is set before the import is dispatched rather than once it lands.
+    pub used: bool,
+}
+
+/// A dma-buf import the backend has been asked about and has not answered.
+///
+/// The verdict arrives some frames later, by which time the client may have
+/// destroyed the params object, destroyed the buffer, or disconnected — so what
+/// is needed to check that is recorded here rather than looked up hopefully.
+#[derive(Debug)]
+pub struct PendingImport {
+    /// Client that asked.
+    pub client_id: u32,
+    /// The params object to answer on, if it still exists.
+    pub params_id: u32,
+    /// For `create_immed`, the buffer already registered and the serial it was
+    /// registered with. A client may destroy that id and reuse it before the
+    /// verdict lands, and the serial is what tells the two buffers apart.
+    pub immediate: Option<(u32, u64)>,
+    /// The buffer being imported, kept alive until the verdict.
+    pub image: Arc<DmabufImage>,
+    /// Width, for registering the buffer once the verdict is good.
+    pub width: i32,
+    /// Height, likewise.
+    pub height: i32,
 }
 
 #[derive(Debug)]
@@ -377,7 +522,7 @@ pub struct DefaultCursor {
 pub struct CompositorState {
     pub clients: Clients,
     pub shm_pools: HashMap<ClientObjectId, ShmPool>,
-    pub shm_buffers: HashMap<ClientObjectId, ShmBuffer>,
+    pub buffers: HashMap<ClientObjectId, Buffer>,
     pub surfaces: HashMap<ClientObjectId, Surface>,
     pub regions: HashMap<ClientObjectId, Region>,
     pub xdg_surfaces: HashMap<ClientObjectId, XdgSurfaceState>,
@@ -419,6 +564,21 @@ pub struct CompositorState {
     /// that offers none: the client allocates for it and then has nothing to
     /// fall back to.
     pub dmabuf_formats: Vec<crate::shared::DmabufFormat>,
+    /// The `wl_registry` name `zwp_linux_dmabuf_v1` was advertised under, once
+    /// there is something to advertise. `None` means clients have not been
+    /// offered dma-buf and cannot reach any of it.
+    pub dmabuf_global_name: Option<u32>,
+    /// Live `zwp_linux_buffer_params_v1` objects, keyed like every other.
+    pub dmabuf_params: HashMap<ClientObjectId, BufferParams>,
+    /// Imports the backend has been asked about and not yet answered.
+    pub pending_dmabuf_imports: HashMap<u64, PendingImport>,
+    /// Source of import tokens. Never reused, so a verdict cannot be matched to
+    /// a later import.
+    pub next_import_token: u64,
+    /// Where to send work only the backend thread can do. `None` in tests,
+    /// where there is no backend: a client's `create` is then answered `failed`
+    /// rather than left waiting for a verdict that cannot come.
+    pub backend_sender: Option<tokio::sync::mpsc::Sender<crate::shared::BackendRequest>>,
     /// The workspaces of every output, and the windows on them.
     ///
     /// Outputs own workspaces and workspaces own windows, so this is where a
@@ -461,7 +621,7 @@ impl CompositorState {
         Self {
             clients: Clients::new(),
             shm_pools: HashMap::new(),
-            shm_buffers: HashMap::new(),
+            buffers: HashMap::new(),
             surfaces: HashMap::new(),
             regions: HashMap::new(),
             xdg_surfaces: HashMap::new(),
@@ -485,6 +645,11 @@ impl CompositorState {
             surface_viewport: HashMap::new(),
             buffers_pending_release: Vec::new(),
             dmabuf_formats: Vec::new(),
+            dmabuf_global_name: None,
+            dmabuf_params: HashMap::new(),
+            pending_dmabuf_imports: HashMap::new(),
+            next_import_token: 0,
+            backend_sender: None,
             workspaces: Workspaces::new(),
             dirty: true,
             cursor_surfaces: HashMap::new(),
@@ -586,29 +751,31 @@ impl CompositorState {
             self.buffer_guards
                 .insert((client_id, buffer_id), Arc::new(BufferGuard::new(mapping)));
         }
-        self.shm_buffers.insert(
+        self.buffers.insert(
             (client_id, buffer_id),
-            ShmBuffer {
+            Buffer {
                 client_id,
-                pool_id,
-                offset,
                 width,
                 height,
-                stride,
-                format,
                 content_serial,
-                // A buffer nobody has read yet is wholly new.
-                damage: None,
+                kind: BufferKind::Shm(ShmBuffer {
+                    pool_id,
+                    offset,
+                    stride,
+                    format,
+                    // A buffer nobody has read yet is wholly new.
+                    damage: None,
+                }),
             },
         );
     }
 
     pub fn destroy_buffer(&mut self, client_id: u32, buffer_id: u32) {
         let pool_id = self
-            .shm_buffers
+            .buffers
             .get(&(client_id, buffer_id))
-            .map(|b| b.pool_id);
-        self.shm_buffers.remove(&(client_id, buffer_id));
+            .and_then(|b| b.shm().map(|shm| shm.pool_id));
+        self.buffers.remove(&(client_id, buffer_id));
         // The client has destroyed the buffer, so it is not waiting to hear
         // that it may reuse it.
         self.buffer_guards.remove(&(client_id, buffer_id));
@@ -928,7 +1095,7 @@ impl CompositorState {
     /// backwards — the two must agree or damage lands in the wrong place.
     pub fn surface_buffer_mapping(&self, key: ClientObjectId) -> Option<BufferMapping> {
         let surface = self.surfaces.get(&key)?;
-        let buffer = self.shm_buffers.get(&(key.0, surface.buffer_id?))?;
+        let buffer = self.buffers.get(&(key.0, surface.buffer_id?))?;
         if buffer.width <= 0 || buffer.height <= 0 {
             return None;
         }
@@ -961,7 +1128,7 @@ impl CompositorState {
     }
 
     /// Hand out the next content serial.
-    fn next_content_serial(&mut self) -> u64 {
+    pub fn next_content_serial(&mut self) -> u64 {
         self.next_content_serial += 1;
         self.next_content_serial
     }
@@ -971,18 +1138,28 @@ impl CompositorState {
     /// An empty `damage` means the whole buffer must be treated as new. Damage
     /// accumulates across changes nobody has read yet: if two commits land
     /// between two scenes, the second must not erase what the first reported.
+    /// Record that a client has drawn into a buffer.
+    ///
+    /// Only an upload has anything to record. A dma-buf is sampled where it
+    /// lies, so a client drawing into one needs nothing sent and nothing
+    /// invalidated — and a new serial would tell the backend to throw away an
+    /// import that is still perfectly good, once per committed frame.
     pub fn mark_buffer_damaged(&mut self, client_id: u32, buffer_id: u32, damage: &[TextureRect]) {
         let serial = self.next_content_serial();
-        if let Some(buffer) = self.shm_buffers.get_mut(&(client_id, buffer_id)) {
-            buffer.content_serial = serial;
-            match (&mut buffer.damage, damage.is_empty()) {
-                // Widening to "everything" is sticky until the damage is read:
-                // once one change could not be described, no later rectangle
-                // can narrow the window back down.
-                (_, true) | (None, false) => buffer.damage = None,
-                (Some(existing), false) => existing.extend_from_slice(damage),
-            }
+        let Some(buffer) = self.buffers.get_mut(&(client_id, buffer_id)) else {
+            return;
+        };
+        let Some(shm) = buffer.shm_mut() else {
+            return;
+        };
+        match (&mut shm.damage, damage.is_empty()) {
+            // Widening to "everything" is sticky until the damage is read:
+            // once one change could not be described, no later rectangle
+            // can narrow the window back down.
+            (_, true) | (None, false) => shm.damage = None,
+            (Some(existing), false) => existing.extend_from_slice(damage),
         }
+        buffer.content_serial = serial;
     }
 
     /// Whether anything is still reading a buffer's memory.
@@ -990,6 +1167,13 @@ impl CompositorState {
     /// True only while some `TextureImage` borrowing it is alive. A buffer with
     /// no guard at all — destroyed, or never mapped — counts as idle.
     pub fn buffer_is_being_read(&self, key: ClientObjectId) -> bool {
+        // A dma-buf has no mapping to guard, so the image itself is what the
+        // readers hold: state keeps one `Arc` and every in-flight texture
+        // clones it. Answering from `buffer_guards` alone would report every
+        // dma-buf idle and release it out from under the frame drawing it.
+        if let Some(BufferKind::Dmabuf(image)) = self.buffers.get(&key).map(|b| &b.kind) {
+            return Arc::strong_count(image) > 1;
+        }
         self.buffer_guards
             .get(&key)
             .is_some_and(|guard| Arc::strong_count(guard) > 1)
@@ -1001,8 +1185,10 @@ impl CompositorState {
     /// opposites, and clearing to the wrong one would either force a full
     /// upload every frame or skip a real change.
     pub fn clear_buffer_damage(&mut self) {
-        for buffer in self.shm_buffers.values_mut() {
-            buffer.damage = Some(Vec::new());
+        for buffer in self.buffers.values_mut() {
+            if let Some(shm) = buffer.shm_mut() {
+                shm.damage = Some(Vec::new());
+            }
         }
     }
 
@@ -1012,9 +1198,11 @@ impl CompositorState {
     /// from it regardless of what the client did or did not draw.
     fn mark_pool_damaged(&mut self, client_id: u32, pool_id: u32) {
         let keys: Vec<ClientObjectId> = self
-            .shm_buffers
+            .buffers
             .iter()
-            .filter(|((cid, _), b)| *cid == client_id && b.pool_id == pool_id)
+            .filter(|((cid, _), b)| {
+                *cid == client_id && b.shm().is_some_and(|shm| shm.pool_id == pool_id)
+            })
             .map(|(&key, _)| key)
             .collect();
         for (cid, bid) in keys {
@@ -1033,9 +1221,9 @@ impl CompositorState {
             return;
         }
         let has_buffers = self
-            .shm_buffers
+            .buffers
             .values()
-            .any(|b| b.client_id == client_id && b.pool_id == pool_id);
+            .any(|b| b.client_id == client_id && b.shm().is_some_and(|shm| shm.pool_id == pool_id));
         if !has_buffers && let Some(pool) = self.shm_pools.remove(&(client_id, pool_id)) {
             drop(pool.mapping);
             unsafe { libc::close(pool.fd) };
@@ -1054,6 +1242,7 @@ impl CompositorState {
                 input_region: None,
                 buffer_scale: 1,
                 entered_outputs: HashSet::new(),
+                visible_on: HashSet::new(),
                 parent: None,
                 children: Vec::new(),
                 subsurface_position: (0, 0),
@@ -1214,6 +1403,19 @@ impl CompositorState {
 
     /// Remove all pools, buffers, and surfaces belonging to a disconnecting client.
     pub fn remove_client_resources(&mut self, client_id: u32) {
+        // Buffers go before pools, not after: `destroy_shm_pool` frees a pool
+        // only once nothing references it, so tearing them down in the other
+        // order leaves every one of this client's pools marked dead but never
+        // freed — its mapping alive and its descriptor open for the life of the
+        // compositor.
+        self.buffers.retain(|_, b| b.client_id != client_id);
+        self.dmabuf_params.retain(|&(cid, _), _| cid != client_id);
+        // Each of these pins a descriptor, so a leak here is a leaked fd for
+        // the life of the compositor rather than a stale map entry.
+        self.pending_dmabuf_imports
+            .retain(|_, pending| pending.client_id != client_id);
+        self.buffer_guards.retain(|&(cid, _), _| cid != client_id);
+        self.releasing_buffers.retain(|&(cid, _)| cid != client_id);
         let pool_ids: Vec<u32> = self
             .shm_pools
             .iter()
@@ -1223,9 +1425,6 @@ impl CompositorState {
         for id in pool_ids {
             self.destroy_shm_pool(client_id, id);
         }
-        self.shm_buffers.retain(|_, b| b.client_id != client_id);
-        self.buffer_guards.retain(|&(cid, _), _| cid != client_id);
-        self.releasing_buffers.retain(|&(cid, _)| cid != client_id);
         self.surfaces.retain(|_, s| s.client_id != client_id);
         self.regions.retain(|_, r| r.client_id != client_id);
         self.xdg_toplevels.retain(|_, t| t.client_id != client_id);

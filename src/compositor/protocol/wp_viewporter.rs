@@ -27,9 +27,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
             }
         }
         GET_VIEWPORT => handle_get_viewport(state, msg),
-        op => {
-            tracing::warn!("wp_viewporter: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "wp_viewporter"),
     }
 }
 
@@ -41,6 +39,7 @@ fn handle_get_viewport(state: &mut CompositorState, msg: &WaylandProtocolMessage
 
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(viewport_id), Some(surface_id)) = (args.new_id(), args.u32()) else {
+        super::malformed_request(state, msg, "wp_viewporter");
         return;
     };
 

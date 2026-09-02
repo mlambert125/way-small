@@ -106,10 +106,6 @@ pub struct Output {
 }
 
 /// The positions a cursor may occupy on an output, as an inclusive rectangle.
-///
-/// Inclusive of the far edge minus one, so every position in range still lands
-/// on a real pixel of this output once rounded to `i32`. `None` if the output
-/// has no area to sit on.
 pub fn cursor_bounds(output: &Output) -> Option<(f64, f64, f64, f64)> {
     let g = &output.geometry;
     if g.physical_width <= 0 || g.physical_height <= 0 {

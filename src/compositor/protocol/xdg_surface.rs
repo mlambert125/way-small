@@ -29,9 +29,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         GET_POPUP => handle_get_popup(state, msg),
         SET_WINDOW_GEOMETRY => handle_set_window_geometry(state, msg),
         ACK_CONFIGURE => handle_ack_configure(state, msg),
-        op => {
-            tracing::warn!("xdg_surface: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "xdg_surface"),
     }
 }
 
@@ -157,7 +155,7 @@ fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     if let (Some(popup_wl), Some(parent_wl)) = (popup_wl_surface, parent_wl_surface) {
         if let Some(surface) = state.surfaces.get_mut(&(client_id, popup_wl)) {
             surface.parent = Some(parent_wl);
-            surface.subsurface_position = (x, y);
+            surface.subsurface_position = super::state::clamp_surface_offset(x, y);
         }
         if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_wl)) {
             parent.children.push(popup_wl);
@@ -184,6 +182,7 @@ fn handle_set_window_geometry(
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(x), Some(y), Some(w), Some(h)) = (args.i32(), args.i32(), args.i32(), args.i32())
     else {
+        super::malformed_request(state, msg, "xdg_surface");
         return;
     };
     let xdg_surface_id = msg.message.object_id;
@@ -199,6 +198,7 @@ fn handle_set_window_geometry(
 fn handle_ack_configure(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(serial) = args.u32() else {
+        super::malformed_request(state, msg, "xdg_surface");
         return;
     };
     let xdg_surface_id = msg.message.object_id;

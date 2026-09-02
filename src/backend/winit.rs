@@ -26,6 +26,7 @@ use glutin::display::{AsRawDisplay, GetGlDisplay, GlDisplay, RawDisplay};
 use glutin::surface::{GlSurface, Surface as GlSurfaceHandle, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -82,6 +83,15 @@ struct GlState {
 
 /// Winit application
 struct App {
+    /// Signals that the backend is up, which is what releases the rest of
+    /// startup. Sent once the window and GL context exist and the backend has
+    /// reported what it can do — not merely once the thread is running.
+    ///
+    /// Everything a client learns at connection time is decided by then: a
+    /// socket advertised earlier would let a client enumerate the globals
+    /// before dma-buf support is known, and it would pick shm for the rest of
+    /// its life on the strength of that.
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
     /// GL State data
     gl: Option<GlState>,
     backend_sender: Sender<BackendMessage>,
@@ -100,6 +110,13 @@ struct App {
     frames: watch::Receiver<Frame>,
     /// Last drawn frame, for repainting on resize
     last_frame: Option<Frame>,
+    /// The serial of the newest scene actually drawn on each output.
+    ///
+    /// A published frame carries the newest scene for every output, most of
+    /// which have already been drawn — the compositor recomposes an output
+    /// only when that output has asked. This is what separates the one scene
+    /// that is new from the ones that are being carried along.
+    drawn: HashMap<OutputId, u64>,
     /// A dma-buf probe that arrived before there was a GL context to answer it
     /// with. Answered from `resumed` instead of being refused: the compositor
     /// asks as it starts up, and a hosted backend has no context until its
@@ -118,6 +135,7 @@ impl App {
         if scene.output_id != WINIT_OUTPUT_ID {
             return;
         }
+        self.drawn.insert(scene.output_id, scene.serial);
         let Some(gl) = self.gl.as_mut() else {
             return;
         };
@@ -145,20 +163,48 @@ impl App {
             return;
         }
         let frames = self.frames.borrow_and_update().clone();
+        let mut presented = Vec::new();
         for scene in &frames {
+            // Outputs are paced apart, so a frame is mostly scenes already on
+            // screen. Redrawing one costs a swap for no change, and would have
+            // this output report a presentation it did not make — which is
+            // what fires its clients' frame callbacks.
+            if self.drawn.get(&scene.output_id) == Some(&scene.serial) {
+                continue;
+            }
             self.present_scene(scene);
+            presented.push(scene.output_id);
         }
         if let Some(gl) = self.gl.as_mut() {
             gl.renderer.drop_unused_cached_textures(&frames);
         }
         self.last_frame = Some(frames);
 
-        // Reported even if there was no context to draw with or the window had
-        // no area. The frame is dealt with either way, and a backend that went
-        // quiet here would strand every client waiting on a frame callback.
-        let _ = self
-            .backend_sender
-            .try_send(BackendMessage::FramePresented(PresentedAt::now()));
+        for output_id in presented {
+            // Reported even if there was no context to draw with or the window
+            // had no area. The scene is dealt with either way, and a backend
+            // that went quiet here would strand every client waiting on a
+            // frame callback.
+            let _ = self
+                .backend_sender
+                .try_send(BackendMessage::FramePresented(output_id, PresentedAt::now()));
+            // And the pacing: this output can take another frame once the host
+            // says it is time to draw again. Asking only after presenting is
+            // what bounds the compositor to one frame in flight per output.
+            self.ask_for_a_frame();
+        }
+    }
+
+    /// Ask the host when to draw next, and pass that on as a frame request.
+    ///
+    /// A hosted backend has no vblank of its own — it is a client of another
+    /// compositor, and `RedrawRequested` is that compositor telling it when a
+    /// frame it draws will be shown. That is the same signal a page flip
+    /// completing will be on a DRM backend, arriving by a different route.
+    fn ask_for_a_frame(&mut self) {
+        if let Some(gl) = self.gl.as_ref() {
+            gl.window.request_redraw();
+        }
     }
 
     /// Redraw the last frame, for when the window changed but the scene did not.
@@ -201,8 +247,10 @@ impl App {
         // alone, which is also the only one a dma-buf can be imported through.
         let RawDisplay::Egl(raw_display) = display.raw_display();
 
-        // The compositor already paces frames on its own 16ms timer, so waiting
-        // for vblank here would only stall the thread that handles input.
+        // Pacing comes from the host, through `RedrawRequested`, and a frame is
+        // only composed once this backend has asked for one. Blocking the swap
+        // on vblank as well would pace nothing extra and would stall the
+        // thread that handles input while it waited.
         if let Err(e) = surface.set_swap_interval(&context, SwapInterval::DontWait) {
             warn!("failed to disable vsync: {e}");
         }
@@ -237,6 +285,20 @@ impl App {
             context,
             renderer,
         })
+    }
+
+    /// Try importing one client buffer and report back.
+    ///
+    /// Answered even when there is no context to try with: a client's `create`
+    /// is waiting on this, and silence would hang it.
+    fn answer_dmabuf_import(&mut self, token: u64, image: &crate::shared::DmabufImage) {
+        let imported = self
+            .gl
+            .as_ref()
+            .is_some_and(|gl| gl.renderer.verify_import(image));
+        let _ = self
+            .backend_sender
+            .blocking_send(BackendMessage::DmabufImportResult { token, imported });
     }
 
     /// Answer a dma-buf probe, or remember to once there is a context.
@@ -313,6 +375,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // Without a context there is nothing to display, and no
                 // software path to fall back to, so stop rather than run blind.
                 error!("failed to initialise GL backend: {e:#}");
+                // Release startup even so: it is waiting on this, and a
+                // compositor that is shutting down should not also hang.
+                if let Some(ready) = self.ready.take() {
+                    let _ = ready.send(());
+                }
                 let _ = self.backend_sender.blocking_send(BackendMessage::Closed);
                 self.cancel_token.cancel();
                 event_loop.exit();
@@ -364,13 +431,24 @@ impl ApplicationHandler<UserEvent> for App {
             self.answer_dmabuf_probe();
         }
 
+        // Everything a connecting client will be told now exists.
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.send(());
+        }
+
         // Clear to the background so the window is not showing whatever was in
         // the buffer before the first scene arrives.
         let empty = Scene {
             output_id: WINIT_OUTPUT_ID,
+            serial: 0,
             elements: Vec::new(),
         };
         self.present_scene(&empty);
+        // Nothing has been composed for this output yet, and nothing will be
+        // until it is asked for. This is the first turn of that loop.
+        let _ = self
+            .backend_sender
+            .try_send(BackendMessage::FrameRequested(WINIT_OUTPUT_ID));
     }
 
     /// Window event handler (called by winit event loop)
@@ -390,7 +468,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.repaint();
             }
             WindowEvent::RedrawRequested => {
+                // The host is ready to show another frame. Repaint what is
+                // already here so the window is never blank, and tell the
+                // compositor it may compose the next one.
                 self.repaint();
+                let _ = self
+                    .backend_sender
+                    .try_send(BackendMessage::FrameRequested(WINIT_OUTPUT_ID));
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(scancode) = event.physical_key.to_scancode() {
@@ -478,6 +562,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::FrameReady => self.present_pending_frames(),
             UserEvent::Request(BackendRequest::ProbeDmabuf) => self.answer_dmabuf_probe(),
+            UserEvent::Request(BackendRequest::ImportDmabuf { token, image }) => {
+                self.answer_dmabuf_import(token, &image);
+            }
         }
     }
 }
@@ -494,8 +581,6 @@ pub fn run_winit_backend(
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_any_thread(true)
         .build()?;
-
-    let _ = ready_tx.send(());
 
     let proxy: EventLoopProxy<UserEvent> = event_loop.create_proxy();
     let rt = tokio::runtime::Handle::current();
@@ -548,6 +633,7 @@ pub fn run_winit_backend(
     let xkb_state = xkb::State::new(&xkb_keymap);
 
     let mut app = App {
+        ready: Some(ready_tx),
         gl: None,
         backend_sender,
         cancel_token: cancel_token.clone(),
@@ -556,6 +642,7 @@ pub fn run_winit_backend(
         xkb_state,
         frames: frame_rx,
         last_frame: None,
+        drawn: HashMap::new(),
         dmabuf_probe_pending: false,
     };
     event_loop.run_app(&mut app)?;

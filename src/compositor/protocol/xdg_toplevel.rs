@@ -52,9 +52,7 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
                 msg.message.op_code
             );
         }
-        op => {
-            tracing::warn!("xdg_toplevel: unhandled opcode {}", op);
-        }
+        _ => super::unknown_request(state, msg, "xdg_toplevel"),
     }
 }
 
@@ -70,6 +68,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 fn handle_set_title(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(title) = args.string() else {
+        super::malformed_request(state, msg, "xdg_toplevel");
         return;
     };
     let toplevel_id = msg.message.object_id;
@@ -82,6 +81,7 @@ fn handle_set_title(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
 fn handle_set_app_id(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     let Some(app_id) = args.string() else {
+        super::malformed_request(state, msg, "xdg_toplevel");
         return;
     };
     let toplevel_id = msg.message.object_id;
@@ -117,6 +117,7 @@ fn handle_set_size_hint(
 ) {
     let mut args = ArgReader::new(&msg.message.args);
     let (Some(width), Some(height)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "xdg_toplevel");
         return;
     };
     let toplevel_id = msg.message.object_id;
@@ -147,6 +148,7 @@ fn handle_move(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
     let mut args = ArgReader::new(&msg.message.args);
     // move args: object seat, uint serial
     let (Some(_seat), Some(serial)) = (args.u32(), args.u32()) else {
+        super::malformed_request(state, msg, "xdg_toplevel");
         return;
     };
     let Some(surface) = grab_target(state, msg.client_id, msg.message.object_id, serial) else {
@@ -161,6 +163,7 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
     let mut args = ArgReader::new(&msg.message.args);
     // resize args: object seat, uint serial, uint edges
     let (Some(_seat), Some(serial), Some(edges)) = (args.u32(), args.u32(), args.u32()) else {
+        super::malformed_request(state, msg, "xdg_toplevel");
         return;
     };
     let Some(surface) = grab_target(state, msg.client_id, msg.message.object_id, serial) else {

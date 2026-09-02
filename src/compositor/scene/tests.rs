@@ -117,7 +117,7 @@ fn memfd_filled_with(size: usize, colour: u32) -> std::fs::File {
 /// Build a scene through a throwaway cache, for tests that only look at
 /// one frame.
 fn scene_of(state: &CompositorState) -> Scene {
-    build(OUTPUT, state, &mut SceneCache::new())
+    build(OUTPUT, 1, state, &mut SceneCache::new())
 }
 
 /// The one element drawn from the client's buffer. The cursor is always in
@@ -234,7 +234,7 @@ fn previous_serial_of(image: &TextureImage) -> Option<u64> {
 }
 
 fn texture_of(state: &CompositorState, cache: &mut SceneCache) -> Arc<TextureImage> {
-    surface_element(&build(OUTPUT, state, cache))
+    surface_element(&build(OUTPUT, 1, state, cache))
         .texture
         .clone()
 }
@@ -458,13 +458,13 @@ fn a_window_is_drawn_only_on_the_output_it_belongs_to() {
 
     // Belongs to the first output, so the second one draws nothing of it.
     assert!(
-        build(OUTPUT, &state, &mut cache)
+        build(OUTPUT, 1, &state, &mut cache)
             .elements
             .iter()
             .any(|e| e.texture.id == TextureId::Buffer(CLIENT, BUFFER_ID))
     );
     assert!(
-        !build(OUTPUT_B, &state, &mut cache)
+        !build(OUTPUT_B, 1, &state, &mut cache)
             .elements
             .iter()
             .any(|e| e.texture.id == TextureId::Buffer(CLIENT, BUFFER_ID))
@@ -481,7 +481,7 @@ fn a_window_is_drawn_in_its_own_outputs_coordinates() {
     let surface = state.surfaces.get_mut(&(CLIENT, SURFACE_ID)).unwrap();
     surface.position = (OUTPUT_SIDE + 10, 20);
 
-    let scene = build(OUTPUT_B, &state, &mut SceneCache::new());
+    let scene = build(OUTPUT_B, 1, &state, &mut SceneCache::new());
     // Global x of OUTPUT_SIDE + 10 is x = 10 on that output's own surface.
     assert_eq!(
         surface_element(&scene).dst,
@@ -504,10 +504,10 @@ fn the_cursor_is_drawn_only_on_the_output_under_it() {
         )
     };
 
-    let first = build(OUTPUT, &state, &mut SceneCache::new());
+    let first = build(OUTPUT, 1, &state, &mut SceneCache::new());
     assert!(!first.elements.iter().any(is_cursor));
 
-    let second = build(OUTPUT_B, &state, &mut SceneCache::new());
+    let second = build(OUTPUT_B, 1, &state, &mut SceneCache::new());
     let cursor = second
         .elements
         .iter()
