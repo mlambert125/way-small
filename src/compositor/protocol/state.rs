@@ -16,6 +16,28 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use strum::FromRepr;
 
+#[cfg(test)]
+mod tests;
+
+/// The furthest a surface may sit from its parent, in either direction.
+///
+/// A `wl_subsurface.set_position` is a raw `i32` from the client, and the
+/// protocol puts no bound on it. Those offsets accumulate down a subsurface
+/// tree and are then added to an output origin, so an unclamped one overflows
+/// the arithmetic that hit-tests and composes the tree — a panic in a debug
+/// build, which takes every client down with it, and a wrapped coordinate in a
+/// release build, which is worse for being quiet.
+///
+/// A megapixel in each direction is orders of magnitude past any desktop and
+/// still leaves room for a thousand levels of nesting before an accumulated
+/// offset could reach `i32::MAX`. Positions beyond it are clamped rather than
+/// refused: the protocol allows them, and a surface placed a million pixels
+/// away is off-screen either way.
+pub const MAX_SURFACE_OFFSET: i32 = 1 << 20;
+
+/// The most planes a buffer can have, per `zwp_linux_buffer_params_v1`.
+pub const MAX_DMABUF_PLANES: usize = 4;
+
 /// A client object-id tuple holding a `client_id` paired with an object id.  This pair
 /// is needed because object ids are only unique per client, so the `client_id` is paired
 /// to make it unique
@@ -148,22 +170,6 @@ pub struct SurfacePending {
     pub buffer_scale: Option<i32>,
 }
 
-/// The furthest a surface may sit from its parent, in either direction.
-///
-/// A `wl_subsurface.set_position` is a raw `i32` from the client, and the
-/// protocol puts no bound on it. Those offsets accumulate down a subsurface
-/// tree and are then added to an output origin, so an unclamped one overflows
-/// the arithmetic that hit-tests and composes the tree — a panic in a debug
-/// build, which takes every client down with it, and a wrapped coordinate in a
-/// release build, which is worse for being quiet.
-///
-/// A megapixel in each direction is orders of magnitude past any desktop and
-/// still leaves room for a thousand levels of nesting before an accumulated
-/// offset could reach `i32::MAX`. Positions beyond it are clamped rather than
-/// refused: the protocol allows them, and a surface placed a million pixels
-/// away is off-screen either way.
-pub const MAX_SURFACE_OFFSET: i32 = 1 << 20;
-
 /// Bring a client-chosen surface offset within [`MAX_SURFACE_OFFSET`].
 pub fn clamp_surface_offset(x: i32, y: i32) -> (i32, i32) {
     (
@@ -206,9 +212,6 @@ pub struct Surface {
     /// not on screen.
     pub visible_on: HashSet<OutputId>,
 }
-
-/// The most planes a buffer can have, per `zwp_linux_buffer_params_v1`.
-pub const MAX_DMABUF_PLANES: usize = 4;
 
 /// One plane of a buffer a client is describing.
 #[derive(Debug)]
@@ -1458,6 +1461,3 @@ impl CompositorState {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
