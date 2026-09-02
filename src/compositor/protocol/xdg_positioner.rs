@@ -4,7 +4,9 @@
 //! its parent. Clients set size, anchor rect, anchor edge, gravity, offset,
 //! and constraint adjustments before passing the positioner to `get_popup`.
 
-use super::state::{XdgPositionerAnchor, XdgPositionerConstraintAdjustment, XdgPositionerGravity};
+use enumflags2::BitFlags;
+
+use super::state::{XdgPositionerAnchor, XdgPositionerGravity};
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::state::CompositorState;
@@ -115,8 +117,7 @@ fn handle_set_constraint_adjustment(
     };
     let id = msg.message.object_id;
     if let Some(p) = state.xdg_positioners.get_mut(&(msg.client_id, id)) {
-        p.constraint_adjustment = XdgPositionerConstraintAdjustment::from_repr(adjustment)
-            .expect("Constraint adjustment value should be valid");
+        p.constraint_adjustment = BitFlags::from_bits_truncate(adjustment);
     }
 }
 

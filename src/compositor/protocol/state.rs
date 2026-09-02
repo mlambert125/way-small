@@ -11,6 +11,7 @@ use crate::shared::{
     BufferGuard, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping, TextureRect,
     cursor_bounds, output_contains,
 };
+use enumflags2::{BitFlags, bitflags};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
@@ -471,11 +472,10 @@ pub enum XdgPositionerGravity {
     BottomRight = 8,
 }
 
-#[derive(Debug, Default, Clone, Copy, FromRepr)]
+#[derive(Debug, Clone, Copy)]
+#[bitflags]
 #[repr(u32)]
 pub enum XdgPositionerConstraintAdjustment {
-    #[default]
-    None = 0,
     SlideX = 1,
     SlideY = 2,
     FlipX = 4,
@@ -493,7 +493,7 @@ pub struct XdgPositionerState {
     pub anchor: XdgPositionerAnchor,
     pub gravity: XdgPositionerGravity,
     pub offset: (i32, i32),
-    pub constraint_adjustment: XdgPositionerConstraintAdjustment,
+    pub constraint_adjustment: BitFlags<XdgPositionerConstraintAdjustment>,
 }
 
 #[derive(Debug, Clone)]
