@@ -156,6 +156,9 @@ pub fn build(
             push_surface_tree(state, cache, &mut elements, key, x - origin_x, y - origin_y);
         }
 
+        // Above every window and below the cursor: a drag icon is meant to be
+        // the thing being carried, and the pointer stays on top of it.
+        push_drag_icon(state, cache, &mut elements, output, origin_x, origin_y);
         push_cursor(state, cache, &mut elements, output, origin_x, origin_y);
     }
 
@@ -400,6 +403,47 @@ fn repack_rows(
         out[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(src);
     }
     Some(out.into_boxed_slice())
+}
+
+/// Add the icon of a drag in progress to the scene.
+///
+/// The icon follows the pointer, offset by whatever the client attached it
+/// with. That offset is the only means a client has to position its icon — a
+/// toolkit centres one under the cursor by attaching at a negative dx and dy —
+/// which is why [`crate::compositor::protocol::state::Surface::offset`] is
+/// tracked at all.
+///
+/// Nothing has to be unwound when the drag ends: this reads `state.drag`, so
+/// clearing the drag stops drawing the icon on the next frame.
+fn push_drag_icon(
+    state: &CompositorState,
+    cache: &mut SceneCache,
+    elements: &mut Vec<SceneElement>,
+    output: &Output,
+    origin_x: i32,
+    origin_y: i32,
+) {
+    let Some(icon) = state.drag.as_ref().and_then(|drag| drag.icon) else {
+        return;
+    };
+    let cx = f64_to_i32(state.cursor_x);
+    let cy = f64_to_i32(state.cursor_y);
+    // The pointer is over one output at a time, and so is what it is carrying.
+    if !output_contains(output, cx, cy) {
+        return;
+    }
+    let offset = state.surfaces.get(&icon).map_or((0, 0), |s| s.offset);
+
+    // The whole tree: an icon surface can never itself be a subsurface, but it
+    // may have them.
+    push_surface_tree(
+        state,
+        cache,
+        elements,
+        icon,
+        cx - origin_x + offset.0,
+        cy - origin_y + offset.1,
+    );
 }
 
 /// Add the pointer cursor to the scene.

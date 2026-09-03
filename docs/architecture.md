@@ -25,11 +25,10 @@ This document describes a design, and parts of that design are ahead of the code
 yet written say so where they begin.  As of now:
 
 - **Built**: the socket subsystem, the protocol layer and compositor state, scene building, the GL renderer, shm with
-  zero-copy and damage tracking, dma-buf import, and the winit and null backends.
+  zero-copy and damage tracking, dma-buf import, the clipboard and drag and drop, and the winit and null backends.
 - **Not built**: the DRM backend, and with it every part of running on bare hardware — session management, `libinput`,
-  and modesetting.  There is no clipboard or drag and drop; `wl_data_device.start_drag` and `set_selection` are
-  accepted and do nothing.  Subsurface `set_sync` is recorded but does not cache commits.  There is no XWayland, no
-  layer shell, no decoration protocol, and no touch or tablet input.
+  and modesetting.  Subsurface `set_sync` is recorded but does not cache commits.  There is no XWayland, no layer
+  shell, no decoration protocol, no primary selection, and no touch or tablet input.
 
 ## Source Layout
 
@@ -188,6 +187,10 @@ Making this the dispatcher's job rather than each handler's is what keeps the ac
 ignores its descriptors, returns early, or is an unimplemented stub simply drops the `Vec<OwnedFd>`, which closes
 them.  It cannot leave a descriptor on the queue to be mispaired with some later request, which would otherwise
 corrupt every remaining file descriptor on that connection — a failure that surfaces far away from its cause.
+
+The table is about *inbound* descriptors only.  An event that carries one out — `wl_keyboard.keymap`, and
+`wl_data_source.send` — builds its message with `message_with_fds` and owns the descriptor from that point, so
+dropping the message closes it on every path, sent or not.
 
 Adding a new request that takes an `fd` argument therefore means adding it to `request_fd_count` and widening its
 interface's arm in `handle_message`.  Forgetting the arm closes the descriptor and makes the request a no-op;
@@ -590,6 +593,88 @@ workspace showing on the pointer's output, and the tick's confinement then pulls
 The same grabs are available without the client's cooperation, which is the only way to move a window whose decorations
 offer no handle: Alt+left-drag moves, and Alt+right-drag resizes from whichever corner of the window the pointer is
 nearest.
+
+#### The clipboard, and dragging between windows
+
+Four interfaces carry data between clients, and none of them carries any data.  A `wl_data_source` is a list of mime
+types a client says it can produce; a `wl_data_offer` is the compositor's name for that list, handed to a client that
+may ask for it; a `wl_data_device` is where a client is told which offer is the clipboard and what is being dragged
+over it.  What actually moves the bytes is a pipe the two clients share, and the compositor's whole part in it is to
+pass one end across.
+
+That is worth being explicit about, because it is what keeps this feature out of the event loop entirely.  A client
+pasting sends `wl_data_offer.receive` carrying the write end of a pipe it made; the compositor forwards that descriptor
+verbatim as the descriptor of `wl_data_source.send` to the offering client, and the two of them talk directly.  Nothing
+is buffered, nothing is read, and a hundred megabytes of pasted text never touches compositor memory.  A descriptor
+that would reach a client that has gone away is dropped instead, which closes it — an immediate end of file for the
+reader rather than a hang.  That is also what a paste from a stale offer or for a mime type that was never offered
+gets, and it is the right answer for all three: an empty paste is what actually happened, and none of them is a fault
+worth ending a connection over.
+
+It follows that a selection dies with the client that owns it.  Copy from a terminal, close the terminal, and there is
+nothing to paste — because the only thing that could have produced those bytes has gone.  Keeping the content alive
+would mean the compositor reading every offered mime type into memory the moment a selection was set, which is both
+the asynchronous pipe machinery this design avoids and a policy decision about which clipboards are worth spending
+memory on.  A clipboard manager is a client, and is where that belongs.
+
+An offer is named by the compositor, from the top of the id space, because there is no round trip in which the client
+could name it.  That has a consequence the id-space rules make sharp: `wl_display.delete_id` is never sent for a server
+id, so nothing but the client's own `wl_data_offer.destroy` takes the id out of its object map.  So when the compositor
+stops caring about an offer — the clipboard has been replaced, the drag has left the window — it forgets the offer's
+*contents* and keeps its *identity*.  Tearing the object down instead would leave the client holding an id the
+compositor had forgotten, and the destroy it is about to send would disconnect it.
+
+The clipboard follows keyboard focus.  There is one selection at a time, and the client that has focus is the one told
+about it: on a focus change it is sent a fresh offer, and on binding a data device while already focused it is sent one
+then.  That second case is the one that matters at startup — a client usually gets its data device well after its first
+window is focused, and a compositor that only offered the selection from the focus change would leave it with an empty
+clipboard for the rest of its life.  A client losing focus is told nothing, because an offer it still holds stops
+working the moment the selection is replaced, and it is not going to be asked for a paste in the meantime.  A client
+that owns the selection is offered it back like anyone else: copying and pasting within one application goes through
+exactly this path, and a shortcut that skipped the owner would break it.
+
+A drag takes the pointer the way a move does, and for the same reason: the compositor owns it until the button comes
+up, and the client the pointer was over is sent a leave so it is not left drawing a hover state it will hear no more
+about.  It is a separate piece of state from an interactive grab rather than a third kind of one, because the two have
+nothing in common past that sentence — a move writes a window's position and sends it a configure, while a drag writes
+no geometry at all and delivers protocol to a third client.  They are mutually exclusive by a check where each begins,
+which is also what stops a client starting a move mid-drag off the very button press that started the drag.
+
+What the pointer crosses over is delivered as `wl_data_device.enter`, `motion` and `leave` to the surface underneath,
+with a fresh offer per surface entered — and one per data device, since `enter` is a per-device event and an offer
+belongs to the device it arrived on.  No `wl_pointer` event reaches anyone for the duration; the target learns where
+the pointer is from `wl_data_device.motion`.  A drag with no source is a client dragging within itself and is delivered
+only to that client, with a null offer: there is nothing to hand anyone else.
+
+The two sides then negotiate.  The source names the actions it will allow, the target names the ones it will take and
+which of them it would rather have, and the compositor settles it — the preference where both sides offer it, failing
+that the lowest of copy, move and ask that they agree on, and `none` when they agree on nothing.  Both are told, and
+only when the answer changes.  A client too old for `set_actions` is not the same as one that has it and never called
+it: a version 1 or 2 source can only mean a copy, and a version 1 or 2 target has no way to refuse anything, so it is
+taken to accept whatever is offered.  That is exactly how those clients behaved before actions existed.
+
+On release, a target that has accepted a mime type *and* settled on an action gets `drop`; anything else cancels.  A
+target that took the content but agreed to do nothing with it has not accepted the drop.  The drop is where the drag
+ends and the offer does not: the pointer is free immediately, and the offer outlives it so the target can still read
+from it and then say it is done with `finish`, which is what tells the source `dnd_finished`.  Keeping the drag alive
+to mean "dropped but not finished" was the alternative, and it would put a second condition on every check of whether
+the pointer is spoken for — where the one place that forgot it would swallow the pointer for good.  A version 1 or 2
+target never sends `finish`, so its source never hears `dnd_finished`; that is what the protocol gives it.
+
+The drag icon is the cursor-surface path with a different position: a surface role, permanent like the cursor's, and
+one more quad pushed into the scene above every window and below the cursor.  It sits at the pointer plus whatever
+offset the client attached it with, which is the only means a client has to position it — a toolkit centres its icon
+under the cursor by attaching at a negative `dx` and `dy`.  That offset is why `wl_surface.attach`'s displacement and
+`wl_surface.offset` are tracked at all; nothing else reads them yet, and applying them to ordinary surfaces is a
+larger question about how a surface repositions itself on attach that is deliberately left alone.
+
+Serials are how a client proves the user asked for something.  Starting a drag must quote a pointer button press that
+is still held — the same rule an interactive move follows, and for the same reason, since a drag beginning after the
+user let go has nothing to follow.  Setting the clipboard is looser, because it is a keypress far more often than a
+click, and because a client working through a batch of events quotes the serial of the event it is handling rather
+than the newest one that arrived.  So the compositor keeps a short history of the serials it has sent each client
+rather than only the last, and honours a request quoting any of them.  A serial from neither is refused in silence: a
+client that lost that race has done nothing that warrants `wl_display.error`, which would end its connection.
 
 #### Rendering
 

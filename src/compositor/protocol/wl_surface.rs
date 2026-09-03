@@ -76,7 +76,8 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         FRAME => handle_frame(state, msg),
         SET_INPUT_REGION => handle_set_input_region(state, msg),
         SET_BUFFER_SCALE => handle_set_buffer_scale(state, msg),
-        SET_OPAQUE_REGION | SET_BUFFER_TRANSFORM | OFFSET => {
+        OFFSET => handle_offset(state, msg),
+        SET_OPAQUE_REGION | SET_BUFFER_TRANSFORM => {
             // Acknowledged but not acted upon yet
         }
         COMMIT => handle_commit(state, msg),
@@ -97,7 +98,7 @@ fn handle_destroy(state: &mut CompositorState, msg: &WaylandProtocolMessageWithC
 fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     let mut args = ArgReader::new(&msg.message.args);
     // attach args: object buffer (id or 0 for null), int32 x, int32 y
-    let (Some(buffer_id), Some(_x), Some(_y)) = (args.u32(), args.i32(), args.i32()) else {
+    let (Some(buffer_id), Some(x), Some(y)) = (args.u32(), args.i32(), args.i32()) else {
         super::malformed_request(state, msg, "wl_surface");
         return;
     };
@@ -111,7 +112,34 @@ fn handle_attach(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         } else {
             Some(buffer_id)
         };
+        accumulate_offset(&mut surface.pending.offset, x, y);
     }
+}
+
+fn handle_offset(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let mut args = ArgReader::new(&msg.message.args);
+    let (Some(x), Some(y)) = (args.i32(), args.i32()) else {
+        super::malformed_request(state, msg, "wl_surface");
+        return;
+    };
+
+    let surface_id = msg.message.object_id;
+    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
+        accumulate_offset(&mut surface.pending.offset, x, y);
+    }
+}
+
+/// Add one offset onto the pending one, keeping it within bounds.
+///
+/// Offsets accumulate across attaches within a commit, so this adds rather than
+/// replaces. Clamped for the same reason a subsurface position is: these are
+/// raw `i32`s from the client and are later added to a cursor position, which
+/// overflows if nothing bounds them.
+fn accumulate_offset(pending: &mut (i32, i32), x: i32, y: i32) {
+    *pending = super::state::clamp_surface_offset(
+        pending.0.saturating_add(x),
+        pending.1.saturating_add(y),
+    );
 }
 
 /// Which coordinate space a damage rectangle arrived in.
@@ -291,6 +319,16 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         if let Some(scale) = surface.pending.buffer_scale.take() {
             surface.buffer_scale = scale;
         }
+
+        // Apply the accumulated attach offset. Only the drag icon reads it —
+        // see `Surface::offset` — but it is committed here like any other
+        // double-buffered state so that it is correct if anything else comes
+        // to need it.
+        let offset = std::mem::take(&mut surface.pending.offset);
+        surface.offset = super::state::clamp_surface_offset(
+            surface.offset.0.saturating_add(offset.0),
+            surface.offset.1.saturating_add(offset.1),
+        );
 
         // Apply pending input region
         match std::mem::take(&mut surface.pending.input_region) {

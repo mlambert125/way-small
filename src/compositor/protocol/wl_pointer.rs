@@ -72,7 +72,8 @@ fn process_set_cursor(state: &mut CompositorState, msg: &WaylandProtocolMessageW
         return;
     }
 
-    // Role check: surface must not already have another role (subsurface or xdg_surface).
+    // Role check: surface must not already have another role (subsurface,
+    // xdg_surface, or drag icon).
     let is_subsurface = state
         .surfaces
         .get(&surface_key)
@@ -81,8 +82,9 @@ fn process_set_cursor(state: &mut CompositorState, msg: &WaylandProtocolMessageW
         .xdg_surfaces
         .values()
         .any(|x| x.client_id == client_id && x.wl_surface_id == surface_id);
+    let is_dnd_icon = state.dnd_icon_surfaces.contains(&surface_key);
 
-    if is_subsurface || is_xdg {
+    if is_subsurface || is_xdg || is_dnd_icon {
         return;
     }
 
@@ -106,6 +108,7 @@ pub fn send_enter(
 ) {
     let serial = next_serial();
     state.pointer_enter_serial.insert(client_id, serial);
+    state.record_input_serial(client_id, serial);
     let args = ArgWriter::new()
         .u32(serial)
         .u32(surface_id)
@@ -160,6 +163,10 @@ pub fn send_button(
     pressed: bool,
 ) -> u32 {
     let serial = next_serial();
+    // Recorded on release as well as press: a client may set the selection on
+    // button-up, and quoting the serial of the event it is handling is exactly
+    // what it is supposed to do.
+    state.record_input_serial(client_id, serial);
     let btn_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
         .u32(serial)

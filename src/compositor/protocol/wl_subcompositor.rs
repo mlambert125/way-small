@@ -65,6 +65,15 @@ fn handle_get_subsurface(state: &mut CompositorState, msg: &WaylandProtocolMessa
         return;
     }
 
+    if state.dnd_icon_surfaces.contains(&(client_id, surface_id)) {
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_subcompositor.get_subsurface: surface already has drag icon role",
+        );
+        return;
+    }
+
     debug!(
         "wl_subcompositor.get_subsurface: subsurface_id={} surface_id={} parent_id={}",
         subsurface_id, surface_id, parent_id

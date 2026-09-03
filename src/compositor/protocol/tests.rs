@@ -57,8 +57,9 @@ fn deliver(state: &mut CompositorState, object_id: u32, op_code: u16, args: Vec<
 
 /// Whether the client was sent a `wl_display.error`.
 fn was_sent_an_error(rx: &mut Receiver<WaylandProtocolMessage>) -> bool {
-    std::iter::from_fn(|| rx.try_recv().ok())
-        .any(|m| m.object_id == super::wl_display::OBJECT_ID && m.op_code == super::wl_display::ERROR)
+    std::iter::from_fn(|| rx.try_recv().ok()).any(|m| {
+        m.object_id == super::wl_display::OBJECT_ID && m.op_code == super::wl_display::ERROR
+    })
 }
 
 #[test]

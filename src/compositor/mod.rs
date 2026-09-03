@@ -12,11 +12,11 @@ use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState
 use crate::shared::{OutputId, PresentedAt, Scene, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
 use protocol::CompositorState;
-use protocol::state::{ClientObjectId, GrabKind, ResizeEdges, region_contains};
+use protocol::state::{ClientObjectId, GrabKind, OfferKind, ResizeEdges, region_contains};
 use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use protocol::{
-    wl_keyboard, wl_pointer, wl_registry, wl_surface, wp_presentation_feedback, xdg_popup,
-    xdg_surface, xdg_toplevel,
+    wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry,
+    wl_surface, wp_presentation_feedback, xdg_popup, xdg_surface, xdg_toplevel,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,6 +50,8 @@ const KEY_LEFTALT: u32 = 56;
 const KEY_F4: u32 = 62;
 // evdev keycode for RIGHTALT (used for now for hard-coded keymap)
 const KEY_RIGHTALT: u32 = 100;
+// evdev keycode for ESC, which abandons a drag
+const KEY_ESC: u32 = 1;
 
 /// Smallest window width an interactive resize will produce.
 const MIN_WINDOW_WIDTH: i32 = 120;
@@ -157,11 +159,7 @@ impl FramePacer {
             state.dirty = false;
         }
 
-        let due: Vec<OutputId> = self
-            .stale
-            .intersection(&self.waiting)
-            .copied()
-            .collect();
+        let due: Vec<OutputId> = self.stale.intersection(&self.waiting).copied().collect();
         if due.is_empty() {
             return;
         }
@@ -399,6 +397,15 @@ pub async fn run_compositor(
                         } else {
                             state.pressed_keys.remove(&evdev_key);
                         }
+                        // Escape abandons a drag. Without it the only way out
+                        // of one is to drop it somewhere, and the user may have
+                        // no somewhere they are willing to drop it on.
+                        if pressed && evdev_key == KEY_ESC && state.drag.is_some() {
+                            state.cancel_drag();
+                            consumed_keys.insert(evdev_key);
+                            continue;
+                        }
+
                         // Compositor bindings are handled here and never reach the
                         // client, so a bound combination cannot also trigger an
                         // application shortcut.
@@ -456,6 +463,16 @@ pub async fn run_compositor(
                         if state.pointer_grab.is_some() {
                             if !pressed {
                                 end_grab(&mut state);
+                            }
+                            continue;
+                        }
+
+                        // So does a drag, and for the same reason: the
+                        // compositor owns the pointer, and what the button does
+                        // is decide how the drag ends.
+                        if state.drag.is_some() {
+                            if !pressed {
+                                finish_drag(&mut state);
                             }
                             continue;
                         }
@@ -651,6 +668,12 @@ fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
     // A grab owns the pointer: motion drives the window, and the client hears
     // nothing until the button is up.
     if update_grab(state, x, y) {
+        return;
+    }
+
+    // A drag owns it for the same reason, and delivers to the surface
+    // underneath through its data device rather than its pointer.
+    if update_drag(state, time_ms) {
         return;
     }
 
@@ -1221,6 +1244,163 @@ fn end_grab(state: &mut CompositorState) {
     state.dirty = true;
 }
 
+/// Deliver a drag to whatever is under the pointer. Returns false if there is
+/// no drag, in which case the pointer belongs to the ordinary path.
+///
+/// The surface under the pointer hears about this through its *data device*,
+/// not its pointer: no `wl_pointer` event reaches anyone for the duration of a
+/// drag, and the target learns where the pointer is from
+/// `wl_data_device.motion`.
+fn update_drag(state: &mut CompositorState, time_ms: u32) -> bool {
+    let Some(drag) = state.drag.clone() else {
+        return false;
+    };
+    let (x, y) = (state.cursor_x, state.cursor_y);
+    state.dirty = true;
+
+    // A drag with no source is one client dragging within itself. It has
+    // nothing to hand anyone else, so nobody else is a target — filtering here
+    // rather than at delivery keeps the enter and leave bookkeeping honest,
+    // since the drag never considers itself to have entered a surface it may
+    // not talk to.
+    let hit = hit_test(state, x, y)
+        .filter(|h| drag.source.is_some() || h.surface.0 == drag.origin_client);
+    let new_focus = hit.as_ref().map(|h| h.surface);
+
+    if new_focus == drag.focus {
+        if let Some(h) = hit {
+            let (local_x, local_y) = (x - f64::from(h.surface_x), y - f64::from(h.surface_y));
+            for device_id in wl_data_device::devices_of(state, h.surface.0) {
+                wl_data_device::send_motion(
+                    state,
+                    h.surface.0,
+                    device_id,
+                    time_ms,
+                    local_x,
+                    local_y,
+                );
+            }
+        }
+        return true;
+    }
+
+    state.end_drag_focus();
+    if let Some(h) = hit {
+        let (local_x, local_y) = (x - f64::from(h.surface_x), y - f64::from(h.surface_y));
+        enter_drag_surface(state, h.surface, local_x, local_y);
+    }
+    true
+}
+
+/// Introduce a drag to the client whose surface it has just moved over.
+///
+/// One offer per data device, because `enter` is a per-device event and an
+/// offer belongs to the device it arrived on. The order within a device is
+/// forced: the client has to know the object exists and what mime types are
+/// behind it before it is told a drag is over it and asked to decide.
+fn enter_drag_surface(state: &mut CompositorState, surface: ClientObjectId, x: f64, y: f64) {
+    let Some(source) = state.drag.as_ref().map(|drag| drag.source) else {
+        return;
+    };
+    let client_id = surface.0;
+    let source_actions = source
+        .and_then(|key| state.data_sources.get(&key))
+        .map_or(0, |s| s.actions);
+
+    let mut offers = Vec::new();
+    for device_id in wl_data_device::devices_of(state, client_id) {
+        let offer = source.and_then(|source| {
+            wl_data_device::create_offer(state, client_id, device_id, source, OfferKind::Drag)
+        });
+        if let Some(offer) = offer {
+            // Before the enter, so the client has the whole picture at the
+            // moment it decides what it will accept.
+            wl_data_offer::send_source_actions(state, offer, source_actions);
+            offers.push(offer);
+        }
+        wl_data_device::send_enter(
+            state,
+            client_id,
+            device_id,
+            surface.1,
+            x,
+            y,
+            offer.map(|(_, offer_id)| offer_id),
+        );
+    }
+
+    if let Some(drag) = state.drag.as_mut() {
+        drag.focus = Some(surface);
+        drag.focus_offers.clone_from(&offers);
+    }
+    // After the enter, so the client has already been told the offer exists
+    // before it hears what action it would settle on.
+    for offer in offers {
+        state.resolve_offer_action(offer);
+    }
+}
+
+/// Resolve a drag when the button comes up.
+///
+/// A drop frees the pointer immediately and does *not* end the offer. The
+/// target has still to read the data and say when it is done, and everything
+/// that needs is reachable from the offer rather than from the drag — so the
+/// drag is what ends here and the offer is what survives. Keeping the drag
+/// alive to mean "dropped but not finished" would put a second condition on
+/// every check of whether the pointer is spoken for, and the one place that
+/// forgot it would swallow the pointer for good.
+fn finish_drag(state: &mut CompositorState) {
+    // Read before the drag is taken: this asks what the target accepted
+    // through it.
+    let accepted = state.drag_target_accepted();
+    let Some(drag) = state.drag.take() else {
+        return;
+    };
+    state.dirty = true;
+
+    let Some(focus) = drag.focus else {
+        // Let go over nothing. There is nobody to drop on, so the source is
+        // told the drag came to nothing.
+        if let Some(source) = drag.source {
+            wl_data_source::send_cancelled(state, source);
+        }
+        return;
+    };
+
+    // A drag with no source went only to the client that started it, which
+    // handles the content itself: there is no source to tell and no offer to
+    // keep alive.
+    if drag.source.is_none() {
+        for device_id in wl_data_device::devices_of(state, focus.0) {
+            wl_data_device::send_drop(state, focus.0, device_id);
+        }
+        return;
+    }
+
+    if !accepted {
+        for device_id in wl_data_device::devices_of(state, focus.0) {
+            wl_data_device::send_leave(state, focus.0, device_id);
+        }
+        for &offer in &drag.focus_offers {
+            state.invalidate_offer(offer);
+        }
+        if let Some(source) = drag.source {
+            wl_data_source::send_cancelled(state, source);
+        }
+        return;
+    }
+
+    for device_id in wl_data_device::devices_of(state, focus.0) {
+        wl_data_device::send_drop(state, focus.0, device_id);
+    }
+    for &offer in &drag.focus_offers {
+        state.mark_offer_dropped(offer);
+    }
+    if let Some(source) = drag.source {
+        wl_data_source::send_dnd_drop_performed(state, source);
+    }
+}
+
 /// Ask a client for a size, marking whether the resize is still in progress.
 fn configure_resizing(
     state: &mut CompositorState,
@@ -1294,6 +1474,15 @@ pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObject
         }
     }
     xdg_toplevel::send_activated(state, new_client, new_surface, true);
+
+    // The clipboard follows keyboard focus, so this is where a client is told
+    // what is on it. After the keyboard enter, because having focus is what
+    // makes the selection this client's to read.
+    //
+    // The client losing focus is told nothing: an offer it still holds stops
+    // working the moment the selection is replaced, and it is not going to be
+    // asked for a paste in the meantime.
+    wl_data_device::send_selection_to_client(state, new_client);
 }
 
 /// Every window on screen, topmost first.
@@ -1358,16 +1547,14 @@ fn hit_test_surface_tree(
             continue;
         };
         let (cx, cy) = child.subsurface_position;
-        if let Some(result) =
-            hit_test_surface_tree(
-                state,
-                child_key,
-                offset_x.saturating_add(cx),
-                offset_y.saturating_add(cy),
-                px,
-                py,
-            )
-        {
+        if let Some(result) = hit_test_surface_tree(
+            state,
+            child_key,
+            offset_x.saturating_add(cx),
+            offset_y.saturating_add(cy),
+            px,
+            py,
+        ) {
             return Some(result);
         }
     }

@@ -6,13 +6,17 @@
 use super::super::workspace::{Workspace, Workspaces};
 use super::client::Clients;
 use super::wire_utils::f64_to_i32;
+use super::wl_data_device_manager::{
+    DND_ACTION_ASK, DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_NONE,
+};
 use super::wl_pointer;
+use super::{wl_data_device, wl_data_offer, wl_data_source};
 use crate::shared::{
     BufferGuard, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping, TextureRect,
     cursor_bounds, output_contains,
 };
 use enumflags2::{BitFlags, bitflags};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use strum::FromRepr;
@@ -169,6 +173,10 @@ pub struct SurfacePending {
     pub input_region: PendingInputRegion,
     /// Pending `wl_surface.set_buffer_scale`.
     pub buffer_scale: Option<i32>,
+    /// Pending offset from `wl_surface.attach`'s `dx`/`dy`, or
+    /// `wl_surface.offset`. Accumulates across attaches within one commit,
+    /// which is what the protocol says it does.
+    pub offset: (i32, i32),
 }
 
 /// Bring a client-chosen surface offset within [`MAX_SURFACE_OFFSET`].
@@ -198,6 +206,15 @@ pub struct Surface {
     /// scaled output submit a correspondingly larger buffer, so the surface's
     /// logical size is its buffer size divided by this. Always at least 1.
     pub buffer_scale: i32,
+    /// Where the surface's contents sit relative to where they would
+    /// otherwise, from `wl_surface.attach`'s `dx`/`dy` and `wl_surface.offset`.
+    ///
+    /// Read only by the drag icon, which is the one surface whose position is
+    /// *defined* by it — a client centres its icon under the pointer this way
+    /// and has no other means to. Applying it to ordinary surfaces is a larger
+    /// question about how a surface repositions itself on attach, and is
+    /// deliberately left alone here rather than changed in passing.
+    pub offset: (i32, i32),
     /// Outputs the client has been told this surface is on, via
     /// `wl_surface.enter`. Diffed each frame so only changes are sent.
     pub entered_outputs: HashSet<OutputId>,
@@ -514,6 +531,129 @@ pub struct SeatState {
     pub has_keyboard: bool,
 }
 
+/// What a `wl_data_source` has been spent on.
+///
+/// A source is single-use by protocol: offering the same one as a selection and
+/// then as a drag would leave two unrelated transfers sharing one set of mime
+/// types and one `cancelled`. The second use is `used_source`, which is why this
+/// is recorded rather than inferred from whether the selection happens to name
+/// it — a source cancelled and replaced is still used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSourceRole {
+    Unused,
+    Selection,
+    Drag,
+}
+
+/// A `wl_data_source`: content one client is offering to another.
+#[derive(Debug)]
+pub struct DataSource {
+    /// Mime types in the order the client offered them, which is the order of
+    /// its own preference and is passed on to the receiver unchanged.
+    pub mime_types: Vec<String>,
+    /// The `dnd_action` mask from `set_actions`.
+    ///
+    /// Zero means the client never called it. That is not the same as a client
+    /// too old to have the request, which is taken to mean `copy` — so the
+    /// default is applied where the negotiation runs rather than stored here,
+    /// and the two cases stay tellable apart.
+    pub actions: u32,
+    /// What this source has been spent on, if anything.
+    pub role: DataSourceRole,
+}
+
+/// Which of the three lives an offer is leading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferKind {
+    /// A clipboard offer, handed out on focus change.
+    Selection,
+    /// The offer for a drag still under the pointer.
+    Drag,
+    /// A drag offer that has been dropped on. The pointer is free again, but
+    /// the offer outlives the drag so the target can still read from it and
+    /// say when it is done.
+    Dropped,
+}
+
+/// A `wl_data_offer`: the compositor's handle on a source, held by the receiver.
+///
+/// The id is the compositor's rather than the client's — see
+/// [`super::client::ClientState::allocate_id`] — because the protocol has the
+/// compositor name it in `wl_data_device.data_offer`, and there is no round
+/// trip in which the client could name it instead.
+#[derive(Debug)]
+pub struct DataOffer {
+    /// The client this offer was given to. The key already says this, since the
+    /// object id lives in that client's id space; it is kept because teardown
+    /// walks values rather than keys.
+    pub client_id: u32,
+    /// The source behind this offer, or `None` once that source has gone.
+    ///
+    /// An offer outlives its source, and it outlives the compositor caring
+    /// about it. The client still owns the id and will still send requests on
+    /// it, and those have to be answered — what is lost is anything to answer
+    /// them with, so a `receive` closes the pipe rather than hanging.
+    pub source: Option<ClientObjectId>,
+    /// Which half of the protocol this offer belongs to. The three take
+    /// different request paths: `finish` and the action events are drag-only,
+    /// and `finish` is legal only once the drop has happened.
+    pub kind: OfferKind,
+    /// The mime type last passed to `accept`, relayed to the source as
+    /// `wl_data_source.target`. `None` means the receiver will take nothing.
+    pub accepted: Option<String>,
+    /// The `dnd_action` mask from `set_actions`, and the one action within it
+    /// the receiver would rather have.
+    pub actions: u32,
+    pub preferred_action: u32,
+    /// The action last settled between the two sides, so an `action` event goes
+    /// out only when it changes.
+    pub resolved_action: u32,
+}
+
+/// A `wl_data_device`.
+///
+/// A flat list, keyed the way `wl_pointer` and `wl_keyboard` bindings are:
+/// every delivery is a fan-out over all of them, and `Clients::get` borrows
+/// mutably, so the list has to be cloned out before the sends begin.
+#[derive(Debug, Clone)]
+pub struct DataDeviceBinding {
+    pub client_id: u32,
+    pub object_id: u32,
+}
+
+/// A drag the compositor is carrying between clients.
+///
+/// Deliberately not a third [`GrabKind`]. A move or resize acts on a window: it
+/// writes a position and sends a configure. A drag writes no geometry at all
+/// and delivers protocol to a *third* client, so both of [`PointerGrab`]'s
+/// fields would be meaningless for it and the two would share not one line of
+/// how they are driven. They cannot both be held at once — an interactive grab
+/// swallows the button press, so the client never receives a serial to quote at
+/// `start_drag` — and that is enforced where each begins rather than assumed.
+#[derive(Debug, Clone)]
+pub struct Drag {
+    /// The content being dragged, or `None` for a client dragging within itself
+    /// with nothing to hand anyone else. That case is why the origin client is
+    /// stored separately rather than read off the source.
+    pub source: Option<ClientObjectId>,
+    /// The client that started the drag, which owns the pointer until it ends.
+    pub origin_client: u32,
+    /// The `wl_surface` the drag started from.
+    pub origin: ClientObjectId,
+    /// The drag icon, if the client gave one. Follows the pointer.
+    pub icon: Option<ClientObjectId>,
+    /// The surface under the pointer. `None` between surfaces, and once a
+    /// target has gone away.
+    pub focus: Option<ClientObjectId>,
+    /// The offers the focus's client was given, one per data device it holds.
+    ///
+    /// A list rather than a single offer because `enter` is a per-device event:
+    /// a client with two devices is entered twice and needs an offer for each,
+    /// and it may then negotiate through either of them. Empty for a drag with
+    /// no source, and for a target that has destroyed what it was given.
+    pub focus_offers: Vec<ClientObjectId>,
+}
+
 pub struct DefaultCursor {
     pub pixels: Vec<u32>,
     pub width: i32,
@@ -617,6 +757,91 @@ pub struct CompositorState {
     /// Buffers the compositor has finished with, waiting on their readers
     /// before `wl_buffer.release` can be sent.
     pub releasing_buffers: HashSet<ClientObjectId>,
+    /// Content clients are offering, keyed by their `wl_data_source` object.
+    pub data_sources: HashMap<ClientObjectId, DataSource>,
+    /// Offers the compositor has handed out, keyed by the receiving client and
+    /// the id allocated in that client's half of the compositor's id space.
+    pub data_offers: HashMap<ClientObjectId, DataOffer>,
+    /// Every live `wl_data_device`.
+    pub data_devices: Vec<DataDeviceBinding>,
+    /// The source that owns the clipboard, if any.
+    ///
+    /// Names the source rather than copying its mime types: there is one
+    /// clipboard, and a second copy of the list could only drift from the
+    /// source that owns it.
+    pub selection: Option<ClientObjectId>,
+    /// The drag in progress, if any. One, because there is one pointer.
+    pub drag: Option<Drag>,
+    /// Surfaces with the drag-icon role. Permanent, like the cursor role.
+    pub dnd_icon_surfaces: HashSet<ClientObjectId>,
+    /// The last few serials of input events delivered to each client.
+    ///
+    /// A client quoting a serial is saying "the user did this in my window",
+    /// and the serial it quotes is the one on the event it is handling — which
+    /// is not necessarily the newest, because a client may read a batch of
+    /// events and act on the first of them. Keeping only the newest refuses a
+    /// client that did nothing wrong; keeping a short history costs a few words
+    /// per client and does not.
+    ///
+    /// Deliberately separate from [`Self::last_button_serial`], which is a
+    /// stricter rule for a different purpose: an interactive move must follow
+    /// the press that is *currently held*, and loosening that to serve the
+    /// clipboard would weaken move and resize by a side effect.
+    pub recent_input_serials: HashMap<u32, VecDeque<u32>>,
+}
+
+/// How many input serials are remembered per client for
+/// [`CompositorState::recent_input_serials`].
+///
+/// Long enough to cover any batch a client could reasonably be working through,
+/// short enough that a stale serial from minutes ago is not still honoured.
+const RECENT_INPUT_SERIALS: usize = 32;
+
+/// Settle the action for a drag from the two sides' masks.
+///
+/// Both sides name a set of actions they will allow, and the receiving side
+/// names one within its set that it would rather have. The preference wins
+/// where the other side also offers it; failing that the lowest bit of what
+/// they agree on does, which puts copy ahead of move ahead of ask.
+///
+/// A client too old to have `set_actions` at all is not the same as one that
+/// has it and never called it, which is why the versions come in here rather
+/// than the defaults being written into the state. A version 1 or 2 source can
+/// only mean a plain copy, and a version 1 or 2 target has no way to refuse
+/// anything, so it is taken to accept whatever is on offer and to prefer a
+/// copy — which is exactly the behaviour it had before actions existed.
+fn resolve_action(
+    source_actions: u32,
+    source_version: u32,
+    offer_actions: u32,
+    offer_preferred: u32,
+    offer_version: u32,
+) -> u32 {
+    let actions_since = super::wl_data_source::ACTIONS_SINCE;
+    let source_actions = if source_version >= actions_since {
+        source_actions
+    } else {
+        DND_ACTION_COPY
+    };
+    let (offer_actions, offer_preferred) = if offer_version >= actions_since {
+        (offer_actions, offer_preferred)
+    } else {
+        (DND_ACTION_COPY, DND_ACTION_COPY)
+    };
+
+    let available = source_actions & offer_actions;
+    if available == 0 {
+        return DND_ACTION_NONE;
+    }
+    if offer_preferred & available != 0 {
+        return offer_preferred;
+    }
+    for action in [DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_ASK] {
+        if available & action != 0 {
+            return action;
+        }
+    }
+    DND_ACTION_NONE
 }
 
 impl CompositorState {
@@ -666,7 +891,34 @@ impl CompositorState {
             next_content_serial: 0,
             buffer_guards: HashMap::new(),
             releasing_buffers: HashSet::new(),
+            data_sources: HashMap::new(),
+            data_offers: HashMap::new(),
+            data_devices: Vec::new(),
+            selection: None,
+            drag: None,
+            dnd_icon_surfaces: HashSet::new(),
+            recent_input_serials: HashMap::new(),
         }
+    }
+
+    /// Note a serial the compositor has just sent a client on an input event.
+    ///
+    /// Only input events are recorded. A serial from a configure or a frame
+    /// callback is not evidence the user did anything, and honouring one would
+    /// let a client take the clipboard whenever it liked.
+    pub fn record_input_serial(&mut self, client_id: u32, serial: u32) {
+        let serials = self.recent_input_serials.entry(client_id).or_default();
+        serials.push_back(serial);
+        while serials.len() > RECENT_INPUT_SERIALS {
+            serials.pop_front();
+        }
+    }
+
+    /// Whether a serial a client quoted is one it was recently given.
+    pub fn is_recent_input_serial(&self, client_id: u32, serial: u32) -> bool {
+        self.recent_input_serials
+            .get(&client_id)
+            .is_some_and(|serials| serials.contains(&serial))
     }
 
     /// Returns false if the pool could not be mapped, which is a client error:
@@ -794,6 +1046,9 @@ impl CompositorState {
     /// the duration, and a client left believing the pointer is still inside it
     /// would keep drawing hover states it can no longer see the end of.
     pub fn start_move_grab(&mut self, surface: ClientObjectId) {
+        if self.drag.is_some() {
+            return;
+        }
         let Some(toplevel) = self.toplevel_for_surface(surface) else {
             return;
         };
@@ -813,6 +1068,9 @@ impl CompositorState {
 
     /// Begin an interactive resize of a window's edge or corner.
     pub fn start_resize_grab(&mut self, surface: ClientObjectId, edges: ResizeEdges) {
+        if self.drag.is_some() {
+            return;
+        }
         let Some(toplevel) = self.toplevel_for_surface(surface) else {
             return;
         };
@@ -835,6 +1093,204 @@ impl CompositorState {
                 last_sent: size,
             },
         });
+    }
+
+    /// Put a source on the clipboard, or clear it.
+    ///
+    /// The source that held it is cancelled, and every offer drawing from it
+    /// goes dead — a client still holding a paste offer for the old clipboard
+    /// gets an empty read rather than the wrong contents.
+    pub fn set_selection(&mut self, source: Option<ClientObjectId>) {
+        if let Some(old) = self.selection
+            && Some(old) != source
+        {
+            wl_data_source::send_cancelled(self, old);
+            self.invalidate_offers_from(old);
+        }
+        self.selection = source;
+        if let Some(client_id) = self.focused_surface.map(|(client_id, _)| client_id) {
+            wl_data_device::send_selection_to_client(self, client_id);
+        }
+    }
+
+    /// Take a source off the clipboard without cancelling it.
+    ///
+    /// Used where the source is going away on its own account — destroyed, or
+    /// its client disconnecting — and telling it would be telling nobody.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        if let Some(client_id) = self.focused_surface.map(|(client_id, _)| client_id) {
+            wl_data_device::send_selection_to_client(self, client_id);
+        }
+    }
+
+    /// Cut every offer drawing from a source loose from it.
+    ///
+    /// The offers are not destroyed. Their clients still own the ids and will
+    /// still send requests on them, and a server id is never announced as free
+    /// — so the compositor forgets what an offer contains and keeps the fact
+    /// that it exists. A read from one then closes the pipe, which the client
+    /// sees as an empty transfer.
+    fn invalidate_offers_from(&mut self, source: ClientObjectId) {
+        for offer in self.data_offers.values_mut() {
+            if offer.source == Some(source) {
+                offer.source = None;
+                offer.accepted = None;
+            }
+        }
+    }
+
+    /// Drop a source, unwinding whatever it was in the middle of.
+    ///
+    /// `notify` sends `cancelled`, which is right when the compositor is taking
+    /// the source away and wrong when the client is destroying it itself.
+    pub fn retire_data_source(&mut self, source: ClientObjectId, notify: bool) {
+        if self.selection == Some(source) {
+            self.clear_selection();
+        }
+        if self.drag.as_ref().is_some_and(|d| d.source == Some(source)) {
+            self.cancel_drag();
+        }
+        self.invalidate_offers_from(source);
+        if notify {
+            wl_data_source::send_cancelled(self, source);
+        }
+        self.data_sources.remove(&source);
+    }
+
+    /// Begin a drag, taking the pointer for the duration.
+    ///
+    /// Sits beside [`Self::start_move_grab`] and [`Self::start_resize_grab`]
+    /// because it is the third thing that can own the pointer, and because all
+    /// three need `release_pointer_to_grab`, which stays private.
+    pub fn start_drag(
+        &mut self,
+        source: Option<ClientObjectId>,
+        origin_client: u32,
+        origin: ClientObjectId,
+        icon: Option<ClientObjectId>,
+    ) {
+        // The client the pointer was over is told it has left, for the same
+        // reason a move grab tells it: it would otherwise keep drawing a hover
+        // state for a pointer it will hear no more about.
+        self.release_pointer_to_grab();
+        self.drag = Some(Drag {
+            source,
+            origin_client,
+            origin,
+            icon,
+            focus: None,
+            focus_offers: Vec::new(),
+        });
+        self.dirty = true;
+    }
+
+    /// End a drag without a drop, telling both sides.
+    pub fn cancel_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        if let Some(focus) = drag.focus {
+            for device_id in wl_data_device::devices_of(self, focus.0) {
+                wl_data_device::send_leave(self, focus.0, device_id);
+            }
+        }
+        for offer in drag.focus_offers {
+            self.invalidate_offer(offer);
+        }
+        if let Some(source) = drag.source {
+            wl_data_source::send_cancelled(self, source);
+        }
+        self.dirty = true;
+    }
+
+    /// Note that an offer has been dropped on, which is what makes
+    /// `wl_data_offer.finish` legal on it.
+    pub fn mark_offer_dropped(&mut self, offer: ClientObjectId) {
+        if let Some(offer) = self.data_offers.get_mut(&offer) {
+            offer.kind = OfferKind::Dropped;
+        }
+    }
+
+    /// Cut one offer loose from its source, leaving the object in place.
+    pub fn invalidate_offer(&mut self, offer: ClientObjectId) {
+        if let Some(offer) = self.data_offers.get_mut(&offer) {
+            offer.source = None;
+            offer.accepted = None;
+        }
+    }
+
+    /// Settle the action for one drag offer, and tell both sides if it changed.
+    ///
+    /// Run whenever either side's half of the negotiation moves: the target's
+    /// `set_actions` or `accept`, and each time the drag enters a surface.
+    /// A selection offer has no action to settle — actions are a drag concept.
+    pub fn resolve_offer_action(&mut self, offer_key: ClientObjectId) {
+        let Some(offer) = self.data_offers.get(&offer_key) else {
+            return;
+        };
+        if offer.kind == OfferKind::Selection {
+            return;
+        }
+        let Some(source_key) = offer.source else {
+            return;
+        };
+        let Some(source) = self.data_sources.get(&source_key) else {
+            return;
+        };
+
+        let action = resolve_action(
+            source.actions,
+            self.object_version(source_key),
+            offer.actions,
+            offer.preferred_action,
+            self.object_version(offer_key),
+        );
+
+        if offer.resolved_action == action {
+            return;
+        }
+        if let Some(offer) = self.data_offers.get_mut(&offer_key) {
+            offer.resolved_action = action;
+        }
+        wl_data_offer::send_action(self, offer_key, action);
+        wl_data_source::send_action(self, source_key, action);
+    }
+
+    /// Re-settle every live drag offer.
+    ///
+    /// Used when the *source's* half of the negotiation moves, which it can do
+    /// without naming any particular offer.
+    pub fn resolve_drag_actions(&mut self) {
+        let keys: Vec<ClientObjectId> = self
+            .data_offers
+            .iter()
+            .filter(|(_, o)| o.kind != OfferKind::Selection && o.source.is_some())
+            .map(|(&key, _)| key)
+            .collect();
+        for key in keys {
+            self.resolve_offer_action(key);
+        }
+    }
+
+    /// Whether a drag target has said it will take what is being dragged.
+    ///
+    /// True only if it named a mime type *and* the two sides settled on an
+    /// action — a target that accepted the content but agreed to do nothing
+    /// with it has not accepted the drop.
+    pub fn drag_target_accepted(&self) -> bool {
+        self.drag.as_ref().is_some_and(|drag| {
+            drag.focus_offers.iter().any(|key| {
+                self.data_offers
+                    .get(key)
+                    .is_some_and(|o| o.accepted.is_some() && o.resolved_action != DND_ACTION_NONE)
+            })
+        })
+    }
+
+    /// The interface version an object was bound at, or 1 if its client is gone.
+    fn object_version(&self, key: ClientObjectId) -> u32 {
+        self.clients.version_of(key.0, key.1).unwrap_or(1)
     }
 
     /// Take the pointer away from whichever client currently has it.
@@ -1244,6 +1700,7 @@ impl CompositorState {
                 pending: SurfacePending::default(),
                 input_region: None,
                 buffer_scale: 1,
+                offset: (0, 0),
                 entered_outputs: HashSet::new(),
                 visible_on: HashSet::new(),
                 parent: None,
@@ -1256,7 +1713,58 @@ impl CompositorState {
     }
 
     pub fn destroy_surface(&mut self, client_id: u32, surface_id: u32) {
-        self.surfaces.remove(&(client_id, surface_id));
+        let key = (client_id, surface_id);
+        self.surfaces.remove(&key);
+
+        // A role is permanent for the life of the *surface*, not of the id. The
+        // client is about to be told the id is free again, and an id it
+        // reallocates is a new surface with no role — so leaving these behind
+        // would refuse a role to a surface that has never had one.
+        self.cursor_role_surfaces.remove(&key);
+        self.dnd_icon_surfaces.remove(&key);
+
+        // A drag cannot outlive the surface it started from — there would be
+        // nothing left to say where it came from, and the client that owns it
+        // has evidently moved on.
+        if self.drag.as_ref().is_some_and(|d| d.origin == key) {
+            self.cancel_drag();
+            return;
+        }
+        // An icon is not so load-bearing: the drag carries on without one.
+        if let Some(drag) = self.drag.as_mut() {
+            if drag.icon == Some(key) {
+                drag.icon = None;
+                self.dirty = true;
+            }
+            if self.drag.as_ref().is_some_and(|d| d.focus == Some(key)) {
+                self.end_drag_focus();
+            }
+        }
+    }
+
+    /// Take the drag off whatever surface it was over, telling that client.
+    pub fn end_drag_focus(&mut self) {
+        let Some(drag) = self.drag.as_ref() else {
+            return;
+        };
+        let Some(focus) = drag.focus else {
+            return;
+        };
+        let offers = drag.focus_offers.clone();
+
+        for device_id in wl_data_device::devices_of(self, focus.0) {
+            wl_data_device::send_leave(self, focus.0, device_id);
+        }
+        for offer in offers {
+            // The source is told the target will take nothing, so it can stop
+            // drawing a drop cursor for a window the pointer has left.
+            wl_data_device::clear_accepted(self, offer);
+            self.invalidate_offer(offer);
+        }
+        if let Some(drag) = self.drag.as_mut() {
+            drag.focus = None;
+            drag.focus_offers.clear();
+        }
     }
 
     pub fn create_region(&mut self, client_id: u32, region_id: u32) {
@@ -1453,6 +1961,48 @@ impl CompositorState {
         self.workspaces.remove_client(client_id);
         self.buffers_pending_release
             .retain(|(cid, _)| *cid != client_id);
+
+        // The data protocols, before the surfaces they refer to are forgotten:
+        // cancelling a drag sends a leave naming the surface it was over, and
+        // clearing the selection sends to whoever has focus.
+        //
+        // A drag whose origin has gone cannot continue — there is nobody to
+        // hand anything to. A drag whose *target* has gone can: the button is
+        // still down, and it will resolve as a cancel on release.
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.origin_client == client_id)
+        {
+            self.cancel_drag();
+        } else if let Some(drag) = self.drag.as_mut()
+            && drag.focus.is_some_and(|(cid, _)| cid == client_id)
+        {
+            drag.focus = None;
+            drag.focus_offers.clear();
+        }
+        // The clipboard outlives its owner only as an offer nobody can read
+        // from, so it is cleared rather than left naming a source that is gone.
+        if self.selection.is_some_and(|(cid, _)| cid == client_id) {
+            self.clear_selection();
+        }
+        let sources: Vec<ClientObjectId> = self
+            .data_sources
+            .keys()
+            .filter(|&&(cid, _)| cid == client_id)
+            .copied()
+            .collect();
+        for source in sources {
+            self.invalidate_offers_from(source);
+        }
+        self.data_sources.retain(|&(cid, _), _| cid != client_id);
+        // Offers are dropped by the client that *holds* them, not by the one
+        // whose source they drew from — those are cut loose above and left in
+        // place, because their own clients still own the ids.
+        self.data_offers.retain(|_, o| o.client_id != client_id);
+        self.data_devices.retain(|d| d.client_id != client_id);
+        self.dnd_icon_surfaces.retain(|(cid, _)| *cid != client_id);
+        self.recent_input_serials.remove(&client_id);
         // Clear focus if it pointed to a surface owned by this client
         if let Some((cid, _)) = self.focused_surface
             && cid == client_id

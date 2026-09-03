@@ -12,6 +12,14 @@
   `wp_color_representation_v1` to know which matrix and range to convert with
 - dma-buf: `y_invert`, currently refused. It is a `TextureSource::Dmabuf { image, y_invert }` field and a swap of the
   two v coordinates in the `u_src` uniform
+- Primary selection (`zwp_primary_selection_v1`), the middle-click clipboard.  It is a near-copy of `wl_data_device`
+  with its own three interfaces and the same descriptor relay behind it
+- `wlr-data-control`, which is what a clipboard manager binds.  Without it a selection dies with the client that set
+  it, which is what the protocol says should happen and is not always what a user wants
+- Drag and drop over touch (`wl_data_device.start_drag` quoting a `wl_touch.down` serial), once there is touch input
+  at all
+- The drag icon reads `wl_surface.attach`'s offset; ordinary surfaces still ignore it.  Applying it everywhere is the
+  larger question of how a surface repositions itself on attach
 - Workspace hotkeys: add, remove and switch the workspaces on an output (the hierarchy is there, the policy is not)
 - Client provided mouse cursors
 - Themed server mouse cursor support (hardcoded white arrow right now)

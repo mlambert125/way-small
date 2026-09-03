@@ -122,6 +122,7 @@ pub fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32
 /// Send `wl_keyboard`.enter to a client's keyboard object.
 pub fn send_enter(state: &mut CompositorState, client_id: u32, keyboard_id: u32, surface_id: u32) {
     let serial = next_serial();
+    state.record_input_serial(client_id, serial);
     // Build `wl_array` of currently pressed evdev keycodes
     let keys_data: Vec<u8> = state
         .pressed_keys
@@ -167,6 +168,9 @@ pub fn send_key(
     pressed: bool,
 ) {
     let serial = next_serial();
+    // This is the one that makes Ctrl+C work: a client setting the clipboard
+    // quotes the serial of the key press that asked for it.
+    state.record_input_serial(client_id, serial);
     let key_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
         .u32(serial)

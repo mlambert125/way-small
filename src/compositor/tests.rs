@@ -850,3 +850,345 @@ fn an_output_that_goes_away_is_forgotten() {
     assert_eq!(pacer.published.len(), 1);
     assert!(pacer.published.contains_key(&OutputId(1)));
 }
+
+// -- Drag and drop -----------------------------------------------------------
+
+use super::{enter_drag_surface, finish_drag, update_drag};
+use crate::compositor::protocol::state::{
+    DataDeviceBinding, DataSource, DataSourceRole, OfferKind,
+};
+use crate::compositor::protocol::{wl_data_device, wl_pointer};
+
+const DRAG_SOURCE: u32 = 40;
+const DRAG_DEVICE_A: u32 = 41;
+const DRAG_DEVICE_B: u32 = 42;
+
+/// Give a client a data device, without going through the manager.
+fn add_data_device(state: &mut CompositorState, client_id: u32, device_id: u32) {
+    state
+        .clients
+        .get(client_id)
+        .unwrap()
+        .register_with_version(
+            device_id,
+            crate::compositor::protocol::ObjectType::WlDataDevice,
+            3,
+        )
+        .unwrap();
+    state.data_devices.push(DataDeviceBinding {
+        client_id,
+        object_id: device_id,
+    });
+}
+
+/// A grabbable window belonging to client 1, a second client with a window of
+/// its own, and a source client 1 is about to drag.
+fn state_ready_to_drag() -> (
+    CompositorState,
+    Receiver<WaylandProtocolMessage>,
+    Receiver<WaylandProtocolMessage>,
+) {
+    let mut state = state_with_grabbable_window();
+    // `state_with_grabbable_window` made client 1 but dropped its receiver, so
+    // it is remade here to watch what the origin is told.
+    let (tx, origin_rx) = channel(64);
+    state.clients.get(1).unwrap().sender = tx;
+    add_data_device(&mut state, 1, DRAG_DEVICE_A);
+    state.data_sources.insert(
+        (1, DRAG_SOURCE),
+        DataSource {
+            mime_types: vec!["text/plain".to_string()],
+            actions: crate::compositor::protocol::wl_data_device_manager::DND_ACTION_COPY,
+            role: DataSourceRole::Drag,
+        },
+    );
+    state
+        .clients
+        .get(1)
+        .unwrap()
+        .register_with_version(
+            DRAG_SOURCE,
+            crate::compositor::protocol::ObjectType::WlDataSource,
+            3,
+        )
+        .unwrap();
+
+    let target_rx = add_client(&mut state, 2);
+    add_toplevel(&mut state, 2, 20, 21, 22);
+    add_data_device(&mut state, 2, DRAG_DEVICE_B);
+    state.buffers.insert(
+        (2, 23),
+        Buffer {
+            client_id: 2,
+            width: WINDOW_W,
+            height: WINDOW_H,
+            content_serial: 1,
+            kind: BufferKind::Shm(ShmBuffer {
+                pool_id: 0,
+                offset: 0,
+                stride: WINDOW_W * 4,
+                format: 0,
+                damage: None,
+            }),
+        },
+    );
+    let target = state.surfaces.get_mut(&(2, 20)).unwrap();
+    target.buffer_id = Some(23);
+    target.position = (400, 10);
+
+    (state, origin_rx, target_rx)
+}
+
+fn sent_ops(rx: &mut Receiver<WaylandProtocolMessage>) -> Vec<(u32, u16)> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .map(|m| (m.object_id, m.op_code))
+        .collect()
+}
+
+#[test]
+fn a_drag_takes_the_pointer_from_whoever_had_it() {
+    let (mut state, mut origin_rx, _target_rx) = state_ready_to_drag();
+    // Client 1's own window has the pointer.
+    state.pointer_surface = Some(WINDOW);
+    state
+        .pointers
+        .push(crate::compositor::protocol::state::PointerBinding {
+            client_id: 1,
+            object_id: 30,
+        });
+    drop(sent_ops(&mut origin_rx));
+
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+
+    assert!(state.pointer_surface.is_none());
+    assert!(
+        sent_ops(&mut origin_rx).contains(&(30, wl_pointer::LEAVE)),
+        "the client is told the pointer has left, so it stops drawing a hover state"
+    );
+}
+
+#[test]
+fn dragging_over_a_window_enters_it_and_leaving_it_leaves() {
+    let (mut state, _origin_rx, mut target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    drop(sent_ops(&mut target_rx));
+
+    // Over client 2's window.
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    assert!(update_drag(&mut state, 0));
+
+    let ops = sent_ops(&mut target_rx);
+    assert!(
+        ops.contains(&(DRAG_DEVICE_B, wl_data_device::DATA_OFFER)),
+        "an offer is made for the surface entered: {ops:?}"
+    );
+    assert!(ops.contains(&(DRAG_DEVICE_B, wl_data_device::ENTER)));
+    assert_eq!(state.drag.as_ref().unwrap().focus, Some((2, 20)));
+    assert_eq!(state.drag.as_ref().unwrap().focus_offers.len(), 1);
+
+    // Off it again.
+    state.cursor_x = 900.0;
+    state.cursor_y = 700.0;
+    assert!(update_drag(&mut state, 1));
+
+    let ops = sent_ops(&mut target_rx);
+    assert!(
+        ops.contains(&(DRAG_DEVICE_B, wl_data_device::LEAVE)),
+        "{ops:?}"
+    );
+    assert!(state.drag.as_ref().unwrap().focus.is_none());
+}
+
+#[test]
+fn moving_within_one_surface_sends_motion_rather_than_re_entering() {
+    let (mut state, _origin_rx, mut target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    update_drag(&mut state, 0);
+    drop(sent_ops(&mut target_rx));
+
+    state.cursor_x = 460.0;
+    update_drag(&mut state, 1);
+
+    let ops = sent_ops(&mut target_rx);
+    assert_eq!(ops, vec![(DRAG_DEVICE_B, wl_data_device::MOTION)]);
+}
+
+#[test]
+fn a_drag_with_no_source_reaches_only_the_client_that_started_it() {
+    // An internal drag has nothing to hand anyone else, so nobody else is a
+    // target.
+    let (mut state, _origin_rx, mut target_rx) = state_ready_to_drag();
+    state.start_drag(None, 1, WINDOW, None);
+
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    update_drag(&mut state, 0);
+
+    assert!(sent_ops(&mut target_rx).is_empty());
+    assert!(state.drag.as_ref().unwrap().focus.is_none());
+}
+
+/// Put the drag over client 2's window and have that client accept it.
+fn drag_accepted_over_the_target() -> (
+    CompositorState,
+    Receiver<WaylandProtocolMessage>,
+    Receiver<WaylandProtocolMessage>,
+) {
+    let (mut state, origin_rx, target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    update_drag(&mut state, 0);
+
+    let offer = state.drag.as_ref().unwrap().focus_offers[0];
+    let entry = state.data_offers.get_mut(&offer).unwrap();
+    entry.accepted = Some("text/plain".to_string());
+    entry.actions = crate::compositor::protocol::wl_data_device_manager::DND_ACTION_COPY;
+    entry.preferred_action = crate::compositor::protocol::wl_data_device_manager::DND_ACTION_COPY;
+    state.resolve_offer_action(offer);
+    (state, origin_rx, target_rx)
+}
+
+#[test]
+fn releasing_over_an_accepting_target_drops() {
+    let (mut state, mut origin_rx, mut target_rx) = drag_accepted_over_the_target();
+    let offer = state.drag.as_ref().unwrap().focus_offers[0];
+    drop(sent_ops(&mut origin_rx));
+    drop(sent_ops(&mut target_rx));
+
+    finish_drag(&mut state);
+
+    assert!(
+        sent_ops(&mut target_rx).contains(&(DRAG_DEVICE_B, wl_data_device::DROP)),
+        "the target is told the user let go here"
+    );
+    assert!(
+        sent_ops(&mut origin_rx).contains(&(
+            DRAG_SOURCE,
+            crate::compositor::protocol::wl_data_source::DND_DROP_PERFORMED
+        )),
+        "the source is told the drop happened"
+    );
+    // The pointer is free at once, but the offer lives on: the target still has
+    // to read the data and say when it is done.
+    assert!(state.drag.is_none());
+    assert_eq!(state.data_offers[&offer].kind, OfferKind::Dropped);
+    assert!(state.data_offers[&offer].source.is_some());
+}
+
+#[test]
+fn releasing_over_a_target_that_accepted_nothing_cancels() {
+    let (mut state, mut origin_rx, mut target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    update_drag(&mut state, 0);
+    drop(sent_ops(&mut origin_rx));
+    drop(sent_ops(&mut target_rx));
+
+    finish_drag(&mut state);
+
+    let target_ops = sent_ops(&mut target_rx);
+    assert!(target_ops.contains(&(DRAG_DEVICE_B, wl_data_device::LEAVE)));
+    assert!(!target_ops.contains(&(DRAG_DEVICE_B, wl_data_device::DROP)));
+    assert!(
+        sent_ops(&mut origin_rx).contains(&(
+            DRAG_SOURCE,
+            crate::compositor::protocol::wl_data_source::CANCELLED
+        )),
+        "a drag that lands nowhere cancels its source"
+    );
+}
+
+#[test]
+fn releasing_over_nothing_cancels() {
+    let (mut state, mut origin_rx, _target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    state.cursor_x = 900.0;
+    state.cursor_y = 700.0;
+    update_drag(&mut state, 0);
+    drop(sent_ops(&mut origin_rx));
+
+    finish_drag(&mut state);
+
+    assert!(sent_ops(&mut origin_rx).contains(&(
+        DRAG_SOURCE,
+        crate::compositor::protocol::wl_data_source::CANCELLED
+    )));
+}
+
+#[test]
+fn the_target_disconnecting_mid_drag_turns_the_drop_into_a_cancel() {
+    let (mut state, mut origin_rx, _target_rx) = drag_accepted_over_the_target();
+    state.remove_client_resources(2);
+    state.clients.remove(2);
+    drop(sent_ops(&mut origin_rx));
+
+    // The button is still down, so the drag survives — with nobody to drop on.
+    assert!(state.drag.is_some());
+    assert!(state.drag.as_ref().unwrap().focus.is_none());
+
+    finish_drag(&mut state);
+    assert!(sent_ops(&mut origin_rx).contains(&(
+        DRAG_SOURCE,
+        crate::compositor::protocol::wl_data_source::CANCELLED
+    )));
+}
+
+#[test]
+fn the_origin_disconnecting_mid_drag_cancels_it() {
+    let (mut state, _origin_rx, mut target_rx) = drag_accepted_over_the_target();
+    drop(sent_ops(&mut target_rx));
+
+    state.remove_client_resources(1);
+    state.clients.remove(1);
+
+    assert!(
+        state.drag.is_none(),
+        "there is nobody left to hand anything to"
+    );
+    assert!(sent_ops(&mut target_rx).contains(&(DRAG_DEVICE_B, wl_data_device::LEAVE)));
+}
+
+#[test]
+fn destroying_the_origin_surface_cancels_the_drag() {
+    let (mut state, _origin_rx, _target_rx) = drag_accepted_over_the_target();
+    state.destroy_surface(1, WINDOW.1);
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn a_drag_and_an_interactive_grab_cannot_both_hold_the_pointer() {
+    let (mut state, _origin_rx, _target_rx) = state_ready_to_drag();
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+
+    state.start_move_grab(WINDOW);
+    assert!(
+        state.pointer_grab.is_none(),
+        "a client cannot start a move off the same press that started the drag"
+    );
+}
+
+#[test]
+fn a_client_with_two_data_devices_is_entered_on_both() {
+    let (mut state, _origin_rx, mut target_rx) = state_ready_to_drag();
+    add_data_device(&mut state, 2, DRAG_DEVICE_B + 1);
+    state.start_drag(Some((1, DRAG_SOURCE)), 1, WINDOW, None);
+    drop(sent_ops(&mut target_rx));
+
+    state.cursor_x = 450.0;
+    state.cursor_y = 50.0;
+    enter_drag_surface(&mut state, (2, 20), 10.0, 10.0);
+
+    let ops = sent_ops(&mut target_rx);
+    assert!(ops.contains(&(DRAG_DEVICE_B, wl_data_device::ENTER)));
+    assert!(ops.contains(&(DRAG_DEVICE_B + 1, wl_data_device::ENTER)));
+    assert_eq!(
+        state.drag.as_ref().unwrap().focus_offers.len(),
+        2,
+        "an offer belongs to the device it arrived on"
+    );
+}
