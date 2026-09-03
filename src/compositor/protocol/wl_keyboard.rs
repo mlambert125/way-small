@@ -122,25 +122,16 @@ pub fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32
 /// Send `wl_keyboard`.enter to a client's keyboard object.
 pub fn send_enter(state: &mut CompositorState, client_id: u32, keyboard_id: u32, surface_id: u32) {
     let serial = next_serial();
-    // Build `wl_array` of currently pressed evdev keycodes
-    let keys_data: Vec<u8> = state
-        .pressed_keys
-        .iter()
-        .flat_map(|k| k.to_le_bytes())
-        .collect();
+    state.record_input_serial(client_id, serial);
+    // The keys currently held, as a `wl_array` of evdev keycodes.
+    let keys: Vec<u32> = state.pressed_keys.iter().copied().collect();
     let args = ArgWriter::new()
         .u32(serial)
         .u32(surface_id)
-        .u32(u32::try_from(keys_data.len()).expect("Pressed key length should be < u32::MAX"))
+        .array_u32(&keys)
         .build();
-    // Append raw key array after the wl_array length
-    let mut full_args = args;
-    full_args.extend_from_slice(&keys_data);
-    // Pad to 4-byte boundary
-    let padding = (4 - (keys_data.len() % 4)) % 4;
-    full_args.extend(std::iter::repeat_n(0u8, padding));
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(keyboard_id, ENTER, full_args));
+        let _ = client.send(message(keyboard_id, ENTER, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -167,6 +158,9 @@ pub fn send_key(
     pressed: bool,
 ) {
     let serial = next_serial();
+    // This is the one that makes Ctrl+C work: a client setting the clipboard
+    // quotes the serial of the key press that asked for it.
+    state.record_input_serial(client_id, serial);
     let key_state: u32 = u32::from(pressed); // 1 for pressed, 0 for released
     let args = ArgWriter::new()
         .u32(serial)

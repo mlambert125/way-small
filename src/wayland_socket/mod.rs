@@ -39,6 +39,7 @@ const MAX_PENDING_FDS: usize = 256;
 pub const CLIENT_SEND_QUEUE_LIMIT: usize = 4096;
 
 /// A low-level (untyped) wayland message
+#[derive(Debug)]
 pub struct WaylandProtocolMessage {
     /// The object being acted upon
     pub object_id: u32,

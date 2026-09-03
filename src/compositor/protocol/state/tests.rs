@@ -282,3 +282,107 @@ mod disconnect {
         assert!(state.buffers.is_empty());
     }
 }
+
+// -- The data protocols ------------------------------------------------------
+
+use super::{CompositorState, DataDeviceBinding, DataOffer, DataSource, DataSourceRole, OfferKind};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::channel;
+use tokio_util::sync::CancellationToken;
+
+/// A client holding a data device and a source offering one mime type.
+fn client_with_a_source(state: &mut CompositorState, client_id: u32, source_id: u32) {
+    let (tx, _rx) = channel(64);
+    state.clients.create(
+        client_id,
+        tx,
+        Arc::new(Mutex::new(VecDeque::new())),
+        CancellationToken::new(),
+    );
+    state.data_devices.push(DataDeviceBinding {
+        client_id,
+        object_id: source_id + 100,
+    });
+    state.data_sources.insert(
+        (client_id, source_id),
+        DataSource {
+            mime_types: vec!["text/plain".to_string()],
+            actions: 0,
+            role: DataSourceRole::Selection,
+        },
+    );
+}
+
+#[test]
+fn a_disconnecting_client_takes_the_clipboard_it_owned_with_it() {
+    let mut state = CompositorState::new();
+    client_with_a_source(&mut state, 1, 40);
+    state.selection = Some((1, 40));
+
+    state.remove_client_resources(1);
+
+    assert!(
+        state.selection.is_none(),
+        "a selection naming a source that has gone can produce nothing"
+    );
+    assert!(state.data_sources.is_empty());
+    assert!(state.data_devices.is_empty());
+}
+
+#[test]
+fn a_disconnecting_client_leaves_someone_elses_clipboard_alone() {
+    let mut state = CompositorState::new();
+    client_with_a_source(&mut state, 1, 40);
+    client_with_a_source(&mut state, 2, 50);
+    state.selection = Some((1, 40));
+
+    state.remove_client_resources(2);
+
+    assert_eq!(state.selection, Some((1, 40)));
+}
+
+#[test]
+fn an_offer_outlives_the_source_that_went_away() {
+    // The client that holds it still owns the id and will still send requests
+    // on it, so the object stays and only its contents are forgotten.
+    let mut state = CompositorState::new();
+    client_with_a_source(&mut state, 1, 40);
+    client_with_a_source(&mut state, 2, 50);
+    state.selection = Some((1, 40));
+    state.data_offers.insert(
+        (2, 0xff00_0000),
+        DataOffer {
+            client_id: 2,
+            source: Some((1, 40)),
+            kind: OfferKind::Selection,
+            accepted: None,
+            actions: 0,
+            preferred_action: 0,
+            resolved_action: 0,
+        },
+    );
+
+    state.remove_client_resources(1);
+
+    let offer = state
+        .data_offers
+        .get(&(2, 0xff00_0000))
+        .expect("the offer object survives its source");
+    assert!(offer.source.is_none(), "but it has nothing left behind it");
+}
+
+#[test]
+fn a_destroyed_surface_gives_its_role_back() {
+    // Roles are permanent for the life of a surface, not of an id: the client
+    // is told the id is free, and what it allocates next has no role.
+    let mut state = CompositorState::new();
+    state.create_surface(1, 10);
+    state.dnd_icon_surfaces.insert((1, 10));
+    state.cursor_role_surfaces.insert((1, 10));
+
+    state.destroy_surface(1, 10);
+
+    assert!(state.dnd_icon_surfaces.is_empty());
+    assert!(state.cursor_role_surfaces.is_empty());
+}

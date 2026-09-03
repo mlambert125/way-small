@@ -574,3 +574,106 @@ fn a_window_whose_output_vanished_is_rehomed() {
         "should have been re-homed onto the output that is left"
     );
 }
+
+// -- The drag icon -----------------------------------------------------------
+
+const ICON_ID: u32 = 400;
+const ICON_BUFFER_ID: u32 = 401;
+
+/// Give a client a second surface with a buffer, and make it the icon of a
+/// drag in progress.
+fn start_drag_with_an_icon(state: &mut CompositorState, offset: (i32, i32)) {
+    let pixel_count = (BUFFER_SIDE * BUFFER_SIDE).unsigned_abs() as usize;
+    let size = pixel_count * 4;
+    let file = memfd_filled_with(size, 0xff00_ff00);
+    state.register_shm_pool(
+        CLIENT,
+        POOL_ID + 1,
+        file.into_raw_fd(),
+        size.try_into().unwrap(),
+    );
+    state.register_buffer(
+        CLIENT,
+        ICON_BUFFER_ID,
+        POOL_ID + 1,
+        0,
+        BUFFER_SIDE,
+        BUFFER_SIDE,
+        BUFFER_SIDE * 4,
+        0,
+    );
+    state.create_surface(CLIENT, ICON_ID);
+    let icon = state.surfaces.get_mut(&(CLIENT, ICON_ID)).unwrap();
+    icon.buffer_id = Some(ICON_BUFFER_ID);
+    icon.offset = offset;
+
+    state.dnd_icon_surfaces.insert((CLIENT, ICON_ID));
+    state.start_drag(None, CLIENT, (CLIENT, SURFACE_ID), Some((CLIENT, ICON_ID)));
+}
+
+#[test]
+fn no_drag_means_no_icon() {
+    let state = test_state(1);
+    assert_eq!(
+        scene_of(&state).elements.len(),
+        2,
+        "the window and the cursor"
+    );
+}
+
+#[test]
+fn the_drag_icon_is_drawn_above_the_windows_and_below_the_cursor() {
+    let mut state = test_state(1);
+    state.cursor_x = 50.0;
+    state.cursor_y = 50.0;
+    start_drag_with_an_icon(&mut state, (0, 0));
+
+    let scene = scene_of(&state);
+    assert_eq!(scene.elements.len(), 3, "window, icon, cursor");
+    // Order is z-order: the icon is what is being carried, so it goes over
+    // every window, and the pointer stays over it.
+    assert_eq!(scene.elements[1].dst.0, 50);
+    assert_eq!(scene.elements[1].dst.1, 50);
+    assert_eq!(
+        (scene.elements[1].dst.2, scene.elements[1].dst.3),
+        (BUFFER_SIDE, BUFFER_SIDE)
+    );
+}
+
+#[test]
+fn the_drag_icon_follows_the_attach_offset() {
+    // A toolkit centres its icon under the pointer by attaching at a negative
+    // dx and dy, and that offset is the only means it has to position it.
+    let mut state = test_state(1);
+    state.cursor_x = 50.0;
+    state.cursor_y = 50.0;
+    start_drag_with_an_icon(&mut state, (-20, -20));
+
+    let scene = scene_of(&state);
+    assert_eq!((scene.elements[1].dst.0, scene.elements[1].dst.1), (30, 30));
+}
+
+#[test]
+fn ending_the_drag_takes_the_icon_out_of_the_scene() {
+    let mut state = test_state(1);
+    state.cursor_x = 50.0;
+    state.cursor_y = 50.0;
+    start_drag_with_an_icon(&mut state, (0, 0));
+    assert_eq!(scene_of(&state).elements.len(), 3);
+
+    state.cancel_drag();
+    assert_eq!(scene_of(&state).elements.len(), 2);
+}
+
+#[test]
+fn the_drag_icon_is_only_drawn_on_the_output_holding_the_pointer() {
+    let mut state = test_state(1);
+    // The pointer is off this output entirely.
+    state.cursor_x = f64::from(OUTPUT_SIDE) + 50.0;
+    state.cursor_y = f64::from(OUTPUT_SIDE) + 50.0;
+    start_drag_with_an_icon(&mut state, (0, 0));
+
+    // Just the window: neither the icon nor the cursor belongs on an output
+    // the pointer is not over.
+    assert_eq!(scene_of(&state).elements.len(), 1);
+}

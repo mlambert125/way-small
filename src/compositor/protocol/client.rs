@@ -109,6 +109,24 @@ impl ClientState {
         Some(id)
     }
 
+    /// Take the next id from the compositor's half and record a version for it.
+    ///
+    /// A compositor-named object still has a version, and it is the version of
+    /// whatever created it — a `wl_data_offer` speaks the version its
+    /// `wl_data_device` was bound at. Without this the object would default to
+    /// version 1 and every version-gated event on it would be silently
+    /// suppressed, which is a failure that looks exactly like the feature not
+    /// being implemented.
+    pub fn allocate_id_with_version(
+        &mut self,
+        object_type: ObjectType,
+        version: u32,
+    ) -> Option<u32> {
+        let id = self.allocate_id(object_type)?;
+        self.object_versions.insert(id, version);
+        Some(id)
+    }
+
     /// Registers a new wayland object with wayland protocol version information
     pub fn register_with_version(
         &mut self,
@@ -244,5 +262,18 @@ impl Clients {
     /// Iterate over all clients
     pub fn iter(&self) -> impl Iterator<Item = (&u32, &ClientState)> {
         self.states.iter()
+    }
+
+    /// The version an object was bound at, without borrowing the collection
+    /// mutably.
+    ///
+    /// [`Self::get`] hands back a `&mut ClientState`, which cannot be held
+    /// while the rest of `CompositorState` is read. Version gating needs the
+    /// answer in exactly that position — deciding whether to send an event,
+    /// with the state that decides *what* to send already borrowed.
+    pub fn version_of(&self, client_id: u32, object_id: u32) -> Option<u32> {
+        self.states
+            .get(&client_id)
+            .map(|client| client.version(object_id))
     }
 }

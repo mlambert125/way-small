@@ -9,14 +9,14 @@
 //! turns it into GPU work.
 
 use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState, MouseButton};
-use crate::shared::{OutputId, PresentedAt, Scene, fourcc_name, output_contains};
+use crate::shared::{OutputId, PresentedAt, Scene, ScrollSource, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
 use protocol::CompositorState;
-use protocol::state::{ClientObjectId, GrabKind, ResizeEdges, region_contains};
+use protocol::state::{ClientObjectId, GrabKind, OfferKind, ResizeEdges, region_contains};
 use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use protocol::{
-    wl_keyboard, wl_pointer, wl_registry, wl_surface, wp_presentation_feedback, xdg_popup,
-    xdg_surface, xdg_toplevel,
+    wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat,
+    wl_surface, wl_touch, wp_presentation_feedback, xdg_popup, xdg_surface, xdg_toplevel,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,6 +50,16 @@ const KEY_LEFTALT: u32 = 56;
 const KEY_F4: u32 = 62;
 // evdev keycode for RIGHTALT (used for now for hard-coded keymap)
 const KEY_RIGHTALT: u32 = 100;
+// evdev keycode for ESC, which abandons a drag
+const KEY_ESC: u32 = 1;
+
+/// Surface-local distance one unit of scroll moves.
+///
+/// A wheel detent arrives as one line and clients expect rather more than one
+/// pixel from it. The protocol has no unit of its own here — the value is
+/// whatever the compositor says it is — so this is a feel setting rather than a
+/// conversion.
+const SCROLL_STEP: f64 = 10.0;
 
 /// Smallest window width an interactive resize will produce.
 const MIN_WINDOW_WIDTH: i32 = 120;
@@ -157,11 +167,7 @@ impl FramePacer {
             state.dirty = false;
         }
 
-        let due: Vec<OutputId> = self
-            .stale
-            .intersection(&self.waiting)
-            .copied()
-            .collect();
+        let due: Vec<OutputId> = self.stale.intersection(&self.waiting).copied().collect();
         if due.is_empty() {
             return;
         }
@@ -290,12 +296,28 @@ pub async fn run_compositor(
             }
             Some(message) = backend_message_receiver.recv() => {
                 match message {
-                    BackendMessage::SeatCapabilities { pointer, keyboard } => {
-                        info!("Seat capabilities: pointer={} keyboard={}", pointer, keyboard);
+                    BackendMessage::SeatCapabilities { pointer, keyboard, touch } => {
+                        info!(
+                            "Seat capabilities: pointer={} keyboard={} touch={}",
+                            pointer, keyboard, touch
+                        );
+                        let changed = state.seat.has_pointer != pointer
+                            || state.seat.has_keyboard != keyboard
+                            || state.seat.has_touch != touch;
                         state.seat.has_pointer = pointer;
                         state.seat.has_keyboard = keyboard;
+                        state.seat.has_touch = touch;
+                        // A capability can appear after clients have bound the
+                        // seat — a touchscreen is only known to exist once it
+                        // is touched — so everyone already connected is told
+                        // again rather than only whoever binds next.
+                        if changed {
+                            wl_seat::broadcast_capabilities(&mut state);
+                        }
                     }
                     BackendMessage::OutputInfo { outputs } => {
+                        let seen: HashSet<OutputId> =
+                            outputs.iter().map(|output| output.id).collect();
                         for new_output in outputs {
                             if state.outputs.iter().any(|o| o.id == new_output.id) {
                                 // Update existing output (preserve global name mapping)
@@ -319,6 +341,24 @@ pub async fn run_compositor(
                                 );
                             }
                         }
+                        // `OutputInfo` is the whole set the backend can see, so
+                        // an output missing from it has gone. Withdrawing the
+                        // global is the half that matters to clients: one that
+                        // is announced and never withdrawn leaves them holding a
+                        // name for a display that no longer exists.
+                        let gone: Vec<OutputId> = state
+                            .outputs
+                            .iter()
+                            .map(|output| output.id)
+                            .filter(|id| !seen.contains(id))
+                            .collect();
+                        for output_id in gone {
+                            info!("Output {:?} disconnected", output_id);
+                            if let Some(global_name) = state.remove_output(output_id) {
+                                wl_registry::broadcast_global_remove(&mut state, global_name);
+                            }
+                        }
+
                         // A new output arrives with no workspace, and a window
                         // opening before it has one would have nowhere to go.
                         state.sync_workspaces();
@@ -399,6 +439,15 @@ pub async fn run_compositor(
                         } else {
                             state.pressed_keys.remove(&evdev_key);
                         }
+                        // Escape abandons a drag. Without it the only way out
+                        // of one is to drop it somewhere, and the user may have
+                        // no somewhere they are willing to drop it on.
+                        if pressed && evdev_key == KEY_ESC && state.drag.is_some() {
+                            state.cancel_drag();
+                            consumed_keys.insert(evdev_key);
+                            continue;
+                        }
+
                         // Compositor bindings are handled here and never reach the
                         // client, so a bound combination cannot also trigger an
                         // application shortcut.
@@ -460,6 +509,16 @@ pub async fn run_compositor(
                             continue;
                         }
 
+                        // So does a drag, and for the same reason: the
+                        // compositor owns the pointer, and what the button does
+                        // is decide how the drag ends.
+                        if state.drag.is_some() {
+                            if !pressed {
+                                finish_drag(&mut state);
+                            }
+                            continue;
+                        }
+
                         // Alt+drag moves and resizes without the client's help,
                         // which is the only way for one that draws no usable
                         // decorations.
@@ -467,7 +526,7 @@ pub async fn run_compositor(
                             && alt_held(&state)
                             && let Some(hit) = hit_test(&state, state.cursor_x, state.cursor_y)
                         {
-                            state.workspaces.raise(hit.toplevel);
+                            raise_window(&mut state, hit.toplevel);
                             switch_focus(&mut state, hit.toplevel);
                             match button {
                                 MouseButton::Left => state.start_move_grab(hit.toplevel),
@@ -500,7 +559,7 @@ pub async fn run_compositor(
                         let cy = state.cursor_y;
                         if pressed && let Some(hit) = hit_test(&state, cx, cy) && state.focused_surface != Some(hit.toplevel) {
                             // Raise to top of its workspace
-                            state.workspaces.raise(hit.toplevel);
+                            raise_window(&mut state, hit.toplevel);
                             state.dirty = true;
 
                             switch_focus(&mut state, hit.toplevel);
@@ -534,23 +593,28 @@ pub async fn run_compositor(
                             }
                         }
                     }
-                    BackendMessage::MouseScroll { dx, dy } => {
+                    BackendMessage::TouchDown { id, x, y } => {
                         let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-                        let pointer_client = state.pointer_surface.map(|(cid, _)| cid);
-                        for ptr in state.pointers.clone() {
-                            if Some(ptr.client_id) != pointer_client {
-                                continue;
-                            }
-                            if dy != 0.0 {
-                                // mouse axis 0 = vertical
-                                wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 0, dy * 10.0);
-                            }
-                            if dx != 0.0 {
-                                // mouse axis 1 = horizontal
-                                wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 1, dx * 10.0);
-                            }
-                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
-                        }
+                        touch_down(&mut state, time_ms, id, x, y);
+                    }
+                    BackendMessage::TouchMotion { id, x, y } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        touch_motion(&mut state, time_ms, id, x, y);
+                    }
+                    BackendMessage::TouchUp { id } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        touch_up(&mut state, time_ms, id);
+                    }
+                    BackendMessage::TouchCancel => {
+                        touch_cancel(&mut state);
+                    }
+                    BackendMessage::MouseScroll { dx, dy, source, v120_x, v120_y } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        deliver_scroll(&mut state, time_ms, dx, dy, source, v120_x, v120_y);
+                    }
+                    BackendMessage::MouseScrollEnd => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        deliver_scroll_end(&mut state, time_ms);
                     }
                     BackendMessage::FocusIn => {
                         debug!("Focus in");
@@ -594,6 +658,9 @@ pub async fn run_compositor(
                     state.dirty = true;
                 }
                 pacer.forget_gone_outputs(&state);
+                // A bell that has run its course has to be taken off the screen,
+                // and nothing else would notice it had expired.
+                state.expire_bells();
 
                 // Surfaces no display is showing are paced from here, because
                 // nothing else will pace them: no output will ever report
@@ -651,6 +718,12 @@ fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
     // A grab owns the pointer: motion drives the window, and the client hears
     // nothing until the button is up.
     if update_grab(state, x, y) {
+        return;
+    }
+
+    // A drag owns it for the same reason, and delivers to the surface
+    // underneath through its data device rather than its pointer.
+    if update_drag(state, time_ms) {
         return;
     }
 
@@ -714,6 +787,210 @@ fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
                 wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
             }
         }
+    }
+}
+
+/// Raise the window under a click, bringing any dialogs of its own with it.
+///
+/// Goes through the toplevel rather than straight to the workspace stack so
+/// that `set_parent` is honoured — a dialog must not be buried by a click on
+/// the window it belongs to.
+fn raise_window(state: &mut CompositorState, surface: ClientObjectId) {
+    match state.toplevel_for_surface(surface) {
+        Some(toplevel) => state.raise_with_children(toplevel),
+        None => state.workspaces.raise(surface),
+    }
+}
+
+/// A finger has landed. Find what it landed on and tell that client.
+///
+/// The surface is settled here and remembered for the life of the point, so
+/// every later motion and the eventual lift go to the same client however far
+/// the finger travels.
+fn touch_down(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+    state.dirty = true;
+    let Some(hit) = hit_test(state, x, y) else {
+        // Nothing there. The point is not recorded, so its motion and lift are
+        // dropped too rather than being delivered to whatever is touched next.
+        return;
+    };
+
+    // Touching a window raises and focuses it, the same as clicking one.
+    raise_window(state, hit.toplevel);
+    switch_focus(state, hit.toplevel);
+
+    state.touch_points.insert(id, hit.surface);
+    let (local_x, local_y) = (x - f64::from(hit.surface_x), y - f64::from(hit.surface_y));
+    for touch_id in wl_touch::touches_of(state, hit.surface.0) {
+        wl_touch::send_down(
+            state,
+            hit.surface.0,
+            touch_id,
+            time_ms,
+            hit.surface.1,
+            id,
+            local_x,
+            local_y,
+        );
+        wl_touch::send_frame(state, hit.surface.0, touch_id);
+    }
+}
+
+/// A finger already down has moved, in the coordinates of the surface it
+/// started on — which may be nowhere near where it is now.
+fn touch_motion(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+    state.dirty = true;
+    let Some(&surface) = state.touch_points.get(&id) else {
+        return;
+    };
+    let origin = surface_global_position(state, surface.0, surface.1);
+    let (local_x, local_y) = (x - f64::from(origin.0), y - f64::from(origin.1));
+    for touch_id in wl_touch::touches_of(state, surface.0) {
+        wl_touch::send_motion(state, surface.0, touch_id, time_ms, id, local_x, local_y);
+        wl_touch::send_frame(state, surface.0, touch_id);
+    }
+}
+
+/// A finger has been lifted.
+fn touch_up(state: &mut CompositorState, time_ms: u32, id: i32) {
+    state.dirty = true;
+    let Some(surface) = state.touch_points.remove(&id) else {
+        return;
+    };
+    for touch_id in wl_touch::touches_of(state, surface.0) {
+        wl_touch::send_up(state, surface.0, touch_id, time_ms, id);
+        wl_touch::send_frame(state, surface.0, touch_id);
+    }
+}
+
+/// The touch sequence has been taken over, so every point in it is void.
+///
+/// Every client holding a point is told, not just the one under the last
+/// finger: a two-finger gesture spanning two windows leaves both of them
+/// waiting to be told how it ended.
+fn touch_cancel(state: &mut CompositorState) {
+    state.dirty = true;
+    let mut clients: Vec<u32> = state.touch_points.values().map(|s| s.0).collect();
+    clients.sort_unstable();
+    clients.dedup();
+    state.touch_points.clear();
+    for client_id in clients {
+        for touch_id in wl_touch::touches_of(state, client_id) {
+            wl_touch::send_cancel(state, client_id, touch_id);
+        }
+    }
+}
+
+/// Deliver a scroll to whichever client has the pointer.
+///
+/// The order within the frame is the protocol's and is not arbitrary: the
+/// source first, so a client knows what kind of scroll it is about to be told
+/// about; then the detent count for an axis, before the distance it explains;
+/// then the distance; then the frame that says the picture is complete. A
+/// client acting on the distance before it knows the source cannot decide
+/// whether the scroll may have momentum.
+fn deliver_scroll(
+    state: &mut CompositorState,
+    time_ms: u32,
+    dx: f64,
+    dy: f64,
+    source: ScrollSource,
+    v120_x: i32,
+    v120_y: i32,
+) {
+    let Some((pointer_client, _)) = state.pointer_surface else {
+        return;
+    };
+    // A touchpad scroll ends, and the axes it was moving are the ones that have
+    // to be told so. A wheel never stops in this sense — it is between detents,
+    // not finished.
+    if source == ScrollSource::Finger {
+        state.scrolling_vertical |= dy != 0.0;
+        state.scrolling_horizontal |= dx != 0.0;
+    }
+
+    for ptr in state.pointers.clone() {
+        if ptr.client_id != pointer_client {
+            continue;
+        }
+        wl_pointer::send_axis_source(state, ptr.client_id, ptr.object_id, source);
+        if dy != 0.0 {
+            wl_pointer::send_axis_steps(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                wl_pointer::AXIS_VERTICAL,
+                v120_y,
+            );
+            wl_pointer::send_axis(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_VERTICAL,
+                dy * SCROLL_STEP,
+            );
+        }
+        if dx != 0.0 {
+            wl_pointer::send_axis_steps(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                wl_pointer::AXIS_HORIZONTAL,
+                v120_x,
+            );
+            wl_pointer::send_axis(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_HORIZONTAL,
+                dx * SCROLL_STEP,
+            );
+        }
+        wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+    }
+}
+
+/// Tell the client a touchpad scroll has finished.
+///
+/// Only the axes that were actually moving are stopped: an `axis_stop` for an
+/// axis that never scrolled is a statement about something that never happened.
+fn deliver_scroll_end(state: &mut CompositorState, time_ms: u32) {
+    let (vertical, horizontal) = (state.scrolling_vertical, state.scrolling_horizontal);
+    state.scrolling_vertical = false;
+    state.scrolling_horizontal = false;
+    if !vertical && !horizontal {
+        return;
+    }
+    let Some((pointer_client, _)) = state.pointer_surface else {
+        return;
+    };
+
+    for ptr in state.pointers.clone() {
+        if ptr.client_id != pointer_client {
+            continue;
+        }
+        wl_pointer::send_axis_source(state, ptr.client_id, ptr.object_id, ScrollSource::Finger);
+        if vertical {
+            wl_pointer::send_axis_stop(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_VERTICAL,
+            );
+        }
+        if horizontal {
+            wl_pointer::send_axis_stop(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_HORIZONTAL,
+            );
+        }
+        wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
     }
 }
 
@@ -1221,6 +1498,163 @@ fn end_grab(state: &mut CompositorState) {
     state.dirty = true;
 }
 
+/// Deliver a drag to whatever is under the pointer. Returns false if there is
+/// no drag, in which case the pointer belongs to the ordinary path.
+///
+/// The surface under the pointer hears about this through its *data device*,
+/// not its pointer: no `wl_pointer` event reaches anyone for the duration of a
+/// drag, and the target learns where the pointer is from
+/// `wl_data_device.motion`.
+fn update_drag(state: &mut CompositorState, time_ms: u32) -> bool {
+    let Some(drag) = state.drag.clone() else {
+        return false;
+    };
+    let (x, y) = (state.cursor_x, state.cursor_y);
+    state.dirty = true;
+
+    // A drag with no source is one client dragging within itself. It has
+    // nothing to hand anyone else, so nobody else is a target — filtering here
+    // rather than at delivery keeps the enter and leave bookkeeping honest,
+    // since the drag never considers itself to have entered a surface it may
+    // not talk to.
+    let hit = hit_test(state, x, y)
+        .filter(|h| drag.source.is_some() || h.surface.0 == drag.origin_client);
+    let new_focus = hit.as_ref().map(|h| h.surface);
+
+    if new_focus == drag.focus {
+        if let Some(h) = hit {
+            let (local_x, local_y) = (x - f64::from(h.surface_x), y - f64::from(h.surface_y));
+            for device_id in wl_data_device::devices_of(state, h.surface.0) {
+                wl_data_device::send_motion(
+                    state,
+                    h.surface.0,
+                    device_id,
+                    time_ms,
+                    local_x,
+                    local_y,
+                );
+            }
+        }
+        return true;
+    }
+
+    state.end_drag_focus();
+    if let Some(h) = hit {
+        let (local_x, local_y) = (x - f64::from(h.surface_x), y - f64::from(h.surface_y));
+        enter_drag_surface(state, h.surface, local_x, local_y);
+    }
+    true
+}
+
+/// Introduce a drag to the client whose surface it has just moved over.
+///
+/// One offer per data device, because `enter` is a per-device event and an
+/// offer belongs to the device it arrived on. The order within a device is
+/// forced: the client has to know the object exists and what mime types are
+/// behind it before it is told a drag is over it and asked to decide.
+fn enter_drag_surface(state: &mut CompositorState, surface: ClientObjectId, x: f64, y: f64) {
+    let Some(source) = state.drag.as_ref().map(|drag| drag.source) else {
+        return;
+    };
+    let client_id = surface.0;
+    let source_actions = source
+        .and_then(|key| state.data_sources.get(&key))
+        .map_or(0, |s| s.actions);
+
+    let mut offers = Vec::new();
+    for device_id in wl_data_device::devices_of(state, client_id) {
+        let offer = source.and_then(|source| {
+            wl_data_device::create_offer(state, client_id, device_id, source, OfferKind::Drag)
+        });
+        if let Some(offer) = offer {
+            // Before the enter, so the client has the whole picture at the
+            // moment it decides what it will accept.
+            wl_data_offer::send_source_actions(state, offer, source_actions);
+            offers.push(offer);
+        }
+        wl_data_device::send_enter(
+            state,
+            client_id,
+            device_id,
+            surface.1,
+            x,
+            y,
+            offer.map(|(_, offer_id)| offer_id),
+        );
+    }
+
+    if let Some(drag) = state.drag.as_mut() {
+        drag.focus = Some(surface);
+        drag.focus_offers.clone_from(&offers);
+    }
+    // After the enter, so the client has already been told the offer exists
+    // before it hears what action it would settle on.
+    for offer in offers {
+        state.resolve_offer_action(offer);
+    }
+}
+
+/// Resolve a drag when the button comes up.
+///
+/// A drop frees the pointer immediately and does *not* end the offer. The
+/// target has still to read the data and say when it is done, and everything
+/// that needs is reachable from the offer rather than from the drag — so the
+/// drag is what ends here and the offer is what survives. Keeping the drag
+/// alive to mean "dropped but not finished" would put a second condition on
+/// every check of whether the pointer is spoken for, and the one place that
+/// forgot it would swallow the pointer for good.
+fn finish_drag(state: &mut CompositorState) {
+    // Read before the drag is taken: this asks what the target accepted
+    // through it.
+    let accepted = state.drag_target_accepted();
+    let Some(drag) = state.drag.take() else {
+        return;
+    };
+    state.dirty = true;
+
+    let Some(focus) = drag.focus else {
+        // Let go over nothing. There is nobody to drop on, so the source is
+        // told the drag came to nothing.
+        if let Some(source) = drag.source {
+            wl_data_source::send_cancelled(state, source);
+        }
+        return;
+    };
+
+    // A drag with no source went only to the client that started it, which
+    // handles the content itself: there is no source to tell and no offer to
+    // keep alive.
+    if drag.source.is_none() {
+        for device_id in wl_data_device::devices_of(state, focus.0) {
+            wl_data_device::send_drop(state, focus.0, device_id);
+        }
+        return;
+    }
+
+    if !accepted {
+        for device_id in wl_data_device::devices_of(state, focus.0) {
+            wl_data_device::send_leave(state, focus.0, device_id);
+        }
+        for &offer in &drag.focus_offers {
+            state.invalidate_offer(offer);
+        }
+        if let Some(source) = drag.source {
+            wl_data_source::send_cancelled(state, source);
+        }
+        return;
+    }
+
+    for device_id in wl_data_device::devices_of(state, focus.0) {
+        wl_data_device::send_drop(state, focus.0, device_id);
+    }
+    for &offer in &drag.focus_offers {
+        state.mark_offer_dropped(offer);
+    }
+    if let Some(source) = drag.source {
+        wl_data_source::send_dnd_drop_performed(state, source);
+    }
+}
+
 /// Ask a client for a size, marking whether the resize is still in progress.
 fn configure_resizing(
     state: &mut CompositorState,
@@ -1294,6 +1728,15 @@ pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObject
         }
     }
     xdg_toplevel::send_activated(state, new_client, new_surface, true);
+
+    // The clipboard follows keyboard focus, so this is where a client is told
+    // what is on it. After the keyboard enter, because having focus is what
+    // makes the selection this client's to read.
+    //
+    // The client losing focus is told nothing: an offer it still holds stops
+    // working the moment the selection is replaced, and it is not going to be
+    // asked for a paste in the meantime.
+    wl_data_device::send_selection_to_client(state, new_client);
 }
 
 /// Every window on screen, topmost first.
@@ -1358,16 +1801,14 @@ fn hit_test_surface_tree(
             continue;
         };
         let (cx, cy) = child.subsurface_position;
-        if let Some(result) =
-            hit_test_surface_tree(
-                state,
-                child_key,
-                offset_x.saturating_add(cx),
-                offset_y.saturating_add(cy),
-                px,
-                py,
-            )
-        {
+        if let Some(result) = hit_test_surface_tree(
+            state,
+            child_key,
+            offset_x.saturating_add(cx),
+            offset_y.saturating_add(cy),
+            px,
+            py,
+        ) {
             return Some(result);
         }
     }

@@ -42,7 +42,11 @@ fn handle_create_surface(state: &mut CompositorState, msg: &WaylandProtocolMessa
 
     debug!("wl_compositor.create_surface: surface_id={}", surface_id);
 
-    if client.register(surface_id, ObjectType::WlSurface).is_err() {
+    let version = client.version(msg.message.object_id);
+    if client
+        .register_with_version(surface_id, ObjectType::WlSurface, version)
+        .is_err()
+    {
         return;
     }
     state.create_surface(msg.client_id, surface_id);
@@ -66,7 +70,11 @@ fn handle_create_region(state: &mut CompositorState, msg: &WaylandProtocolMessag
 
     debug!("wl_compositor.create_region: region_id={}", region_id);
 
-    if client.register(region_id, ObjectType::WlRegion).is_err() {
+    let version = client.version(msg.message.object_id);
+    if client
+        .register_with_version(region_id, ObjectType::WlRegion, version)
+        .is_err()
+    {
         return;
     }
     state.create_region(msg.client_id, region_id);

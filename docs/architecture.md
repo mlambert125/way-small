@@ -25,11 +25,11 @@ This document describes a design, and parts of that design are ahead of the code
 yet written say so where they begin.  As of now:
 
 - **Built**: the socket subsystem, the protocol layer and compositor state, scene building, the GL renderer, shm with
-  zero-copy and damage tracking, dma-buf import, and the winit and null backends.
+  zero-copy and damage tracking, dma-buf import, the clipboard and drag and drop, and the winit and null backends.
 - **Not built**: the DRM backend, and with it every part of running on bare hardware — session management, `libinput`,
-  and modesetting.  There is no clipboard or drag and drop; `wl_data_device.start_drag` and `set_selection` are
-  accepted and do nothing.  Subsurface `set_sync` is recorded but does not cache commits.  There is no layer shell,
-  no decoration protocol, and no touch or tablet input.
+  and modesetting.  Subsurface `set_sync` is recorded but does not cache commits.  There is no layer shell, no
+  decoration protocol, no primary selection, and no tablet input.  Touch is implemented but has only ever been
+  exercised by tests — see `docs/notes.md`.
 - **Not intended in-tree**: X11 window management.  X clients are meant to be served by `xwayland-satellite`, which
   runs Xwayland and the `xwm` in a process of its own and hands each X window to the compositor as an ordinary
   `xdg_toplevel` or `xdg_popup`.  Nothing here then needs an X11 protocol implementation, and the window model does
@@ -195,6 +195,10 @@ Making this the dispatcher's job rather than each handler's is what keeps the ac
 ignores its descriptors, returns early, or is an unimplemented stub simply drops the `Vec<OwnedFd>`, which closes
 them.  It cannot leave a descriptor on the queue to be mispaired with some later request, which would otherwise
 corrupt every remaining file descriptor on that connection — a failure that surfaces far away from its cause.
+
+The table is about *inbound* descriptors only.  An event that carries one out — `wl_keyboard.keymap`, and
+`wl_data_source.send` — builds its message with `message_with_fds` and owns the descriptor from that point, so
+dropping the message closes it on every path, sent or not.
 
 Adding a new request that takes an `fd` argument therefore means adding it to `request_fd_count` and widening its
 interface's arm in `handle_message`.  Forgetting the arm closes the descriptor and makes the request a no-op;
@@ -520,6 +524,30 @@ The constraint is the union of the outputs, not their bounding box. Two outputs 
 a notch belonging to no display, and a pointer parked there would be exactly as lost. A position off every output snaps
 to the nearest point of the nearest one.
 
+#### Scrolling
+
+Four events describe one scroll, and the order they go out in is the protocol's
+rather than a convenience.  The source comes first, because it says what kind of
+scroll this is: a wheel clicks through detents and stops between them, a
+touchpad glides and is let go of, and a client cannot tell them apart from the
+deltas alone — which is what decides whether the scroll may be given momentum.
+Then the detent count for an axis, before the distance it explains.  Then the
+distance.  Then the frame that says the picture is complete.
+
+The detent count goes out as one of two events that are alternatives rather than
+companions.  Version 8 replaced `axis_discrete` with `axis_value120`, and a
+client that understands the newer one would count every detent twice if it were
+sent both — so the client's version decides which it gets, and exactly one goes
+out.  The `120` is the unit: a high-resolution wheel reports a fraction of a
+click without needing a different event from an ordinary one, and an older
+client is told in whole clicks, where a movement smaller than one rounds to
+nothing because that is the best that unit can say.
+
+`axis_stop` is what a touchpad has and a wheel does not.  A scroll that has
+paused and one that has ended look identical in a stream of deltas, and only the
+axes that actually moved are stopped — a stop for an axis that never scrolled
+describes something that never happened.
+
 #### Outputs, workspaces and windows
 
 The three nest: an output owns one or more workspaces, and a workspace owns the toplevel windows shown together on it.
@@ -597,6 +625,168 @@ workspace showing on the pointer's output, and the tick's confinement then pulls
 The same grabs are available without the client's cooperation, which is the only way to move a window whose decorations
 offer no handle: Alt+left-drag moves, and Alt+right-drag resizes from whichever corner of the window the pointer is
 nearest.
+
+#### Window states, dialogs and popups
+
+A window has two states it can ask for and the compositor grants: maximized, which fills the output, and fullscreen,
+which covers it.  They are independent, and the difference is worth keeping straight — a fullscreen window is raised
+above everything on its workspace and a maximized one is an ordinary window that happens to fill the screen, so
+un-fullscreening a window that was also maximized has to leave it filling the output rather than shrink it back to
+the size it had before either.  The geometry to return to is captured once, on the way in from a normal window, and
+spent on the way out of the last state; capturing it again on the second transition would record the maximized
+geometry and lose the real one.
+
+A configure carries the *complete* set of states, so it is built in one place from what the compositor knows rather
+than assembled per call site.  The earlier shape, where activation and resizing each wrote their own short array,
+could say only one thing at a time — and a configure that omits `maximized` is telling the client it is no longer
+maximized.
+
+A window is also told how much room it has, through `configure_bounds`, before the configure it is meant to size
+itself against.  There are no panels or docks here so the bounds are the whole output, but the point of the event is
+that the client should not have to *assume* that — a window opening larger than the display it is on is what it
+prevents.  It is sent only when the answer changes, which for a window that stays on one display means once.
+
+Not every request is granted, and `xdg_toplevel.wm_capabilities` is where that is said out loud.  A client told
+nothing must assume every capability is available, so silence is a claim rather than a neutral absence: toolkits draw
+the title-bar buttons and each one then does nothing.  The capabilities are a table pairing each with whether the
+request behind it is implemented, which is what stops the advertisement drifting from the truth — minimize is absent
+because a minimized window would have no way back with no taskbar to click, and the window menu because the
+compositor has no text rendering to draw one with.
+
+`set_parent` makes one window a dialog of another, and the only thing the compositor does with it is keep the child
+above the parent.  That means raising either has to move both, since otherwise clicking the window would bury the
+dialog belonging to it — so raising starts from the root of the family and walks down.  A link that would close a
+loop is refused, because the walk that orders them would otherwise never end.
+
+A popup is placed by an `xdg_positioner`, in two steps.  The anchor and gravity say where the client wants it: a
+point on the anchor rectangle, and which corner of the popup hangs off that point.  The constraint adjustment then
+says what to do when that lands off-screen, which is the ordinary case for a menu opened near an edge — flip to the
+other side of the anchor, slide back into view, or shrink.  Each axis is settled separately, so a menu running off
+the right edge slides sideways without also being dragged upwards, and a flip that would not help is discarded
+rather than throwing the popup to the far side for nothing.  `reposition` runs the same placement again on a live
+popup and answers with the client's own token, so a client that has asked more than once can tell which answer
+belongs to which request.
+
+#### The bell
+
+`xdg_system_bell_v1.ring` asks the compositor to get the user's attention.  There is no audio anywhere in this
+project, so the bell is visual: the output the surface is on is tinted for a moment.  That is the same answer a
+terminal gives with the speaker muted, and it is deliberately translucent and brief — the alert is the change, and a
+screen the user cannot read through is worse than one they can.
+
+#### The clipboard, and dragging between windows
+
+Four interfaces carry data between clients, and none of them carries any data.  A `wl_data_source` is a list of mime
+types a client says it can produce; a `wl_data_offer` is the compositor's name for that list, handed to a client that
+may ask for it; a `wl_data_device` is where a client is told which offer is the clipboard and what is being dragged
+over it.  What actually moves the bytes is a pipe the two clients share, and the compositor's whole part in it is to
+pass one end across.
+
+That is worth being explicit about, because it is what keeps this feature out of the event loop entirely.  A client
+pasting sends `wl_data_offer.receive` carrying the write end of a pipe it made; the compositor forwards that descriptor
+verbatim as the descriptor of `wl_data_source.send` to the offering client, and the two of them talk directly.  Nothing
+is buffered, nothing is read, and a hundred megabytes of pasted text never touches compositor memory.  A descriptor
+that would reach a client that has gone away is dropped instead, which closes it — an immediate end of file for the
+reader rather than a hang.  That is also what a paste from a stale offer or for a mime type that was never offered
+gets, and it is the right answer for all three: an empty paste is what actually happened, and none of them is a fault
+worth ending a connection over.
+
+It follows that a selection dies with the client that owns it.  Copy from a terminal, close the terminal, and there is
+nothing to paste — because the only thing that could have produced those bytes has gone.  Keeping the content alive
+would mean the compositor reading every offered mime type into memory the moment a selection was set, which is both
+the asynchronous pipe machinery this design avoids and a policy decision about which clipboards are worth spending
+memory on.  A clipboard manager is a client, and is where that belongs.
+
+An offer is named by the compositor, from the top of the id space, because there is no round trip in which the client
+could name it.  That has a consequence the id-space rules make sharp: `wl_display.delete_id` is never sent for a server
+id, so nothing but the client's own `wl_data_offer.destroy` takes the id out of its object map.  So when the compositor
+stops caring about an offer — the clipboard has been replaced, the drag has left the window — it forgets the offer's
+*contents* and keeps its *identity*.  Tearing the object down instead would leave the client holding an id the
+compositor had forgotten, and the destroy it is about to send would disconnect it.
+
+The clipboard follows keyboard focus.  There is one selection at a time, and the client that has focus is the one told
+about it: on a focus change it is sent a fresh offer, and on binding a data device while already focused it is sent one
+then.  That second case is the one that matters at startup — a client usually gets its data device well after its first
+window is focused, and a compositor that only offered the selection from the focus change would leave it with an empty
+clipboard for the rest of its life.  A client losing focus is told nothing, because an offer it still holds stops
+working the moment the selection is replaced, and it is not going to be asked for a paste in the meantime.  A client
+that owns the selection is offered it back like anyone else: copying and pasting within one application goes through
+exactly this path, and a shortcut that skipped the owner would break it.
+
+A drag takes the pointer the way a move does, and for the same reason: the compositor owns it until the button comes
+up, and the client the pointer was over is sent a leave so it is not left drawing a hover state it will hear no more
+about.  It is a separate piece of state from an interactive grab rather than a third kind of one, because the two have
+nothing in common past that sentence — a move writes a window's position and sends it a configure, while a drag writes
+no geometry at all and delivers protocol to a third client.  They are mutually exclusive by a check where each begins,
+which is also what stops a client starting a move mid-drag off the very button press that started the drag.
+
+What the pointer crosses over is delivered as `wl_data_device.enter`, `motion` and `leave` to the surface underneath,
+with a fresh offer per surface entered — and one per data device, since `enter` is a per-device event and an offer
+belongs to the device it arrived on.  No `wl_pointer` event reaches anyone for the duration; the target learns where
+the pointer is from `wl_data_device.motion`.  A drag with no source is a client dragging within itself and is delivered
+only to that client, with a null offer: there is nothing to hand anyone else.
+
+The two sides then negotiate.  The source names the actions it will allow, the target names the ones it will take and
+which of them it would rather have, and the compositor settles it — the preference where both sides offer it, failing
+that the lowest of copy, move and ask that they agree on, and `none` when they agree on nothing.  Both are told, and
+only when the answer changes.  A client too old for `set_actions` is not the same as one that has it and never called
+it: a version 1 or 2 source can only mean a copy, and a version 1 or 2 target has no way to refuse anything, so it is
+taken to accept whatever is offered.  That is exactly how those clients behaved before actions existed.
+
+On release, a target that has accepted a mime type *and* settled on an action gets `drop`; anything else cancels.  A
+target that took the content but agreed to do nothing with it has not accepted the drop.  The drop is where the drag
+ends and the offer does not: the pointer is free immediately, and the offer outlives it so the target can still read
+from it and then say it is done with `finish`, which is what tells the source `dnd_finished`.  Keeping the drag alive
+to mean "dropped but not finished" was the alternative, and it would put a second condition on every check of whether
+the pointer is spoken for — where the one place that forgot it would swallow the pointer for good.  A version 1 or 2
+target never sends `finish`, so its source never hears `dnd_finished`; that is what the protocol gives it.
+
+The drag icon is the cursor-surface path with a different position: a surface role, permanent like the cursor's, and
+one more quad pushed into the scene above every window and below the cursor.  It sits at the pointer plus whatever
+offset the client attached it with, which is the only means a client has to position it — a toolkit centres its icon
+under the cursor by attaching at a negative `dx` and `dy`.  That offset is why `wl_surface.attach`'s displacement and
+`wl_surface.offset` are tracked at all; nothing else reads them yet, and applying them to ordinary surfaces is a
+larger question about how a surface repositions itself on attach that is deliberately left alone.
+
+Serials are how a client proves the user asked for something.  Starting a drag must quote a pointer button press that
+is still held — the same rule an interactive move follows, and for the same reason, since a drag beginning after the
+user let go has nothing to follow.  Setting the clipboard is looser, because it is a keypress far more often than a
+click, and because a client working through a batch of events quotes the serial of the event it is handling rather
+than the newest one that arrived.  So the compositor keeps a short history of the serials it has sent each client
+rather than only the last, and honours a request quoting any of them.  A serial from neither is refused in silence: a
+client that lost that race has done nothing that warrants `wl_display.error`, which would end its connection.
+
+#### Touch
+
+Touch is multi-point, and every event names which finger it is about.  A point belongs to the surface it *started*
+on for its whole life, however far it then travels: dragging a finger off a window keeps reporting to the client
+that owns it, which is what makes a swipe leaving the window still reach the thing being swiped.  A touch that lands
+on nothing is not tracked at all, so its motion and lift are dropped rather than delivered to whatever is touched
+next.
+
+`cancel` is not the same as every finger lifting.  It says something else has taken the sequence over, and a client
+receiving it must undo what the gesture was doing rather than complete it — so it goes to every client holding a
+point, not only the one under the last finger, since a two-finger gesture spanning two windows leaves both waiting
+to hear how it ended.
+
+The seat capability appears on the first touch rather than at startup.  winit reports touch *events* and never touch
+*devices*, so the first event is the only evidence a touchscreen exists — and a capability can therefore appear
+after clients have already bound the seat, which is why they are all told again rather than only whoever binds next.
+
+#### What a client says about its buffer
+
+Two requests describe the buffer rather than the surface, and both reach further than they look.
+
+`set_buffer_transform` says how the client has *already* rotated or flipped its contents, so drawing it correctly
+means undoing that — the compositor applies the inverse as an affine map over the unit quad in the vertex shader.
+The map is column-major, matching how GL reads a `mat2`, and writing it row-major transposes exactly the two quarter
+turns while leaving the symmetric transforms looking correct, which is a bug that hides well and is what the test
+covering all eight exists to catch.  A quarter turn also exchanges the surface's width and height, so this reaches
+hit testing and layout and not only sampling.
+
+`set_opaque_region` is a promise, not a description: the client says what is fully opaque and the compositor may
+skip the alpha blend there.  It is acted on only when the region covers the whole surface, because a partial promise
+would mean splitting the quad along the region's edges, and one quad per surface is what keeps this renderer simple.
 
 #### Rendering
 

@@ -56,6 +56,11 @@ uniform vec4 u_dst;
 uniform vec2 u_viewport;
 // Source rect in normalised texture coordinates: (u0, v0, u1, v1).
 uniform vec4 u_src;
+// Undoes the client's `wl_surface.set_buffer_transform`, as an affine map over
+// the unit quad: source = u_uv_origin + u_uv_basis * destination. Identity for
+// the overwhelmingly common untransformed case.
+uniform vec2 u_uv_origin;
+uniform mat2 u_uv_basis;
 
 out vec2 v_texcoord;
 
@@ -64,7 +69,8 @@ void main() {
     vec2 ndc = (pixel / u_viewport) * 2.0 - 1.0;
     // Wayland's y axis grows downward, GL's grows upward.
     gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
-    v_texcoord = mix(u_src.xy, u_src.zw, a_unit);
+    vec2 unit = u_uv_origin + u_uv_basis * a_unit;
+    v_texcoord = mix(u_src.xy, u_src.zw, unit);
 }
 ";
 
@@ -163,6 +169,9 @@ pub struct GlRenderer {
     u_viewport: Option<glow::UniformLocation>,
     /// Source crop uniform, in normalised texture coordinates.
     u_src: Option<glow::UniformLocation>,
+    /// Buffer-transform map, undoing `wl_surface.set_buffer_transform`.
+    u_uv_origin: Option<glow::UniformLocation>,
+    u_uv_basis: Option<glow::UniformLocation>,
     /// Opaque-alpha flag uniform, 1.0 for XRGB8888.
     ///
     /// All four are `Option` because GL returns no location for a uniform the
@@ -204,6 +213,8 @@ impl GlRenderer {
             let u_dst = gl.get_uniform_location(program, "u_dst");
             let u_viewport = gl.get_uniform_location(program, "u_viewport");
             let u_src = gl.get_uniform_location(program, "u_src");
+            let u_uv_origin = gl.get_uniform_location(program, "u_uv_origin");
+            let u_uv_basis = gl.get_uniform_location(program, "u_uv_basis");
             let u_ignore_alpha = gl.get_uniform_location(program, "u_ignore_alpha");
             let u_swizzle = gl.get_uniform_location(program, "u_swizzle");
             if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
@@ -245,6 +256,8 @@ impl GlRenderer {
                 u_dst,
                 u_viewport,
                 u_src,
+                u_uv_origin,
+                u_uv_basis,
                 u_ignore_alpha,
                 u_swizzle,
                 textures: HashMap::new(),
@@ -344,7 +357,21 @@ impl GlRenderer {
                     as_f32((sy + sh) / th),
                 );
 
-                let ignore_alpha = f32::from(u8::from(image.format == PixelFormat::Xrgb8888));
+                let ((ox, oy), basis) = element.transform.uv_map();
+                gl.uniform_2_f32(self.u_uv_origin.as_ref(), ox, oy);
+                // Column-major, which is what GL expects and what the basis is
+                // written as: each inner array is one column.
+                gl.uniform_matrix_2_f32_slice(
+                    self.u_uv_basis.as_ref(),
+                    false,
+                    &[basis[0][0], basis[0][1], basis[1][0], basis[1][1]],
+                );
+
+                // A buffer with no alpha channel, or a client that has promised
+                // this surface covers what is behind it. Either way the blend
+                // has nothing to do, and the promise is the client's to keep.
+                let opaque = image.format == PixelFormat::Xrgb8888 || element.opaque;
+                let ignore_alpha = f32::from(u8::from(opaque));
                 gl.uniform_1_f32(self.u_ignore_alpha.as_ref(), ignore_alpha);
                 let swizzle = f32::from(u8::from(image.swizzle_bgra()));
                 gl.uniform_1_f32(self.u_swizzle.as_ref(), swizzle);

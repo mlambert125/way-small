@@ -20,6 +20,9 @@ pub enum TextureId {
     DefaultCursor,
     /// The built-in cursor used when no theme is available.
     FallbackCursor,
+    /// A single translucent white pixel, stretched over an output for the
+    /// visual bell.
+    BellFlash,
 }
 
 /// Pixel layout of a texture's source bytes.

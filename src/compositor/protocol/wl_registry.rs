@@ -18,6 +18,7 @@ const BIND: u16 = 0;
 
 // Event opcodes
 pub const GLOBAL: u16 = 0;
+pub const GLOBAL_REMOVE: u16 = 1;
 
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
@@ -70,6 +71,7 @@ fn handle_bind(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClie
             "wl_seat" => ObjectType::WlSeat,
             "wp_viewporter" => ObjectType::WpViewporter,
             "wp_presentation" => ObjectType::WpPresentation,
+            "wl_fixes" => ObjectType::WlFixes,
             other => {
                 tracing::warn!("wl_registry.bind: no handler for interface '{}' yet", other);
                 return;
@@ -198,6 +200,28 @@ pub fn broadcast_global(
                     .u32(version)
                     .build();
                 let _ = client.send(message(*obj_id, GLOBAL, args));
+            }
+        }
+    }
+}
+
+/// Withdraw a global that has gone away.
+///
+/// The counterpart to [`broadcast_global`], and the half that was missing: a
+/// global announced and never withdrawn leaves every client holding a name it
+/// may still try to bind, and an object for a thing that no longer exists. An
+/// unplugged display is the case this exists for.
+///
+/// A client is expected to destroy its objects for the global on hearing this,
+/// and the compositor must send it nothing further about them — which is why
+/// the bookkeeping tying clients to the departed output is dropped alongside,
+/// in [`CompositorState::remove_output`].
+pub fn broadcast_global_remove(state: &mut CompositorState, global_name: u32) {
+    for (_, client) in state.clients.iter() {
+        for (obj_id, obj_type) in &client.objects {
+            if *obj_type == ObjectType::WlRegistry {
+                let args = ArgWriter::new().u32(global_name).build();
+                let _ = client.send(message(*obj_id, GLOBAL_REMOVE, args));
             }
         }
     }

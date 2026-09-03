@@ -5,6 +5,10 @@
 //! (cursor-based parser for incoming args), and the `message()` constructor.
 
 use crate::wayland_socket::WaylandProtocolMessage;
+use std::os::fd::OwnedFd;
+
+#[cfg(test)]
+mod tests;
 
 /// Read a u32 from a byte slice at the given offset.
 #[allow(dead_code)]
@@ -18,6 +22,23 @@ pub fn read_u32(args: &[u8], offset: usize) -> Option<u32> {
 pub fn read_i32(args: &[u8], offset: usize) -> Option<i32> {
     args.get(offset..offset + 4)
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Read a Wayland string that may be null.
+///
+/// Returns (`Option<String>`, `bytes_consumed`), where the inner `None` is a
+/// null string and `Some(String::new())` is an empty one. The two are different
+/// on the wire and mean different things: `wl_data_source.target` sends null to
+/// say the target will take nothing at all, and a client reading that as an
+/// empty string would believe a zero-length mime type had been accepted.
+///
+/// [`read_string`] collapses the two, which is right for every interface that
+/// has no nullable string and wrong for the ones that do.
+pub fn read_string_or_null(args: &[u8], offset: usize) -> Option<(Option<String>, usize)> {
+    if read_u32(args, offset)? == 0 {
+        return Some((None, 4));
+    }
+    read_string(args, offset).map(|(s, consumed)| (Some(s), consumed))
 }
 
 /// Read a Wayland string from a byte slice at the given offset.
@@ -77,6 +98,42 @@ impl ArgWriter {
         let padding = padded - len as usize;
         self.buf.extend(std::iter::repeat_n(0u8, padding));
         self
+    }
+
+    /// Adds a `wl_array` of `u32`s.
+    ///
+    /// On the wire an array is a byte count followed by the bytes, padded out
+    /// to a four-byte boundary — the count is of *bytes*, not elements, which
+    /// is the easy thing to get wrong when there is no helper and each caller
+    /// counts for itself.
+    pub fn array_u32(mut self, values: &[u32]) -> Self {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let len = u32::try_from(bytes.len()).expect("array too long for Wayland protocol");
+        self.buf.extend_from_slice(&len.to_le_bytes());
+        self.buf.extend_from_slice(&bytes);
+        let padding = (4 - (bytes.len() % 4)) % 4;
+        self.buf.extend(std::iter::repeat_n(0u8, padding));
+        self
+    }
+
+    /// Adds a nullable object or `new_id` argument. A null object is a zero id.
+    pub fn object(self, val: Option<u32>) -> Self {
+        self.u32(val.unwrap_or(0))
+    }
+
+    /// Adds a nullable string.
+    ///
+    /// Not the same as an empty one, and the difference is on the wire: a null
+    /// string is a length of zero and nothing else, while an empty string is a
+    /// length of one, a NUL byte, and three bytes of padding.
+    /// `wl_data_source.target` distinguishes them — null means the target will
+    /// take nothing — so writing `string("")` where a null belongs tells the
+    /// source that a zero-length mime type was accepted.
+    pub fn string_or_null(self, val: Option<&str>) -> Self {
+        match val {
+            Some(s) => self.string(s),
+            None => self.u32(0),
+        }
     }
 
     /// Adds a 64-bit float as a 24.8 fixed point decimal to the buffer
@@ -143,6 +200,22 @@ impl<'a> ArgReader<'a> {
         Some(s)
     }
 
+    /// Attempt to read a nullable wayland string and advance the cursor.
+    ///
+    /// The outer `None` is a decode failure; the inner one is a null string,
+    /// which `wl_data_offer.accept` sends to say it will take nothing. See
+    /// [`read_string_or_null`] for why the two cannot be collapsed.
+    ///
+    /// The nesting is the point rather than an oversight — the two layers mean
+    /// different things and the caller acts differently on each — so the lint
+    /// against it does not apply.
+    #[allow(clippy::option_option)]
+    pub fn string_or_null(&mut self) -> Option<Option<String>> {
+        let (s, consumed) = read_string_or_null(self.buf, self.pos)?;
+        self.pos += consumed;
+        Some(s)
+    }
+
     /// Attempt to read a fixed-point decimal from the buffer, convert it to a `f64` and advance the cursor
     pub fn fixed(&mut self) -> Option<f64> {
         let raw = self.i32()?;
@@ -162,5 +235,25 @@ pub fn message(object_id: u32, op_code: u16, args: Vec<u8>) -> WaylandProtocolMe
         op_code,
         args,
         fds: Vec::new(),
+    }
+}
+
+/// Build a `WaylandMessage` carrying file descriptors as ancillary data.
+///
+/// The message owns them from here on. `SCM_RIGHTS` duplicates a descriptor
+/// into the receiving client, so our copy still has to be closed afterwards —
+/// dropping the message does that on every path, sent or not, which is what
+/// makes a send that fails or a client that has gone away leak nothing.
+pub fn message_with_fds(
+    object_id: u32,
+    op_code: u16,
+    args: Vec<u8>,
+    fds: Vec<OwnedFd>,
+) -> WaylandProtocolMessage {
+    WaylandProtocolMessage {
+        object_id,
+        op_code,
+        args,
+        fds,
     }
 }
