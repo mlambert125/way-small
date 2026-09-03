@@ -28,8 +28,15 @@ yet written say so where they begin.  As of now:
   zero-copy and damage tracking, dma-buf import, and the winit and null backends.
 - **Not built**: the DRM backend, and with it every part of running on bare hardware — session management, `libinput`,
   and modesetting.  There is no clipboard or drag and drop; `wl_data_device.start_drag` and `set_selection` are
-  accepted and do nothing.  Subsurface `set_sync` is recorded but does not cache commits.  There is no XWayland, no
-  layer shell, no decoration protocol, and no touch or tablet input.
+  accepted and do nothing.  Subsurface `set_sync` is recorded but does not cache commits.  There is no layer shell,
+  no decoration protocol, and no touch or tablet input.
+- **Not intended in-tree**: X11 window management.  X clients are meant to be served by `xwayland-satellite`, which
+  runs Xwayland and the `xwm` in a process of its own and hands each X window to the compositor as an ordinary
+  `xdg_toplevel` or `xdg_popup`.  Nothing here then needs an X11 protocol implementation, and the window model does
+  not have to span two kinds of toplevel: hit testing, focus, stacking and workspaces treat an X window as they
+  treat any other.  Everything satellite requires of a host — the core interfaces, the whole of `xdg_shell`, and
+  `wp_viewporter` — is already advertised.  The decision is tentative, and what it costs is set out in
+  `docs/notes.md`.
 
 ## Source Layout
 

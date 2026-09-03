@@ -97,10 +97,10 @@ pub enum TextureSource {
     /// is the same image to the backend, which is how it knows the import it
     /// already has is still good.
     ///
-    /// Nothing builds one yet: the backend can import them and the renderer can
-    /// draw them, but a client has no way to send one until
-    /// `zwp_linux_dmabuf_v1` is implemented.
-    #[allow(dead_code)]
+    /// Built when a client draws with a buffer it created through
+    /// `zwp_linux_dmabuf_v1` — a global advertised only once the backend has
+    /// said it can import one, so this variant exists exactly when there is a
+    /// backend able to do something with it.
     Dmabuf(Arc<DmabufImage>),
 }
 

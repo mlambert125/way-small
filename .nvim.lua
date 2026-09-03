@@ -86,7 +86,7 @@ end
 -- <leader>p* — project commands
 vim.keymap.set('n', '<leader>pb', function() run_script('cargo build', 'build') end, { desc = 'Cargo: build' })
 vim.keymap.set('n', '<leader>pr', function()
-    vim.cmd('tabnew | terminal cargo run')
+    vim.cmd('enew | terminal cargo run')
     vim.api.nvim_buf_set_name(0, 'cargo-run')
     vim.cmd('startinsert')
 end, { desc = 'Cargo: run' })
