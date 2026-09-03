@@ -12,13 +12,14 @@ use super::wl_data_device_manager::{
 use super::wl_pointer;
 use super::{wl_data_device, wl_data_offer, wl_data_source};
 use crate::shared::{
-    BufferGuard, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping, TextureRect,
-    cursor_bounds, output_contains,
+    BufferGuard, BufferTransform, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping,
+    TextureRect, cursor_bounds, output_contains,
 };
 use enumflags2::{BitFlags, bitflags};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use strum::FromRepr;
 
 #[cfg(test)]
@@ -170,9 +171,13 @@ pub struct SurfacePending {
     pub damage_buffer: Vec<TextureRect>,
     pub frame_callback: Option<u32>,
     pub presentation_feedbacks: Vec<u32>,
-    pub input_region: PendingInputRegion,
+    pub input_region: PendingRegion,
+    /// Pending `wl_surface.set_opaque_region`.
+    pub opaque_region: PendingRegion,
     /// Pending `wl_surface.set_buffer_scale`.
     pub buffer_scale: Option<i32>,
+    /// Pending `wl_surface.set_buffer_transform`.
+    pub buffer_transform: Option<BufferTransform>,
     /// Pending offset from `wl_surface.attach`'s `dx`/`dy`, or
     /// `wl_surface.offset`. Accumulates across attaches within one commit,
     /// which is what the protocol says it does.
@@ -202,10 +207,21 @@ pub struct Surface {
     /// Which parts of the surface accept pointer input, in surface-local
     /// coordinates. `None` is the protocol default: the whole surface does.
     pub input_region: Option<Vec<RegionRect>>,
+    /// Which parts of the surface the client promises are fully opaque, in
+    /// surface-local coordinates. `None` is the protocol default: none of it.
+    ///
+    /// A promise rather than a description — the compositor may skip alpha
+    /// blending where it holds, and gets the wrong picture if it does not, so
+    /// it is only acted on where a client has stated it outright.
+    pub opaque_region: Option<Vec<RegionRect>>,
     /// How many buffer pixels map to one surface-local coordinate. Clients on a
     /// scaled output submit a correspondingly larger buffer, so the surface's
     /// logical size is its buffer size divided by this. Always at least 1.
     pub buffer_scale: i32,
+    /// How the client has already transformed its buffer. The compositor undoes
+    /// it when drawing, and swaps the surface's width and height for the
+    /// quarter-turn cases.
+    pub buffer_transform: BufferTransform,
     /// Where the surface's contents sit relative to where they would
     /// otherwise, from `wl_surface.attach`'s `dx`/`dy` and `wl_surface.offset`.
     ///
@@ -397,14 +413,15 @@ pub fn region_contains(rects: &[RegionRect], x: i32, y: i32) -> bool {
     inside
 }
 
-/// A `wl_surface.set_input_region` waiting to be applied at the next commit.
+/// A `wl_surface.set_input_region` or `set_opaque_region` waiting to be applied
+/// at the next commit.
 #[derive(Debug, Default, Clone)]
-pub enum PendingInputRegion {
+pub enum PendingRegion {
     /// The client has not set an input region since the last commit.
     #[default]
     Unchanged,
-    /// Reset to the protocol default, where the whole surface accepts input.
-    /// This is what the null region argument means.
+    /// Reset to the protocol default, which the null region argument means:
+    /// the whole surface accepts input, or none of it is opaque.
     Infinite,
     /// Restricted to these rectangles, in surface-local coordinates.
     Rects(Vec<RegionRect>),
@@ -446,6 +463,27 @@ pub struct XdgToplevelState {
     /// Largest size the client says it wants, from `set_max_size`. Zero in a
     /// dimension means it named no limit there.
     pub max_size: (i32, i32),
+    /// Filling its output, from `set_maximized`.
+    pub maximized: bool,
+    /// Covering its output entirely, from `set_fullscreen`. Distinct from
+    /// maximized: a fullscreen window is drawn above every other window on
+    /// its workspace, and is not confined to leave room for anything.
+    pub fullscreen: bool,
+    /// Where the window was before it was maximized or made fullscreen, as
+    /// (x, y, width, height).
+    ///
+    /// Taken once, on the way *into* the first of those states, and spent on
+    /// the way out of the last. A window that goes maximized then fullscreen
+    /// then back must land where it started, so a second capture on the way
+    /// into fullscreen — which would record the maximized geometry — is
+    /// exactly the bug to avoid.
+    pub restore: Option<(i32, i32, i32, i32)>,
+    /// The toplevel this one hangs off, from `set_parent`. A dialog names its
+    /// window here, and is kept above it in the stack.
+    pub parent: Option<u32>,
+    /// The bounds last sent as `configure_bounds`, so an unchanged one sends
+    /// nothing. A window that has not moved between displays hears this once.
+    pub sent_bounds: Option<(i32, i32)>,
 }
 
 #[derive(Debug)]
@@ -511,6 +549,14 @@ pub struct XdgPositionerState {
     pub gravity: XdgPositionerGravity,
     pub offset: (i32, i32),
     pub constraint_adjustment: BitFlags<XdgPositionerConstraintAdjustment>,
+    /// From `set_reactive`: the popup wants to be re-placed whenever what it is
+    /// anchored to moves, rather than only when the client asks.
+    pub reactive: bool,
+    /// From `set_parent_size`: the size the client believes its parent window
+    /// will be. Constraining happens against this when it is given, which lets
+    /// a client that is about to resize get a popup placed for the size it is
+    /// heading to rather than the one it is leaving.
+    pub parent_size: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -525,10 +571,17 @@ pub struct KeyboardBinding {
     pub object_id: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct TouchBinding {
+    pub client_id: u32,
+    pub object_id: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct SeatState {
     pub has_pointer: bool,
     pub has_keyboard: bool,
+    pub has_touch: bool,
 }
 
 /// What a `wl_data_source` has been spent on.
@@ -682,6 +735,14 @@ pub struct CompositorState {
     pub next_global_number: u32,
     pub pointers: Vec<PointerBinding>,
     pub keyboards: Vec<KeyboardBinding>,
+    pub touches: Vec<TouchBinding>,
+    /// Fingers currently down, and the surface each landed on.
+    ///
+    /// A touch point belongs to the surface it *started* on for its whole
+    /// life, however far it then travels — dragging a finger off a window does
+    /// not hand the gesture to whatever is underneath, which is what makes a
+    /// swipe that leaves the window still reach the client that owns it.
+    pub touch_points: HashMap<i32, ClientObjectId>,
     pub focused_surface: Option<ClientObjectId>,
     /// The specific surface (possibly a subsurface) currently under the pointer.
     /// Used for delivering pointer enter/leave/motion/button to the correct surface.
@@ -774,6 +835,19 @@ pub struct CompositorState {
     pub drag: Option<Drag>,
     /// Surfaces with the drag-icon role. Permanent, like the cursor role.
     pub dnd_icon_surfaces: HashSet<ClientObjectId>,
+    /// Whether a continuous scroll is in progress on each axis.
+    ///
+    /// Only the axes that actually moved are stopped when the fingers lift: an
+    /// `axis_stop` for an axis that never scrolled describes something that
+    /// never happened.
+    pub scrolling_vertical: bool,
+    pub scrolling_horizontal: bool,
+    /// Outputs currently showing the visual bell, and when each stops.
+    ///
+    /// There is no audio anywhere in this compositor, so `xdg_system_bell.ring`
+    /// is answered the way a terminal answers it with the speaker muted: a
+    /// brief flash of the display the surface is on.
+    pub bell_until: HashMap<OutputId, Instant>,
     /// The last few serials of input events delivered to each client.
     ///
     /// A client quoting a serial is saying "the user did this in my window",
@@ -789,6 +863,12 @@ pub struct CompositorState {
     /// clipboard would weaken move and resize by a side effect.
     pub recent_input_serials: HashMap<u32, VecDeque<u32>>,
 }
+
+/// How long the visual bell stays on screen.
+///
+/// Long enough to be seen at a glance, short enough not to be in the way — a
+/// bell is an alert, and one that outstays it becomes an obstruction.
+const BELL_DURATION: Duration = Duration::from_millis(120);
 
 /// How many input serials are remembered per client for
 /// [`CompositorState::recent_input_serials`].
@@ -863,6 +943,8 @@ impl CompositorState {
             next_global_number: u32::try_from(super::GLOBALS.len()).unwrap_or(1),
             pointers: Vec::new(),
             keyboards: Vec::new(),
+            touches: Vec::new(),
+            touch_points: HashMap::new(),
             focused_surface: None,
             pointer_surface: None,
             cursor_x: 0.0,
@@ -898,7 +980,30 @@ impl CompositorState {
             drag: None,
             dnd_icon_surfaces: HashSet::new(),
             recent_input_serials: HashMap::new(),
+            scrolling_vertical: false,
+            scrolling_horizontal: false,
+            bell_until: HashMap::new(),
         }
+    }
+
+    /// Flash an output, for [`super::xdg_system_bell`].
+    pub fn ring_bell(&mut self, output_id: OutputId) {
+        self.bell_until
+            .insert(output_id, Instant::now() + BELL_DURATION);
+        self.dirty = true;
+    }
+
+    /// Drop bells that have finished. Returns true if anything changed, which
+    /// is what puts the flash back off the screen.
+    pub fn expire_bells(&mut self) -> bool {
+        let now = Instant::now();
+        let before = self.bell_until.len();
+        self.bell_until.retain(|_, &mut until| until > now);
+        let changed = self.bell_until.len() != before;
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     /// Note a serial the compositor has just sent a client on an input event.
@@ -1040,13 +1145,268 @@ impl CompositorState {
         }
     }
 
+    /// Place a popup from a positioner, in coordinates relative to its parent.
+    ///
+    /// The constraining region is the output the parent window is on, expressed
+    /// relative to the parent surface — which is what turns "keep it on screen"
+    /// into arithmetic the positioner can do without knowing where anything is
+    /// globally. A client that named a `parent_size` is constrained against
+    /// that instead: it is telling us the size its window is about to become,
+    /// and placing against the size it is leaving would be placing for the past.
+    pub fn place_popup(
+        &self,
+        positioner: ClientObjectId,
+        parent_surface: ClientObjectId,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let pos = self.xdg_positioners.get(&positioner)?;
+
+        let available = if let Some((width, height)) = pos.parent_size {
+            Some((0, 0, width, height))
+        } else {
+            self.surface_output(self.root_of(parent_surface))
+                .and_then(|id| self.outputs.iter().find(|o| o.id == id))
+                .map(|output| {
+                    let parent = self.global_position_of(parent_surface);
+                    (
+                        output.geometry.x - parent.0,
+                        output.geometry.y - parent.1,
+                        output.geometry.physical_width,
+                        output.geometry.physical_height,
+                    )
+                })
+        };
+
+        Some(super::xdg_positioner::place(pos, available))
+    }
+
+    /// The surface at the root of a subsurface or popup tree.
+    fn root_of(&self, key: ClientObjectId) -> ClientObjectId {
+        let (client_id, mut current) = key;
+        for _ in 0..self.surfaces.len() {
+            let Some(parent) = self
+                .surfaces
+                .get(&(client_id, current))
+                .and_then(|s| s.parent)
+            else {
+                break;
+            };
+            current = parent;
+        }
+        (client_id, current)
+    }
+
+    /// Where a surface sits in global coordinates, walking up its parents.
+    fn global_position_of(&self, key: ClientObjectId) -> (i32, i32) {
+        let (client_id, mut current) = key;
+        let (mut x, mut y) = (0i32, 0i32);
+        for _ in 0..=self.surfaces.len() {
+            let Some(surface) = self.surfaces.get(&(client_id, current)) else {
+                break;
+            };
+            x = x.saturating_add(surface.subsurface_position.0);
+            y = y.saturating_add(surface.subsurface_position.1);
+            if let Some(parent) = surface.parent {
+                current = parent;
+            } else {
+                // The root of the tree carries the only global position; every
+                // surface below it is an offset from its parent.
+                x = x.saturating_add(surface.position.0);
+                y = y.saturating_add(surface.position.1);
+                break;
+            }
+        }
+        (x, y)
+    }
+
+    /// Raise a window, bringing its dialogs up with it.
+    ///
+    /// A child is kept above its parent, so raising either has to move both —
+    /// otherwise clicking a window would bury the dialog that belongs to it,
+    /// which is exactly the case `set_parent` exists to prevent.
+    ///
+    /// The parent goes up first and the children follow, deepest last, so a
+    /// chain of dialogs keeps its own order.
+    pub fn raise_with_children(&mut self, toplevel: ClientObjectId) {
+        // Start from the root of the family, so raising a dialog lifts the
+        // whole group rather than tearing it off the top of its parent.
+        let mut root = toplevel;
+        for _ in 0..self.xdg_toplevels.len() {
+            let Some(parent) = self
+                .xdg_toplevels
+                .get(&root)
+                .and_then(|t| t.parent)
+                .map(|id| (root.0, id))
+            else {
+                break;
+            };
+            if !self.xdg_toplevels.contains_key(&parent) {
+                break;
+            }
+            root = parent;
+        }
+
+        for key in std::iter::once(root).chain(self.descendants_of(root)) {
+            if let Some(surface) = self.surface_of_toplevel(key) {
+                self.workspaces.raise(surface);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Every toplevel below one in the parent chain, nearest first.
+    ///
+    /// Breadth-first, and bounded by the number of toplevels that exist:
+    /// `set_parent` refuses a link that would close a loop, but this must not
+    /// depend on that for its own termination.
+    fn descendants_of(&self, root: ClientObjectId) -> Vec<ClientObjectId> {
+        let mut found = Vec::new();
+        let mut frontier = vec![root];
+        for _ in 0..self.xdg_toplevels.len() {
+            let mut next = Vec::new();
+            for (&key, toplevel) in &self.xdg_toplevels {
+                if key.0 != root.0 || found.contains(&key) || key == root {
+                    continue;
+                }
+                let parent = toplevel.parent.map(|id| (key.0, id));
+                if parent.is_some_and(|p| frontier.contains(&p)) {
+                    next.push(key);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            found.extend(next.iter().copied());
+            frontier = next;
+        }
+        found
+    }
+
+    /// Put a window into or out of maximized or fullscreen, and ask it to
+    /// adopt the size that goes with it.
+    ///
+    /// The compositor owns the position and the client owns the size, so this
+    /// moves the window itself and *asks* for the size through a configure —
+    /// the window does not actually change shape until the client acknowledges
+    /// and commits a buffer at the new size.
+    ///
+    /// Returns false if there is nothing to do or nowhere to do it: a window on
+    /// no output has no size to fill.
+    pub fn set_window_state(
+        &mut self,
+        toplevel: ClientObjectId,
+        maximized: bool,
+        fullscreen: bool,
+    ) -> bool {
+        let Some(current) = self.xdg_toplevels.get(&toplevel) else {
+            return false;
+        };
+        if current.maximized == maximized && current.fullscreen == fullscreen {
+            return false;
+        }
+        let was_normal = !current.maximized && !current.fullscreen;
+        let Some(surface) = self.surface_of_toplevel(toplevel) else {
+            return false;
+        };
+
+        // An interactive drag and a window state cannot both own the geometry.
+        // The drag is the one the user is holding, so the state change wins and
+        // the drag is dropped rather than left writing positions underneath it.
+        if self
+            .pointer_grab
+            .is_some_and(|grab| grab.toplevel == toplevel)
+        {
+            self.pointer_grab = None;
+        }
+
+        // Fullscreen wins where both are set: it is the larger claim, and a
+        // window covering its output is already filling it.
+        if maximized || fullscreen {
+            let Some(output) = self
+                .surface_output(surface)
+                .and_then(|id| self.outputs.iter().find(|o| o.id == id))
+            else {
+                return false;
+            };
+            let (origin, size) = (
+                (output.geometry.x, output.geometry.y),
+                (
+                    output.geometry.physical_width,
+                    output.geometry.physical_height,
+                ),
+            );
+
+            // Captured only on the way in from a normal window. Going
+            // maximized then fullscreen must still return to where the window
+            // started, and a second capture would record the maximized
+            // geometry instead.
+            if was_normal {
+                let position = self.surfaces.get(&surface).map_or((0, 0), |s| s.position);
+                let current_size = self.surface_size(surface);
+                if let Some(toplevel) = self.xdg_toplevels.get_mut(&toplevel) {
+                    toplevel.restore =
+                        Some((position.0, position.1, current_size.0, current_size.1));
+                }
+            }
+            if let Some(s) = self.surfaces.get_mut(&surface) {
+                s.position = origin;
+            }
+            if let Some(t) = self.xdg_toplevels.get_mut(&toplevel) {
+                t.maximized = maximized;
+                t.fullscreen = fullscreen;
+            }
+            // A fullscreen window that something else is drawn over is not
+            // fullscreen. Maximized windows are ordinary windows that happen to
+            // fill the screen, and are left where they are in the stack.
+            if fullscreen {
+                self.raise_with_children(toplevel);
+            }
+            super::xdg_toplevel::configure(self, toplevel, size.0, size.1);
+        } else {
+            let restore = self.xdg_toplevels.get_mut(&toplevel).and_then(|t| {
+                t.maximized = false;
+                t.fullscreen = false;
+                t.restore.take()
+            });
+            // A window that was mapped straight into a maximized state has no
+            // geometry to go back to. Zero tells the client to pick its own
+            // size, which is what it was told on its very first configure.
+            let (position, size) =
+                restore.map_or(((0, 0), (0, 0)), |(x, y, w, h)| ((x, y), (w, h)));
+            if restore.is_some()
+                && let Some(s) = self.surfaces.get_mut(&surface)
+            {
+                s.position = position;
+            }
+            super::xdg_toplevel::configure(self, toplevel, size.0, size.1);
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// The `wl_surface` a toplevel draws into.
+    pub fn surface_of_toplevel(&self, toplevel: ClientObjectId) -> Option<ClientObjectId> {
+        let xdg_surface_id = self.xdg_toplevels.get(&toplevel)?.xdg_surface_id;
+        let xdg = self.xdg_surfaces.get(&(toplevel.0, xdg_surface_id))?;
+        Some((toplevel.0, xdg.wl_surface_id))
+    }
+
+    /// Whether a window is filling or covering its output, and so should not be
+    /// dragged, resized, or confined as an ordinary window.
+    pub fn is_window_state_locked(&self, surface: ClientObjectId) -> bool {
+        self.toplevel_for_surface(surface)
+            .and_then(|key| self.xdg_toplevels.get(&key))
+            .is_some_and(|t| t.maximized || t.fullscreen)
+    }
+
     /// Begin an interactive move of a window.
     ///
     /// Sends the client a pointer leave first: the compositor owns the pointer for
     /// the duration, and a client left believing the pointer is still inside it
     /// would keep drawing hover states it can no longer see the end of.
     pub fn start_move_grab(&mut self, surface: ClientObjectId) {
-        if self.drag.is_some() {
+        // A window filling its output has no room to be dragged into, and a
+        // drag would only fight the state that put it there.
+        if self.drag.is_some() || self.is_window_state_locked(surface) {
             return;
         }
         let Some(toplevel) = self.toplevel_for_surface(surface) else {
@@ -1068,7 +1428,7 @@ impl CompositorState {
 
     /// Begin an interactive resize of a window's edge or corner.
     pub fn start_resize_grab(&mut self, surface: ClientObjectId, edges: ResizeEdges) {
-        if self.drag.is_some() {
+        if self.drag.is_some() || self.is_window_state_locked(surface) {
             return;
         }
         let Some(toplevel) = self.toplevel_for_surface(surface) else {
@@ -1407,6 +1767,31 @@ impl CompositorState {
             .map_or((0, 0), |m| (m.dest_width, m.dest_height))
     }
 
+    /// Take an output away, and tell every client it has gone.
+    ///
+    /// Returns the `wl_registry` name it was advertised under, so the caller
+    /// can withdraw the global — the send needs the clients borrowed, which
+    /// this method cannot do while it is walking its own state.
+    ///
+    /// Everything tying a client to the output goes here: the bindings, and the
+    /// record of which surfaces had entered it. No `wl_surface.leave` is sent
+    /// for it, deliberately. The client is about to destroy its `wl_output` on
+    /// hearing `global_remove`, and an event naming an object it has already
+    /// let go is at best ignored and at worst a decode error.
+    pub fn remove_output(&mut self, output_id: OutputId) -> Option<u32> {
+        self.outputs.retain(|output| output.id != output_id);
+        self.output_bindings.retain(|_, &mut id| id != output_id);
+        for surface in self.surfaces.values_mut() {
+            surface.entered_outputs.remove(&output_id);
+            surface.visible_on.remove(&output_id);
+        }
+        // The workspaces of a departed output give their windows back as
+        // unplaced, and the next tick re-homes them onto an output that exists.
+        self.sync_workspaces();
+        self.dirty = true;
+        self.output_global_names.remove(&output_id)
+    }
+
     /// Give every output the one workspace it starts with, and take back the
     /// windows of any output that has gone. Returns true if anything changed.
     ///
@@ -1571,9 +1956,17 @@ impl CompositorState {
             f64::from(buffer.height),
         ));
         let scale = surface.buffer_scale.max(1);
-        let (dest_width, dest_height) = match viewport.and_then(|v| v.destination) {
-            Some((w, h)) => (w, h),
-            None => (f64_to_i32(src.2) / scale, f64_to_i32(src.3) / scale),
+        let (dest_width, dest_height) = if let Some((w, h)) = viewport.and_then(|v| v.destination) {
+            (w, h)
+        } else {
+            // A quarter turn exchanges the axes: a surface whose buffer is
+            // rotated 90 degrees is as wide as that buffer is tall.
+            let (w, h) = (f64_to_i32(src.2) / scale, f64_to_i32(src.3) / scale);
+            if surface.buffer_transform.swaps_axes() {
+                (h, w)
+            } else {
+                (w, h)
+            }
         };
         if dest_width <= 0 || dest_height <= 0 {
             return None;
@@ -1699,7 +2092,9 @@ impl CompositorState {
                 presentation_feedbacks: Vec::new(),
                 pending: SurfacePending::default(),
                 input_region: None,
+                opaque_region: None,
                 buffer_scale: 1,
+                buffer_transform: BufferTransform::default(),
                 offset: (0, 0),
                 entered_outputs: HashSet::new(),
                 visible_on: HashSet::new(),
@@ -1808,6 +2203,11 @@ impl CompositorState {
                 app_id: None,
                 min_size: (0, 0),
                 max_size: (0, 0),
+                maximized: false,
+                fullscreen: false,
+                restore: None,
+                parent: None,
+                sent_bounds: None,
             },
         );
         let Some(xdg_surface) = self.xdg_surfaces.get_mut(&(client_id, xdg_surface_id)) else {
@@ -1947,6 +2347,8 @@ impl CompositorState {
             .retain(|(cid, _), _| *cid != client_id);
         self.pointers.retain(|p| p.client_id != client_id);
         self.keyboards.retain(|k| k.client_id != client_id);
+        self.touches.retain(|t| t.client_id != client_id);
+        self.touch_points.retain(|_, &mut key| key.0 != client_id);
         self.output_bindings.retain(|(cid, _), _| *cid != client_id);
         self.cursor_surfaces.remove(&client_id);
         self.pointer_enter_serial.remove(&client_id);

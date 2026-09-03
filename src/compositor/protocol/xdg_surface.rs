@@ -64,26 +64,26 @@ fn handle_get_toplevel(state: &mut CompositorState, msg: &WaylandProtocolMessage
     );
 
     let client_id = msg.client_id;
+    // The xdg_surface's version, carried down. Without it the toplevel sits at
+    // version 1 and every version-gated event on it — `wm_capabilities` and
+    // `configure_bounds` — is silently suppressed.
+    let version = client.version(xdg_surface_id);
     if client
-        .register(toplevel_id, ObjectType::XdgToplevel)
+        .register_with_version(toplevel_id, ObjectType::XdgToplevel, version)
         .is_err()
     {
         return;
     }
     state.create_xdg_toplevel(client_id, toplevel_id, xdg_surface_id);
 
-    // Send initial xdg_toplevel.configure (empty states, 0x0 = client picks size)
-    super::xdg_toplevel::send_configure(state, client_id, toplevel_id, 0, 0);
+    // Before the first configure: the client decides what chrome to draw off the
+    // back of it, and a configure it has already acted on is too late.
+    super::xdg_toplevel::send_wm_capabilities(state, client_id, toplevel_id);
 
-    // Send xdg_surface.configure with a serial the client must ack
-    let serial = super::next_serial();
-    let args = ArgWriter::new().u32(serial).build();
-
-    let Some(client) = state.clients.get(msg.client_id) else {
-        tracing::warn!("Received message from unknown client {}", msg.client_id);
-        return;
-    };
-    let _ = client.send(message(xdg_surface_id, CONFIGURE, args));
+    // The initial configure. A zero size leaves the client to pick its own,
+    // which is what it is for on a window that has never been mapped; the
+    // bounds that go out with it say how much room there is to pick within.
+    super::xdg_toplevel::configure(state, (client_id, toplevel_id), 0, 0);
 
     // Take focus on the new toplevel
     let wl_surface_id = state
@@ -120,15 +120,30 @@ fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         popup_id, parent_xdg_surface_id, positioner_id
     );
 
-    // Compute position from positioner
-    let (x, y, width, height) =
-        if let Some(pos) = state.xdg_positioners.get(&(client_id, positioner_id)) {
-            compute_popup_position(pos)
-        } else {
-            (0, 0, 1, 1)
-        };
+    // Position from the positioner, kept on screen where the client asked for
+    // that. Needs the parent's `wl_surface` because the constraining region is
+    // the parent's output expressed relative to the parent.
+    let parent_surface = state
+        .xdg_surfaces
+        .get(&(client_id, parent_xdg_surface_id))
+        .map(|xdg| (client_id, xdg.wl_surface_id));
+    let (x, y, width, height) = parent_surface
+        .and_then(|parent| state.place_popup((client_id, positioner_id), parent))
+        .unwrap_or((0, 0, 1, 1));
 
-    if client.register(popup_id, ObjectType::XdgPopup).is_err() {
+    // NLL: the borrow taken to decode the arguments ends above, because placing
+    // the popup reads the outputs and the surface tree — state the client
+    // borrow would otherwise lock out.
+    let Some(client) = state.clients.get(client_id) else {
+        return;
+    };
+    // Carried down for the same reason as a toplevel's: `repositioned` is
+    // gated on version 3, and a popup left at version 1 would never get one.
+    let version = client.version(xdg_surface_id);
+    if client
+        .register_with_version(popup_id, ObjectType::XdgPopup, version)
+        .is_err()
+    {
         return;
     }
     state.create_xdg_popup(
@@ -223,47 +238,4 @@ pub fn send_configure(
     if let Some(client) = state.clients.get(client_id) {
         let _ = client.send(message(xdg_surface_id, CONFIGURE, args));
     }
-}
-
-/// Compute popup position from a positioner.
-///
-/// The anchor point is derived from the `anchor_rect` + anchor edge.
-/// The popup is placed so that the gravity edge of the popup aligns
-/// with the anchor point, then offset is applied.
-fn compute_popup_position(pos: &super::state::XdgPositionerState) -> (i32, i32, i32, i32) {
-    let (ar_x, ar_y, ar_w, ar_h) = pos.anchor_rect;
-
-    // Anchor point within the anchor rect
-    // Anchor edges: 0=none(center), 1=top, 2=bottom, 3=left, 4=right,
-    //               5=top_left, 6=bottom_left, 7=top_right, 8=bottom_right
-    let anchor_x = match pos.anchor as u32 {
-        3 | 5 | 6 => ar_x,        // left edge
-        4 | 7 | 8 => ar_x + ar_w, // right edge
-        _ => ar_x + ar_w / 2,     // center
-    };
-    let anchor_y = match pos.anchor as u32 {
-        1 | 5 | 7 => ar_y,        // top edge
-        2 | 6 | 8 => ar_y + ar_h, // bottom edge
-        _ => ar_y + ar_h / 2,     // center
-    };
-
-    // Gravity determines which part of the popup is placed at the anchor point
-    // Same enum values as anchor
-    let popup_x = match pos.gravity as u32 {
-        3 | 5 | 6 => anchor_x - pos.width, // popup extends left
-        4 | 7 | 8 => anchor_x,             // popup extends right
-        _ => anchor_x - pos.width / 2,     // centered
-    };
-    let popup_y = match pos.gravity as u32 {
-        1 | 5 | 7 => anchor_y - pos.height, // popup extends up
-        2 | 6 | 8 => anchor_y,              // popup extends down
-        _ => anchor_y - pos.height / 2,     // centered
-    };
-
-    (
-        popup_x + pos.offset.0,
-        popup_y + pos.offset.1,
-        pos.width,
-        pos.height,
-    )
 }

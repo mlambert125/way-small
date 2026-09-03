@@ -9,6 +9,7 @@ use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 use super::next_serial;
 use super::state::CompositorState;
 use super::wire_utils::{ArgWriter, message};
+use crate::shared::ScrollSource;
 
 // Request opcodes
 const SET_CURSOR: u16 = 0;
@@ -21,6 +22,23 @@ pub const MOTION: u16 = 2;
 pub const BUTTON: u16 = 3;
 pub const AXIS: u16 = 4;
 pub const FRAME: u16 = 5;
+pub const AXIS_SOURCE: u16 = 6;
+pub const AXIS_STOP: u16 = 7;
+pub const AXIS_DISCRETE: u16 = 8;
+pub const AXIS_VALUE120: u16 = 9;
+
+/// `wl_pointer.axis` values.
+pub const AXIS_VERTICAL: u32 = 0;
+pub const AXIS_HORIZONTAL: u32 = 1;
+
+/// `wl_pointer.axis_source` values.
+const AXIS_SOURCE_WHEEL: u32 = 0;
+const AXIS_SOURCE_FINGER: u32 = 1;
+
+/// The version at which the axis detail events appear.
+const AXIS_DETAIL_SINCE: u32 = 5;
+/// The version at which `axis_value120` replaces `axis_discrete`.
+const AXIS_VALUE120_SINCE: u32 = 8;
 
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
@@ -203,5 +221,89 @@ pub fn send_frame(state: &mut CompositorState, client_id: u32, pointer_id: u32) 
         && client.version(pointer_id) >= 5
     {
         let _ = client.send(message(pointer_id, FRAME, Vec::new()));
+    }
+}
+
+/// Send `wl_pointer.axis_source`, saying what did the scrolling.
+///
+/// Goes out once per frame, before the axis events it describes. A client uses
+/// it to decide whether the scroll can have momentum: a wheel clicks and stops,
+/// a touchpad glides and is let go of.
+pub fn send_axis_source(
+    state: &mut CompositorState,
+    client_id: u32,
+    pointer_id: u32,
+    source: ScrollSource,
+) {
+    let value = match source {
+        ScrollSource::Wheel => AXIS_SOURCE_WHEEL,
+        ScrollSource::Finger => AXIS_SOURCE_FINGER,
+    };
+    let args = ArgWriter::new().u32(value).build();
+    if let Some(client) = state.clients.get(client_id)
+        && client.version(pointer_id) >= AXIS_DETAIL_SINCE
+    {
+        let _ = client.send(message(pointer_id, AXIS_SOURCE, args));
+    }
+}
+
+/// Send `wl_pointer.axis_stop`: this axis has stopped scrolling.
+///
+/// Only meaningful for a source that can stop. A client cannot tell a scroll
+/// that has paused from one that has ended by watching the deltas, and kinetic
+/// scrolling turns on exactly that difference.
+pub fn send_axis_stop(
+    state: &mut CompositorState,
+    client_id: u32,
+    pointer_id: u32,
+    time_ms: u32,
+    axis: u32,
+) {
+    let args = ArgWriter::new().u32(time_ms).u32(axis).build();
+    if let Some(client) = state.clients.get(client_id)
+        && client.version(pointer_id) >= AXIS_DETAIL_SINCE
+    {
+        let _ = client.send(message(pointer_id, AXIS_STOP, args));
+    }
+}
+
+/// Tell a client how far a wheel clicked, in whichever unit its version speaks.
+///
+/// The two events are alternatives, not companions: version 8 replaced
+/// `axis_discrete` with `axis_value120`, and sending both would have a client
+/// that understands the newer one count every detent twice. So the version
+/// decides which goes out, and exactly one does.
+///
+/// `v120` is 120ths of a detent, which is what lets a high-resolution wheel
+/// report a fraction of a click without a separate event for it. An older
+/// client is sent whole detents, and a movement smaller than one rounds to
+/// nothing — which is the best that unit can say.
+pub fn send_axis_steps(
+    state: &mut CompositorState,
+    client_id: u32,
+    pointer_id: u32,
+    axis: u32,
+    v120: i32,
+) {
+    if v120 == 0 {
+        return;
+    }
+    let Some(version) = state.clients.version_of(client_id, pointer_id) else {
+        return;
+    };
+    if version < AXIS_DETAIL_SINCE {
+        return;
+    }
+
+    let (op_code, args) = if version >= AXIS_VALUE120_SINCE {
+        (AXIS_VALUE120, ArgWriter::new().u32(axis).i32(v120).build())
+    } else {
+        (
+            AXIS_DISCRETE,
+            ArgWriter::new().u32(axis).i32(v120 / 120).build(),
+        )
+    };
+    if let Some(client) = state.clients.get(client_id) {
+        let _ = client.send(message(pointer_id, op_code, args));
     }
 }

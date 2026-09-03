@@ -17,7 +17,7 @@ use crate::shared::{
     BackendMessage, BackendRequest, ButtonState, DmabufFormat, DmabufProbe, Frame, KeyState,
     MouseButton, PresentedAt, Scene, fourcc_name,
 };
-use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId};
+use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId, ScrollSource};
 use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
@@ -122,6 +122,9 @@ struct App {
     /// asks as it starts up, and a hosted backend has no context until its
     /// window exists.
     dmabuf_probe_pending: bool,
+    /// Whether a touch has ever arrived. winit reports no touch devices, only
+    /// touch events, so this is the only evidence a touchscreen exists.
+    touch_seen: bool,
 }
 
 impl App {
@@ -396,6 +399,11 @@ impl ApplicationHandler<UserEvent> for App {
             .blocking_send(BackendMessage::SeatCapabilities {
                 pointer: true,
                 keyboard: true,
+                // A host window is told about touch only when a touch happens,
+                // so there is nothing to report up front. The capability is
+                // announced from the first touch event instead — see the
+                // `WindowEvent::Touch` arm.
+                touch: false,
             });
         let _ = self
             .backend_sender
@@ -453,6 +461,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     /// Window event handler (called by winit event loop)
+    ///
+    /// One arm per winit event, and each is short; the length is the number of
+    /// events rather than the complexity of any of them.
+    #[allow(clippy::too_many_lines)]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -544,14 +556,72 @@ impl ApplicationHandler<UserEvent> for App {
                         state: st,
                     });
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+            WindowEvent::Touch(touch) => {
+                // winit has no "a touchscreen exists" signal, so the first
+                // touch is the signal: the seat gains the capability then, and
+                // clients that care re-read it. Announcing it up front would
+                // claim a device that may not exist.
+                if !self.touch_seen {
+                    self.touch_seen = true;
+                    let _ = self
+                        .backend_sender
+                        .blocking_send(BackendMessage::SeatCapabilities {
+                            pointer: true,
+                            keyboard: true,
+                            touch: true,
+                        });
+                }
+
+                // The id is a `u64` from winit and an `i32` on the wire. Real
+                // devices number their fingers from zero, so the truncation is
+                // theoretical, but wrapping it deliberately keeps two fingers
+                // from ever colliding on one id.
+                let id = i32::try_from(touch.id % u64::from(i32::MAX.cast_unsigned())).unwrap_or(0);
+                let (x, y) = (touch.location.x, touch.location.y);
+                let message = match touch.phase {
+                    winit::event::TouchPhase::Started => BackendMessage::TouchDown { id, x, y },
+                    winit::event::TouchPhase::Moved => BackendMessage::TouchMotion { id, x, y },
+                    winit::event::TouchPhase::Ended => BackendMessage::TouchUp { id },
+                    winit::event::TouchPhase::Cancelled => BackendMessage::TouchCancel,
+                };
+                let _ = self.backend_sender.blocking_send(message);
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                // A touchpad reports its scroll ending, and that end is
+                // information a client cannot infer from the deltas.
+                if phase == winit::event::TouchPhase::Ended {
+                    let _ = self
+                        .backend_sender
+                        .blocking_send(BackendMessage::MouseScrollEnd);
+                    return;
+                }
+
+                // The two delta kinds are the two sources: lines come from a
+                // wheel, which clicks, and pixels from a touchpad, which does
+                // not. winit does not say which device it was, but it does say
+                // which unit — and the unit only exists because the devices
+                // differ.
+                let (dx, dy, source, v120_x, v120_y) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (
+                        f64::from(x),
+                        f64::from(y),
+                        ScrollSource::Wheel,
+                        detents_to_v120(x),
+                        detents_to_v120(y),
+                    ),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        (pos.x, pos.y, ScrollSource::Finger, 0, 0)
+                    }
                 };
                 let _ = self
                     .backend_sender
-                    .blocking_send(BackendMessage::MouseScroll { dx, dy });
+                    .blocking_send(BackendMessage::MouseScroll {
+                        dx,
+                        dy,
+                        source,
+                        v120_x,
+                        v120_y,
+                    });
             }
             WindowEvent::Focused(focused) => {
                 let msg = if focused {
@@ -656,7 +726,17 @@ pub fn run_winit_backend(
         last_frame: None,
         drawn: HashMap::new(),
         dmabuf_probe_pending: false,
+        touch_seen: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// Wheel detents as 120ths of a click, which is the unit the protocol uses.
+///
+/// The fraction exists so a high-resolution wheel can report part of a detent
+/// without a separate event from an ordinary one.
+#[allow(clippy::cast_possible_truncation)]
+fn detents_to_v120(detents: f32) -> i32 {
+    (detents * 120.0) as i32
 }

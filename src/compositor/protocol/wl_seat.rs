@@ -25,14 +25,13 @@ pub const NAME: u16 = 1;
 // Capability flags
 const CAP_POINTER: u32 = 1;
 const CAP_KEYBOARD: u32 = 2;
+const CAP_TOUCH: u32 = 4;
 
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     match msg.message.op_code {
         GET_POINTER => handle_get_pointer(state, msg),
         GET_KEYBOARD => handle_get_keyboard(state, msg),
-        GET_TOUCH => {
-            debug!("wl_seat.get_touch: not supported");
-        }
+        GET_TOUCH => handle_get_touch(state, msg),
         RELEASE => {
             if let Some(client) = state.clients.get(msg.client_id) {
                 client.unregister(msg.message.object_id);
@@ -69,6 +68,42 @@ fn handle_get_pointer(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     state.pointers.push(super::state::PointerBinding {
         client_id: msg.client_id,
         object_id: pointer_id,
+    });
+}
+
+/// Hand back a `wl_touch` that reports nothing.
+///
+/// There is no touch device, and the seat says so in its capabilities — but the
+/// client names the id here, so the object still has to be registered. Dropping
+/// the request instead leaves the client holding an id the compositor does not
+/// know, and its eventual `release` would disconnect it. See [`super::wl_touch`].
+fn handle_get_touch(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
+    let Some(client) = state.clients.get(msg.client_id) else {
+        tracing::warn!("Received message from unknown client {}", msg.client_id);
+        return;
+    };
+    let mut args = ArgReader::new(&msg.message.args);
+    let Some(touch_id) = args.new_id() else {
+        client.send_error(
+            msg.message.object_id,
+            0,
+            "wl_seat.get_touch: malformed args",
+        );
+        return;
+    };
+
+    debug!("wl_seat.get_touch: touch_id={touch_id}");
+
+    let seat_version = client.version(msg.message.object_id);
+    if client
+        .register_with_version(touch_id, ObjectType::WlTouch, seat_version)
+        .is_err()
+    {
+        return;
+    }
+    state.touches.push(super::state::TouchBinding {
+        client_id: msg.client_id,
+        object_id: touch_id,
     });
 }
 
@@ -119,10 +154,36 @@ pub fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32)
     if state.seat.has_keyboard {
         caps |= CAP_KEYBOARD;
     }
+    if state.seat.has_touch {
+        caps |= CAP_TOUCH;
+    }
 
     let args = ArgWriter::new().u32(caps).build();
     let _ = client.send(message(seat_id, CAPABILITIES, args));
 
     let args = ArgWriter::new().string("default").build();
     let _ = client.send(message(seat_id, NAME, args));
+}
+
+/// Tell every client that has bound the seat what it can now do.
+///
+/// Capabilities are not fixed for the life of the compositor: a touchscreen is
+/// only known to exist once it is touched, and a client that bound the seat
+/// before that would otherwise never hear about it.
+pub fn broadcast_capabilities(state: &mut CompositorState) {
+    let seats: Vec<(u32, u32)> = state
+        .clients
+        .iter()
+        .flat_map(|(client_id, client)| {
+            let client_id = *client_id;
+            client
+                .objects
+                .iter()
+                .filter(|(_, object_type)| **object_type == ObjectType::WlSeat)
+                .map(move |(object_id, _)| (client_id, *object_id))
+        })
+        .collect();
+    for (client_id, seat_id) in seats {
+        send_seat_info(state, client_id, seat_id);
+    }
 }

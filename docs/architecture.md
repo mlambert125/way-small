@@ -28,7 +28,8 @@ yet written say so where they begin.  As of now:
   zero-copy and damage tracking, dma-buf import, the clipboard and drag and drop, and the winit and null backends.
 - **Not built**: the DRM backend, and with it every part of running on bare hardware — session management, `libinput`,
   and modesetting.  Subsurface `set_sync` is recorded but does not cache commits.  There is no XWayland, no layer
-  shell, no decoration protocol, no primary selection, and no touch or tablet input.
+  shell, no decoration protocol, no primary selection, and no tablet input.  Touch is implemented but has only ever
+  been exercised by tests — see `docs/notes.md`.
 
 ## Source Layout
 
@@ -516,6 +517,30 @@ The constraint is the union of the outputs, not their bounding box. Two outputs 
 a notch belonging to no display, and a pointer parked there would be exactly as lost. A position off every output snaps
 to the nearest point of the nearest one.
 
+#### Scrolling
+
+Four events describe one scroll, and the order they go out in is the protocol's
+rather than a convenience.  The source comes first, because it says what kind of
+scroll this is: a wheel clicks through detents and stops between them, a
+touchpad glides and is let go of, and a client cannot tell them apart from the
+deltas alone — which is what decides whether the scroll may be given momentum.
+Then the detent count for an axis, before the distance it explains.  Then the
+distance.  Then the frame that says the picture is complete.
+
+The detent count goes out as one of two events that are alternatives rather than
+companions.  Version 8 replaced `axis_discrete` with `axis_value120`, and a
+client that understands the newer one would count every detent twice if it were
+sent both — so the client's version decides which it gets, and exactly one goes
+out.  The `120` is the unit: a high-resolution wheel reports a fraction of a
+click without needing a different event from an ordinary one, and an older
+client is told in whole clicks, where a movement smaller than one rounds to
+nothing because that is the best that unit can say.
+
+`axis_stop` is what a touchpad has and a wheel does not.  A scroll that has
+paused and one that has ended look identical in a stream of deltas, and only the
+axes that actually moved are stopped — a stop for an axis that never scrolled
+describes something that never happened.
+
 #### Outputs, workspaces and windows
 
 The three nest: an output owns one or more workspaces, and a workspace owns the toplevel windows shown together on it.
@@ -593,6 +618,54 @@ workspace showing on the pointer's output, and the tick's confinement then pulls
 The same grabs are available without the client's cooperation, which is the only way to move a window whose decorations
 offer no handle: Alt+left-drag moves, and Alt+right-drag resizes from whichever corner of the window the pointer is
 nearest.
+
+#### Window states, dialogs and popups
+
+A window has two states it can ask for and the compositor grants: maximized, which fills the output, and fullscreen,
+which covers it.  They are independent, and the difference is worth keeping straight — a fullscreen window is raised
+above everything on its workspace and a maximized one is an ordinary window that happens to fill the screen, so
+un-fullscreening a window that was also maximized has to leave it filling the output rather than shrink it back to
+the size it had before either.  The geometry to return to is captured once, on the way in from a normal window, and
+spent on the way out of the last state; capturing it again on the second transition would record the maximized
+geometry and lose the real one.
+
+A configure carries the *complete* set of states, so it is built in one place from what the compositor knows rather
+than assembled per call site.  The earlier shape, where activation and resizing each wrote their own short array,
+could say only one thing at a time — and a configure that omits `maximized` is telling the client it is no longer
+maximized.
+
+A window is also told how much room it has, through `configure_bounds`, before the configure it is meant to size
+itself against.  There are no panels or docks here so the bounds are the whole output, but the point of the event is
+that the client should not have to *assume* that — a window opening larger than the display it is on is what it
+prevents.  It is sent only when the answer changes, which for a window that stays on one display means once.
+
+Not every request is granted, and `xdg_toplevel.wm_capabilities` is where that is said out loud.  A client told
+nothing must assume every capability is available, so silence is a claim rather than a neutral absence: toolkits draw
+the title-bar buttons and each one then does nothing.  The capabilities are a table pairing each with whether the
+request behind it is implemented, which is what stops the advertisement drifting from the truth — minimize is absent
+because a minimized window would have no way back with no taskbar to click, and the window menu because the
+compositor has no text rendering to draw one with.
+
+`set_parent` makes one window a dialog of another, and the only thing the compositor does with it is keep the child
+above the parent.  That means raising either has to move both, since otherwise clicking the window would bury the
+dialog belonging to it — so raising starts from the root of the family and walks down.  A link that would close a
+loop is refused, because the walk that orders them would otherwise never end.
+
+A popup is placed by an `xdg_positioner`, in two steps.  The anchor and gravity say where the client wants it: a
+point on the anchor rectangle, and which corner of the popup hangs off that point.  The constraint adjustment then
+says what to do when that lands off-screen, which is the ordinary case for a menu opened near an edge — flip to the
+other side of the anchor, slide back into view, or shrink.  Each axis is settled separately, so a menu running off
+the right edge slides sideways without also being dragged upwards, and a flip that would not help is discarded
+rather than throwing the popup to the far side for nothing.  `reposition` runs the same placement again on a live
+popup and answers with the client's own token, so a client that has asked more than once can tell which answer
+belongs to which request.
+
+#### The bell
+
+`xdg_system_bell_v1.ring` asks the compositor to get the user's attention.  There is no audio anywhere in this
+project, so the bell is visual: the output the surface is on is tinted for a moment.  That is the same answer a
+terminal gives with the speaker muted, and it is deliberately translucent and brief — the alert is the change, and a
+screen the user cannot read through is worse than one they can.
 
 #### The clipboard, and dragging between windows
 
@@ -675,6 +748,38 @@ click, and because a client working through a batch of events quotes the serial 
 than the newest one that arrived.  So the compositor keeps a short history of the serials it has sent each client
 rather than only the last, and honours a request quoting any of them.  A serial from neither is refused in silence: a
 client that lost that race has done nothing that warrants `wl_display.error`, which would end its connection.
+
+#### Touch
+
+Touch is multi-point, and every event names which finger it is about.  A point belongs to the surface it *started*
+on for its whole life, however far it then travels: dragging a finger off a window keeps reporting to the client
+that owns it, which is what makes a swipe leaving the window still reach the thing being swiped.  A touch that lands
+on nothing is not tracked at all, so its motion and lift are dropped rather than delivered to whatever is touched
+next.
+
+`cancel` is not the same as every finger lifting.  It says something else has taken the sequence over, and a client
+receiving it must undo what the gesture was doing rather than complete it — so it goes to every client holding a
+point, not only the one under the last finger, since a two-finger gesture spanning two windows leaves both waiting
+to hear how it ended.
+
+The seat capability appears on the first touch rather than at startup.  winit reports touch *events* and never touch
+*devices*, so the first event is the only evidence a touchscreen exists — and a capability can therefore appear
+after clients have already bound the seat, which is why they are all told again rather than only whoever binds next.
+
+#### What a client says about its buffer
+
+Two requests describe the buffer rather than the surface, and both reach further than they look.
+
+`set_buffer_transform` says how the client has *already* rotated or flipped its contents, so drawing it correctly
+means undoing that — the compositor applies the inverse as an affine map over the unit quad in the vertex shader.
+The map is column-major, matching how GL reads a `mat2`, and writing it row-major transposes exactly the two quarter
+turns while leaving the symmetric transforms looking correct, which is a bug that hides well and is what the test
+covering all eight exists to catch.  A quarter turn also exchanges the surface's width and height, so this reaches
+hit testing and layout and not only sampling.
+
+`set_opaque_region` is a promise, not a description: the client says what is fully opaque and the compositor may
+skip the alpha blend there.  It is acted on only when the region covers the whole surface, because a partial promise
+would mean splitting the quad along the region's edges, and one quad per surface is what keeps this renderer simple.
 
 #### Rendering
 

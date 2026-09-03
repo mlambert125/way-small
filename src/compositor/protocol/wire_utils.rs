@@ -100,6 +100,22 @@ impl ArgWriter {
         self
     }
 
+    /// Adds a `wl_array` of `u32`s.
+    ///
+    /// On the wire an array is a byte count followed by the bytes, padded out
+    /// to a four-byte boundary — the count is of *bytes*, not elements, which
+    /// is the easy thing to get wrong when there is no helper and each caller
+    /// counts for itself.
+    pub fn array_u32(mut self, values: &[u32]) -> Self {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let len = u32::try_from(bytes.len()).expect("array too long for Wayland protocol");
+        self.buf.extend_from_slice(&len.to_le_bytes());
+        self.buf.extend_from_slice(&bytes);
+        let padding = (4 - (bytes.len() % 4)) % 4;
+        self.buf.extend(std::iter::repeat_n(0u8, padding));
+        self
+    }
+
     /// Adds a nullable object or `new_id` argument. A null object is a zero id.
     pub fn object(self, val: Option<u32>) -> Self {
         self.u32(val.unwrap_or(0))

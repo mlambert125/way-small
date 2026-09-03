@@ -159,6 +159,7 @@ pub fn build(
         // Above every window and below the cursor: a drag icon is meant to be
         // the thing being carried, and the pointer stays on top of it.
         push_drag_icon(state, cache, &mut elements, output, origin_x, origin_y);
+        push_bell(state, cache, &mut elements, output);
         push_cursor(state, cache, &mut elements, output, origin_x, origin_y);
     }
 
@@ -242,6 +243,8 @@ fn push_surface(
         texture,
         src: mapping.src,
         dst: (offset_x, offset_y, mapping.dest_width, mapping.dest_height),
+        transform: surface.buffer_transform,
+        opaque: surface_is_opaque(surface, mapping.dest_width, mapping.dest_height),
     });
 }
 
@@ -495,6 +498,9 @@ fn push_cursor(
         texture,
         src: (0.0, 0.0, f64::from(w), f64::from(h)),
         dst: (cx - hotspot_x, cy - hotspot_y, w, h),
+        transform: crate::shared::BufferTransform::Normal,
+        // A cursor is mostly transparent, whatever else it is.
+        opaque: false,
     });
 }
 
@@ -538,6 +544,10 @@ fn ensure_cursor_image(
             (cursor.width, cursor.height, cursor.pixels.clone())
         }
         TextureId::FallbackCursor => fallback_cursor_pixels(),
+        // One pixel, stretched over the whole output. The alpha is what makes
+        // it a flash rather than a blank screen: the window stays readable
+        // underneath it.
+        TextureId::BellFlash => (1, 1, vec![0x60ff_ffff]),
         TextureId::Buffer(..) => return None,
     };
 
@@ -630,4 +640,58 @@ pub fn load_default_cursor() -> Option<DefaultCursor> {
         hotspot_x: image.xhot.cast_signed(),
         hotspot_y: image.yhot.cast_signed(),
     })
+}
+
+/// Whether a client has promised its whole surface is opaque.
+///
+/// Only a region covering the surface outright counts. A partial promise is
+/// real information, but acting on it would mean splitting the quad along the
+/// region's edges, and one quad per window is what makes this renderer simple —
+/// so the useful case, a window that says all of it is opaque, is the one taken.
+fn surface_is_opaque(
+    surface: &crate::compositor::protocol::state::Surface,
+    width: i32,
+    height: i32,
+) -> bool {
+    let Some(region) = &surface.opaque_region else {
+        return false;
+    };
+    region.iter().any(|rect| {
+        rect.op == crate::compositor::protocol::state::RegionOp::Add
+            && rect.x <= 0
+            && rect.y <= 0
+            && rect.x.saturating_add(rect.width) >= width
+            && rect.y.saturating_add(rect.height) >= height
+    })
+}
+
+/// Flash an output that a client has rung the bell on.
+///
+/// A translucent quad over the whole display, drawn above every window so it
+/// cannot be missed, and below the cursor so the pointer stays visible while it
+/// is up. It is deliberately not a full-brightness blank: the alert is the
+/// change, and a screen the user cannot read through is worse than one they can.
+fn push_bell(
+    state: &CompositorState,
+    cache: &mut SceneCache,
+    elements: &mut Vec<SceneElement>,
+    output: &Output,
+) {
+    if !state.bell_until.contains_key(&output.id) {
+        return;
+    }
+    let Some(texture) = ensure_cursor_image(state, cache, TextureId::BellFlash) else {
+        return;
+    };
+    let (width, height) = (
+        output.geometry.physical_width,
+        output.geometry.physical_height,
+    );
+    elements.push(SceneElement {
+        texture,
+        src: (0.0, 0.0, 1.0, 1.0),
+        dst: (0, 0, width, height),
+        transform: crate::shared::BufferTransform::Normal,
+        opaque: false,
+    });
 }

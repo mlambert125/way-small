@@ -102,8 +102,9 @@ fn handle_get_subsurface(state: &mut CompositorState, msg: &WaylandProtocolMessa
 
     // Register before touching any surface state: a rejected id must not leave
     // a half-built parent-child relationship behind.
+    let version = client.version(msg.message.object_id);
     if client
-        .register(subsurface_id, ObjectType::WlSubsurface)
+        .register_with_version(subsurface_id, ObjectType::WlSubsurface, version)
         .is_err()
     {
         return;

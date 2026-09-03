@@ -57,8 +57,9 @@ fn handle_create_positioner(
         positioner_id
     );
 
+    let version = client.version(msg.message.object_id);
     if client
-        .register(positioner_id, ObjectType::XdgPositioner)
+        .register_with_version(positioner_id, ObjectType::XdgPositioner, version)
         .is_err()
     {
         return;
@@ -99,8 +100,9 @@ fn handle_get_xdg_surface(state: &mut CompositorState, msg: &WaylandProtocolMess
         return;
     }
 
+    let version = client.version(msg.message.object_id);
     if client
-        .register(xdg_surface_id, ObjectType::XdgSurface)
+        .register_with_version(xdg_surface_id, ObjectType::XdgSurface, version)
         .is_err()
     {
         return;

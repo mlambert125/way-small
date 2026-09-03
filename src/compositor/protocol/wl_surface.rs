@@ -10,7 +10,7 @@ use crate::shared::TextureRect;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 use super::ObjectType;
-use super::state::{ClientObjectId, CompositorState, PendingInputRegion};
+use super::state::{ClientObjectId, CompositorState, PendingRegion};
 use super::wire_utils::{ArgReader, ArgWriter, message};
 
 // Request opcodes
@@ -77,9 +77,8 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
         SET_INPUT_REGION => handle_set_input_region(state, msg),
         SET_BUFFER_SCALE => handle_set_buffer_scale(state, msg),
         OFFSET => handle_offset(state, msg),
-        SET_OPAQUE_REGION | SET_BUFFER_TRANSFORM => {
-            // Acknowledged but not acted upon yet
-        }
+        SET_OPAQUE_REGION => handle_set_opaque_region(state, msg),
+        SET_BUFFER_TRANSFORM => handle_set_buffer_transform(state, msg),
         COMMIT => handle_commit(state, msg),
         _ => super::unknown_request(state, msg, "wl_surface"),
     }
@@ -218,34 +217,98 @@ fn handle_set_input_region(
     state: &mut CompositorState,
     msg: &WaylandProtocolMessageWithClientInfo,
 ) {
-    let Some(region_id) = ArgReader::new(&msg.message.args).u32() else {
+    let Some(region) = decode_region(state, msg) else {
         return;
     };
-    let surface_id = msg.message.object_id;
-
-    // A null region is the protocol's way of saying "infinite": the whole
-    // surface accepts input again.
-    let region = if region_id == 0 {
-        PendingInputRegion::Infinite
-    } else if let Some(region) = state.regions.get(&(msg.client_id, region_id)) {
-        PendingInputRegion::Rects(region.rects.clone())
-    } else {
-        tracing::warn!(
-            "wl_surface.set_input_region: unknown region {} for surface {}",
-            region_id,
-            surface_id
-        );
-        return;
-    };
-
-    debug!(
-        "wl_surface.set_input_region: surface_id={} region_id={}",
-        surface_id, region_id
-    );
-
-    if let Some(surface) = state.surfaces.get_mut(&(msg.client_id, surface_id)) {
+    if let Some(surface) = state
+        .surfaces
+        .get_mut(&(msg.client_id, msg.message.object_id))
+    {
         surface.pending.input_region = region;
     }
+}
+
+/// Record where the client promises its surface is fully opaque.
+///
+/// Purely an optimisation, and one the compositor is free to ignore — which is
+/// why a region that cannot be resolved is dropped rather than treated as an
+/// error. What it buys is skipping the alpha blend for surfaces that cover what
+/// is behind them, which is most windows most of the time.
+fn handle_set_opaque_region(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) {
+    let Some(region) = decode_region(state, msg) else {
+        return;
+    };
+    if let Some(surface) = state
+        .surfaces
+        .get_mut(&(msg.client_id, msg.message.object_id))
+    {
+        surface.pending.opaque_region = region;
+    }
+}
+
+/// Record how the client has already transformed its buffer.
+///
+/// The compositor undoes it when drawing, and a quarter turn also exchanges the
+/// surface's width and height — so this reaches hit testing and layout, not
+/// only sampling.
+fn handle_set_buffer_transform(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) {
+    let mut args = ArgReader::new(&msg.message.args);
+    let Some(value) = args.i32() else {
+        super::malformed_request(state, msg, "wl_surface");
+        return;
+    };
+
+    let Some(transform) = u32::try_from(value)
+        .ok()
+        .and_then(crate::shared::BufferTransform::from_wire)
+    else {
+        if let Some(client) = state.clients.get(msg.client_id) {
+            // wl_surface.error.invalid_transform = 0
+            client.send_error(
+                msg.message.object_id,
+                0,
+                "wl_surface.set_buffer_transform: not a transform the protocol defines",
+            );
+        }
+        return;
+    };
+
+    if let Some(surface) = state
+        .surfaces
+        .get_mut(&(msg.client_id, msg.message.object_id))
+    {
+        surface.pending.buffer_transform = Some(transform);
+    }
+}
+
+/// Read a nullable `wl_region` argument into a pending region.
+///
+/// A null region is the protocol default rather than an absence: for input it
+/// means the whole surface, for opacity it means none of it, which is why the
+/// two are distinguished at the point they are applied rather than here.
+fn decode_region(
+    state: &mut CompositorState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) -> Option<PendingRegion> {
+    let mut args = ArgReader::new(&msg.message.args);
+    let Some(region_id) = args.u32() else {
+        super::malformed_request(state, msg, "wl_surface");
+        return None;
+    };
+    if region_id == 0 {
+        return Some(PendingRegion::Infinite);
+    }
+    let rects = state
+        .regions
+        .get(&(msg.client_id, region_id))
+        .map(|region| region.rects.clone())?;
+    Some(PendingRegion::Rects(rects))
 }
 
 /// `wl_surface.set_buffer_scale` — how many buffer pixels map to one
@@ -320,6 +383,13 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
             surface.buffer_scale = scale;
         }
 
+        // And the buffer transform, which is double-buffered for the same
+        // reason: it changes the surface's size, and a size that changed
+        // between an attach and its commit would tear.
+        if let Some(transform) = surface.pending.buffer_transform.take() {
+            surface.buffer_transform = transform;
+        }
+
         // Apply the accumulated attach offset. Only the drag icon reads it —
         // see `Surface::offset` — but it is committed here like any other
         // double-buffered state so that it is correct if anything else comes
@@ -332,9 +402,17 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 
         // Apply pending input region
         match std::mem::take(&mut surface.pending.input_region) {
-            PendingInputRegion::Unchanged => {}
-            PendingInputRegion::Infinite => surface.input_region = None,
-            PendingInputRegion::Rects(rects) => surface.input_region = Some(rects),
+            PendingRegion::Unchanged => {}
+            PendingRegion::Infinite => surface.input_region = None,
+            PendingRegion::Rects(rects) => surface.input_region = Some(rects),
+        }
+
+        // And the opaque region, where the null case means the opposite: no
+        // part of the surface is promised opaque.
+        match std::mem::take(&mut surface.pending.opaque_region) {
+            PendingRegion::Unchanged => {}
+            PendingRegion::Infinite => surface.opaque_region = None,
+            PendingRegion::Rects(rects) => surface.opaque_region = Some(rects),
         }
 
         damage_surface = std::mem::take(&mut surface.pending.damage_surface);

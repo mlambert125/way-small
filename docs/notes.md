@@ -20,6 +20,20 @@
   at all
 - The drag icon reads `wl_surface.attach`'s offset; ordinary surfaces still ignore it.  Applying it everywhere is the
   larger question of how a surface repositions itself on attach
+- Requests still accepted and ignored, as of an audit against `wayland.xml` and wayland-protocols 1.49.  Every
+  request an advertised version requires is in its dispatch table; these are the ones with no behaviour behind them:
+    - `xdg_toplevel.set_minimized`.  There is no taskbar, dock or window list, so a minimized window would have no
+      way back onto the screen.  `wm_capabilities` reports it as unsupported, so clients hide the button
+    - `xdg_toplevel.show_window_menu`.  The compositor has no text rendering and no widgets, so there is no menu to
+      show; `wm_capabilities` says so and clients draw their own
+    - `xdg_positioner.set_parent_configure`.  Placement is not deferred until the parent acknowledges a configure,
+      so the serial has nothing to be matched against
+- Touch is implemented but has never run against hardware — there is no touchscreen on the development machine, so
+  `wl_touch` is covered by unit tests alone.  winit reports no touch *devices*, only touch *events*, so the seat
+  capability appears on the first touch rather than at startup
+- `wl_surface.set_opaque_region` is honoured only when the region covers the whole surface.  A partial one is real
+  information, but acting on it means splitting the quad along the region's edges, and one quad per surface is what
+  keeps the renderer simple
 - Workspace hotkeys: add, remove and switch the workspaces on an output (the hierarchy is there, the policy is not)
 - Client provided mouse cursors
 - Themed server mouse cursor support (hardcoded white arrow right now)

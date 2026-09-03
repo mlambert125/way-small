@@ -16,7 +16,7 @@ pub use output::{
     OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputGeometry, OutputId, OutputMode,
     OutputSubpixel, OutputTransform, cursor_bounds, output_contains,
 };
-pub use scene::{Frame, Scene, SceneElement};
+pub use scene::{BufferTransform, Frame, Scene, SceneElement};
 pub use shm_guard::patched_pages;
 pub use texture::{PixelFormat, TextureId, TextureImage, TextureRect, TextureSource, UploadPixels};
 
@@ -112,6 +112,21 @@ pub enum BackendRequest {
     },
 }
 
+/// What produced a scroll.
+///
+/// A wheel moves in detents and stops between them; a touchpad moves smoothly
+/// and has a definite end. Clients treat the two differently — kinetic
+/// scrolling belongs to one and not the other — and cannot tell them apart from
+/// the deltas alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollSource {
+    /// A mouse wheel, clicking through detents.
+    Wheel,
+    /// A touchpad or trackpoint, moving smoothly, with an end the user makes by
+    /// lifting their fingers.
+    Finger,
+}
+
 /// A message from the backend to the compositor
 #[derive(Debug)]
 pub enum BackendMessage {
@@ -121,6 +136,8 @@ pub enum BackendMessage {
         pointer: bool,
         /// A keyboard is present and available
         keyboard: bool,
+        /// A touchscreen is present and available
+        touch: bool,
     },
     /// A message reporting output info
     OutputInfo {
@@ -187,13 +204,61 @@ pub enum BackendMessage {
         /// The state of the button
         state: ButtonState,
     },
-    /// The mouse scroll wheel has moved
+    /// A finger has touched the screen.
+    ///
+    /// Touch is multi-point, so every event names which finger it is about.
+    /// The id is the backend's, and is only required to be unique among the
+    /// fingers currently down — one that has been lifted may be reused.
+    TouchDown {
+        /// Which finger.
+        id: i32,
+        /// Where it landed, in global compositor coordinates.
+        x: f64,
+        /// Likewise.
+        y: f64,
+    },
+    /// A finger already down has moved.
+    TouchMotion {
+        /// Which finger.
+        id: i32,
+        /// Its new position, in global compositor coordinates.
+        x: f64,
+        /// Likewise.
+        y: f64,
+    },
+    /// A finger has been lifted.
+    TouchUp {
+        /// Which finger.
+        id: i32,
+    },
+    /// The touch sequence has been taken over by something else — a gesture
+    /// recogniser, or the compositor itself — and every point in it is void.
+    ///
+    /// Not the same as every finger lifting: a client that has been sent this
+    /// must undo whatever the sequence was doing rather than complete it.
+    TouchCancel,
+    /// The pointer's scroll axes have moved.
     MouseScroll {
         /// The change in the x axis of the scroll
         dx: f64,
         /// The change in the y axis of the scroll
         dy: f64,
+        /// What did the scrolling, which decides how a client should treat it.
+        source: ScrollSource,
+        /// Wheel detents on each axis, in 120ths of a click, and zero for a
+        /// source that does not click. The unit is the protocol's: it lets a
+        /// high-resolution wheel report a fraction of a detent without needing
+        /// a different event from an ordinary one.
+        v120_x: i32,
+        v120_y: i32,
     },
+    /// A continuous scroll has finished — the fingers have left the touchpad.
+    ///
+    /// Worth a message of its own because it is information a client cannot
+    /// infer. Scrolling that merely pauses and scrolling that has ended look
+    /// identical from a stream of deltas, and kinetic scrolling needs to tell
+    /// them apart.
+    MouseScrollEnd,
     /// What this backend can do with dma-bufs, in answer to
     /// [`BackendRequest::ProbeDmabuf`].
     DmabufSupport {

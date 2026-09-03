@@ -25,6 +25,7 @@ pub mod wl_data_device_manager;
 pub mod wl_data_offer;
 pub mod wl_data_source;
 pub mod wl_display;
+pub mod wl_fixes;
 pub mod wl_keyboard;
 pub mod wl_output;
 pub mod wl_pointer;
@@ -36,6 +37,7 @@ pub mod wl_shm_pool;
 pub mod wl_subcompositor;
 pub mod wl_subsurface;
 pub mod wl_surface;
+pub mod wl_touch;
 pub mod wp_presentation;
 pub mod wp_presentation_feedback;
 pub mod wp_viewport;
@@ -134,6 +136,7 @@ pub fn malformed_request(
 pub enum ObjectType {
     WlDisplay,
     WlRegistry,
+    WlFixes,
     WlCallback,
     WlShm,
     WlShmPool,
@@ -144,6 +147,7 @@ pub enum ObjectType {
     WlSeat,
     WlPointer,
     WlKeyboard,
+    WlTouch,
     WlOutput,
     WlSubcompositor,
     WlSubsurface,
@@ -214,6 +218,10 @@ pub static GLOBALS: &[Global] = &[
     Global {
         interface: "wp_presentation",
         version: 1,
+    },
+    Global {
+        interface: wl_fixes::INTERFACE,
+        version: wl_fixes::VERSION,
     },
     // wl_output is not in this static list — each physical output gets its own
     // dynamic global, managed via CompositorState::output_global_names.
@@ -289,6 +297,9 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
         Some(ObjectType::WlRegistry) => {
             wl_registry::handle(state, message);
         }
+        Some(ObjectType::WlFixes) => {
+            wl_fixes::handle(state, message);
+        }
         Some(ObjectType::WlCallback) => {
             wl_callback::handle(state, message);
         }
@@ -333,6 +344,9 @@ pub fn handle_message(state: &mut CompositorState, message: &WaylandProtocolMess
         }
         Some(ObjectType::WlKeyboard) => {
             wl_keyboard::handle(state, message);
+        }
+        Some(ObjectType::WlTouch) => {
+            wl_touch::handle(state, message);
         }
         Some(ObjectType::WlOutput) => {
             wl_output::handle(state, message);

@@ -9,14 +9,14 @@
 //! turns it into GPU work.
 
 use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState, MouseButton};
-use crate::shared::{OutputId, PresentedAt, Scene, fourcc_name, output_contains};
+use crate::shared::{OutputId, PresentedAt, Scene, ScrollSource, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
 use protocol::CompositorState;
 use protocol::state::{ClientObjectId, GrabKind, OfferKind, ResizeEdges, region_contains};
 use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
 use protocol::{
-    wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry,
-    wl_surface, wp_presentation_feedback, xdg_popup, xdg_surface, xdg_toplevel,
+    wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat,
+    wl_surface, wl_touch, wp_presentation_feedback, xdg_popup, xdg_surface, xdg_toplevel,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,6 +52,14 @@ const KEY_F4: u32 = 62;
 const KEY_RIGHTALT: u32 = 100;
 // evdev keycode for ESC, which abandons a drag
 const KEY_ESC: u32 = 1;
+
+/// Surface-local distance one unit of scroll moves.
+///
+/// A wheel detent arrives as one line and clients expect rather more than one
+/// pixel from it. The protocol has no unit of its own here — the value is
+/// whatever the compositor says it is — so this is a feel setting rather than a
+/// conversion.
+const SCROLL_STEP: f64 = 10.0;
 
 /// Smallest window width an interactive resize will produce.
 const MIN_WINDOW_WIDTH: i32 = 120;
@@ -288,12 +296,28 @@ pub async fn run_compositor(
             }
             Some(message) = backend_message_receiver.recv() => {
                 match message {
-                    BackendMessage::SeatCapabilities { pointer, keyboard } => {
-                        info!("Seat capabilities: pointer={} keyboard={}", pointer, keyboard);
+                    BackendMessage::SeatCapabilities { pointer, keyboard, touch } => {
+                        info!(
+                            "Seat capabilities: pointer={} keyboard={} touch={}",
+                            pointer, keyboard, touch
+                        );
+                        let changed = state.seat.has_pointer != pointer
+                            || state.seat.has_keyboard != keyboard
+                            || state.seat.has_touch != touch;
                         state.seat.has_pointer = pointer;
                         state.seat.has_keyboard = keyboard;
+                        state.seat.has_touch = touch;
+                        // A capability can appear after clients have bound the
+                        // seat — a touchscreen is only known to exist once it
+                        // is touched — so everyone already connected is told
+                        // again rather than only whoever binds next.
+                        if changed {
+                            wl_seat::broadcast_capabilities(&mut state);
+                        }
                     }
                     BackendMessage::OutputInfo { outputs } => {
+                        let seen: HashSet<OutputId> =
+                            outputs.iter().map(|output| output.id).collect();
                         for new_output in outputs {
                             if state.outputs.iter().any(|o| o.id == new_output.id) {
                                 // Update existing output (preserve global name mapping)
@@ -317,6 +341,24 @@ pub async fn run_compositor(
                                 );
                             }
                         }
+                        // `OutputInfo` is the whole set the backend can see, so
+                        // an output missing from it has gone. Withdrawing the
+                        // global is the half that matters to clients: one that
+                        // is announced and never withdrawn leaves them holding a
+                        // name for a display that no longer exists.
+                        let gone: Vec<OutputId> = state
+                            .outputs
+                            .iter()
+                            .map(|output| output.id)
+                            .filter(|id| !seen.contains(id))
+                            .collect();
+                        for output_id in gone {
+                            info!("Output {:?} disconnected", output_id);
+                            if let Some(global_name) = state.remove_output(output_id) {
+                                wl_registry::broadcast_global_remove(&mut state, global_name);
+                            }
+                        }
+
                         // A new output arrives with no workspace, and a window
                         // opening before it has one would have nowhere to go.
                         state.sync_workspaces();
@@ -484,7 +526,7 @@ pub async fn run_compositor(
                             && alt_held(&state)
                             && let Some(hit) = hit_test(&state, state.cursor_x, state.cursor_y)
                         {
-                            state.workspaces.raise(hit.toplevel);
+                            raise_window(&mut state, hit.toplevel);
                             switch_focus(&mut state, hit.toplevel);
                             match button {
                                 MouseButton::Left => state.start_move_grab(hit.toplevel),
@@ -517,7 +559,7 @@ pub async fn run_compositor(
                         let cy = state.cursor_y;
                         if pressed && let Some(hit) = hit_test(&state, cx, cy) && state.focused_surface != Some(hit.toplevel) {
                             // Raise to top of its workspace
-                            state.workspaces.raise(hit.toplevel);
+                            raise_window(&mut state, hit.toplevel);
                             state.dirty = true;
 
                             switch_focus(&mut state, hit.toplevel);
@@ -551,23 +593,28 @@ pub async fn run_compositor(
                             }
                         }
                     }
-                    BackendMessage::MouseScroll { dx, dy } => {
+                    BackendMessage::TouchDown { id, x, y } => {
                         let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
-                        let pointer_client = state.pointer_surface.map(|(cid, _)| cid);
-                        for ptr in state.pointers.clone() {
-                            if Some(ptr.client_id) != pointer_client {
-                                continue;
-                            }
-                            if dy != 0.0 {
-                                // mouse axis 0 = vertical
-                                wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 0, dy * 10.0);
-                            }
-                            if dx != 0.0 {
-                                // mouse axis 1 = horizontal
-                                wl_pointer::send_axis(&mut state, ptr.client_id, ptr.object_id, time_ms, 1, dx * 10.0);
-                            }
-                            wl_pointer::send_frame(&mut state, ptr.client_id, ptr.object_id);
-                        }
+                        touch_down(&mut state, time_ms, id, x, y);
+                    }
+                    BackendMessage::TouchMotion { id, x, y } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        touch_motion(&mut state, time_ms, id, x, y);
+                    }
+                    BackendMessage::TouchUp { id } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        touch_up(&mut state, time_ms, id);
+                    }
+                    BackendMessage::TouchCancel => {
+                        touch_cancel(&mut state);
+                    }
+                    BackendMessage::MouseScroll { dx, dy, source, v120_x, v120_y } => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        deliver_scroll(&mut state, time_ms, dx, dy, source, v120_x, v120_y);
+                    }
+                    BackendMessage::MouseScrollEnd => {
+                        let time_ms = u32::try_from(start_time.elapsed().as_millis()).unwrap_or(0);
+                        deliver_scroll_end(&mut state, time_ms);
                     }
                     BackendMessage::FocusIn => {
                         debug!("Focus in");
@@ -611,6 +658,9 @@ pub async fn run_compositor(
                     state.dirty = true;
                 }
                 pacer.forget_gone_outputs(&state);
+                // A bell that has run its course has to be taken off the screen,
+                // and nothing else would notice it had expired.
+                state.expire_bells();
 
                 // Surfaces no display is showing are paced from here, because
                 // nothing else will pace them: no output will ever report
@@ -737,6 +787,210 @@ fn deliver_pointer_motion(state: &mut CompositorState, time_ms: u32) {
                 wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
             }
         }
+    }
+}
+
+/// Raise the window under a click, bringing any dialogs of its own with it.
+///
+/// Goes through the toplevel rather than straight to the workspace stack so
+/// that `set_parent` is honoured — a dialog must not be buried by a click on
+/// the window it belongs to.
+fn raise_window(state: &mut CompositorState, surface: ClientObjectId) {
+    match state.toplevel_for_surface(surface) {
+        Some(toplevel) => state.raise_with_children(toplevel),
+        None => state.workspaces.raise(surface),
+    }
+}
+
+/// A finger has landed. Find what it landed on and tell that client.
+///
+/// The surface is settled here and remembered for the life of the point, so
+/// every later motion and the eventual lift go to the same client however far
+/// the finger travels.
+fn touch_down(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+    state.dirty = true;
+    let Some(hit) = hit_test(state, x, y) else {
+        // Nothing there. The point is not recorded, so its motion and lift are
+        // dropped too rather than being delivered to whatever is touched next.
+        return;
+    };
+
+    // Touching a window raises and focuses it, the same as clicking one.
+    raise_window(state, hit.toplevel);
+    switch_focus(state, hit.toplevel);
+
+    state.touch_points.insert(id, hit.surface);
+    let (local_x, local_y) = (x - f64::from(hit.surface_x), y - f64::from(hit.surface_y));
+    for touch_id in wl_touch::touches_of(state, hit.surface.0) {
+        wl_touch::send_down(
+            state,
+            hit.surface.0,
+            touch_id,
+            time_ms,
+            hit.surface.1,
+            id,
+            local_x,
+            local_y,
+        );
+        wl_touch::send_frame(state, hit.surface.0, touch_id);
+    }
+}
+
+/// A finger already down has moved, in the coordinates of the surface it
+/// started on — which may be nowhere near where it is now.
+fn touch_motion(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+    state.dirty = true;
+    let Some(&surface) = state.touch_points.get(&id) else {
+        return;
+    };
+    let origin = surface_global_position(state, surface.0, surface.1);
+    let (local_x, local_y) = (x - f64::from(origin.0), y - f64::from(origin.1));
+    for touch_id in wl_touch::touches_of(state, surface.0) {
+        wl_touch::send_motion(state, surface.0, touch_id, time_ms, id, local_x, local_y);
+        wl_touch::send_frame(state, surface.0, touch_id);
+    }
+}
+
+/// A finger has been lifted.
+fn touch_up(state: &mut CompositorState, time_ms: u32, id: i32) {
+    state.dirty = true;
+    let Some(surface) = state.touch_points.remove(&id) else {
+        return;
+    };
+    for touch_id in wl_touch::touches_of(state, surface.0) {
+        wl_touch::send_up(state, surface.0, touch_id, time_ms, id);
+        wl_touch::send_frame(state, surface.0, touch_id);
+    }
+}
+
+/// The touch sequence has been taken over, so every point in it is void.
+///
+/// Every client holding a point is told, not just the one under the last
+/// finger: a two-finger gesture spanning two windows leaves both of them
+/// waiting to be told how it ended.
+fn touch_cancel(state: &mut CompositorState) {
+    state.dirty = true;
+    let mut clients: Vec<u32> = state.touch_points.values().map(|s| s.0).collect();
+    clients.sort_unstable();
+    clients.dedup();
+    state.touch_points.clear();
+    for client_id in clients {
+        for touch_id in wl_touch::touches_of(state, client_id) {
+            wl_touch::send_cancel(state, client_id, touch_id);
+        }
+    }
+}
+
+/// Deliver a scroll to whichever client has the pointer.
+///
+/// The order within the frame is the protocol's and is not arbitrary: the
+/// source first, so a client knows what kind of scroll it is about to be told
+/// about; then the detent count for an axis, before the distance it explains;
+/// then the distance; then the frame that says the picture is complete. A
+/// client acting on the distance before it knows the source cannot decide
+/// whether the scroll may have momentum.
+fn deliver_scroll(
+    state: &mut CompositorState,
+    time_ms: u32,
+    dx: f64,
+    dy: f64,
+    source: ScrollSource,
+    v120_x: i32,
+    v120_y: i32,
+) {
+    let Some((pointer_client, _)) = state.pointer_surface else {
+        return;
+    };
+    // A touchpad scroll ends, and the axes it was moving are the ones that have
+    // to be told so. A wheel never stops in this sense — it is between detents,
+    // not finished.
+    if source == ScrollSource::Finger {
+        state.scrolling_vertical |= dy != 0.0;
+        state.scrolling_horizontal |= dx != 0.0;
+    }
+
+    for ptr in state.pointers.clone() {
+        if ptr.client_id != pointer_client {
+            continue;
+        }
+        wl_pointer::send_axis_source(state, ptr.client_id, ptr.object_id, source);
+        if dy != 0.0 {
+            wl_pointer::send_axis_steps(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                wl_pointer::AXIS_VERTICAL,
+                v120_y,
+            );
+            wl_pointer::send_axis(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_VERTICAL,
+                dy * SCROLL_STEP,
+            );
+        }
+        if dx != 0.0 {
+            wl_pointer::send_axis_steps(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                wl_pointer::AXIS_HORIZONTAL,
+                v120_x,
+            );
+            wl_pointer::send_axis(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_HORIZONTAL,
+                dx * SCROLL_STEP,
+            );
+        }
+        wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
+    }
+}
+
+/// Tell the client a touchpad scroll has finished.
+///
+/// Only the axes that were actually moving are stopped: an `axis_stop` for an
+/// axis that never scrolled is a statement about something that never happened.
+fn deliver_scroll_end(state: &mut CompositorState, time_ms: u32) {
+    let (vertical, horizontal) = (state.scrolling_vertical, state.scrolling_horizontal);
+    state.scrolling_vertical = false;
+    state.scrolling_horizontal = false;
+    if !vertical && !horizontal {
+        return;
+    }
+    let Some((pointer_client, _)) = state.pointer_surface else {
+        return;
+    };
+
+    for ptr in state.pointers.clone() {
+        if ptr.client_id != pointer_client {
+            continue;
+        }
+        wl_pointer::send_axis_source(state, ptr.client_id, ptr.object_id, ScrollSource::Finger);
+        if vertical {
+            wl_pointer::send_axis_stop(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_VERTICAL,
+            );
+        }
+        if horizontal {
+            wl_pointer::send_axis_stop(
+                state,
+                ptr.client_id,
+                ptr.object_id,
+                time_ms,
+                wl_pointer::AXIS_HORIZONTAL,
+            );
+        }
+        wl_pointer::send_frame(state, ptr.client_id, ptr.object_id);
     }
 }
 
