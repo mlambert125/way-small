@@ -6,7 +6,7 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 
 pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClientInfo) {
     super::unknown_request(state, msg, "wl_callback");

@@ -4,10 +4,10 @@
 //! The only client request is destroy. The compositor sends the release
 //! event when it's done reading the buffer's contents.
 
-use crate::compositor::protocol::message;
+use crate::compositor::protocol::build_message;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -36,5 +36,5 @@ pub fn send_release(state: &mut CompositorState, client_id: u32, buffer_id: u32)
         tracing::warn!("Received message from unknown client {}", client_id);
         return;
     };
-    let _ = client.send(message(buffer_id, RELEASE, vec![]));
+    let _ = client.send(build_message(buffer_id, RELEASE, vec![]));
 }

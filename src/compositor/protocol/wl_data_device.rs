@@ -12,12 +12,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-#[cfg(test)]
-pub mod tests;
-
+use super::super::state::{ClientObjectId, CompositorState, DataOffer, DataSourceRole, OfferKind};
 use super::ObjectType;
-use super::state::{ClientObjectId, CompositorState, DataOffer, DataSourceRole, OfferKind};
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 use super::{next_serial, wl_data_offer, wl_data_source};
 
 // Request opcodes
@@ -304,7 +301,7 @@ pub fn send_selection_to_device(state: &mut CompositorState, client_id: u32, dev
 pub fn send_data_offer(state: &mut CompositorState, client_id: u32, device_id: u32, offer_id: u32) {
     let args = ArgWriter::new().u32(offer_id).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, DATA_OFFER, args));
+        let _ = client.send(build_message(device_id, DATA_OFFER, args));
     }
 }
 
@@ -319,7 +316,7 @@ pub fn send_selection(
 ) {
     let args = ArgWriter::new().object(offer_id).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, SELECTION, args));
+        let _ = client.send(build_message(device_id, SELECTION, args));
     }
 }
 
@@ -346,14 +343,14 @@ pub fn send_enter(
         .object(offer_id)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, ENTER, args));
+        let _ = client.send(build_message(device_id, ENTER, args));
     }
 }
 
 /// Send `wl_data_device.leave`: the drag has gone elsewhere.
 pub fn send_leave(state: &mut CompositorState, client_id: u32, device_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, LEAVE, Vec::new()));
+        let _ = client.send(build_message(device_id, LEAVE, Vec::new()));
     }
 }
 
@@ -368,14 +365,14 @@ pub fn send_motion(
 ) {
     let args = ArgWriter::new().u32(time_ms).fixed(x).fixed(y).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, MOTION, args));
+        let _ = client.send(build_message(device_id, MOTION, args));
     }
 }
 
 /// Send `wl_data_device.drop`: the user let go here.
 pub fn send_drop(state: &mut CompositorState, client_id: u32, device_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(device_id, DROP, Vec::new()));
+        let _ = client.send(build_message(device_id, DROP, Vec::new()));
     }
 }
 

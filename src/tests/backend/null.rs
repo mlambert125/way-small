@@ -1,6 +1,7 @@
 //! Tests for the headless backend.
 
-use super::{BackendMessage, BackendRequest, DmabufProbe, Frame, run_null_backend};
+use crate::backend::null::run_null_backend;
+use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame};
 use tokio::sync::mpsc::channel;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;

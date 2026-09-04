@@ -1,9 +1,15 @@
 //! Tests for the compositor event loop: key bindings, focus, hit
 //! testing, buffer release, window placement, and interactive grabs.
 
-use super::{
-    Binding, CompositorState, KEY_F4, KEY_LEFTALT, KEY_RIGHTALT, KEY_TAB, close_focused_window,
-    cycle_focus, match_binding,
+mod protocol;
+mod scene;
+mod state;
+mod workspace;
+
+use crate::compositor::state::CompositorState;
+use crate::compositor::{
+    Binding, KEY_F4, KEY_LEFTALT, KEY_RIGHTALT, KEY_TAB, close_focused_window, cycle_focus,
+    match_binding,
 };
 use crate::wayland_socket::WaylandProtocolMessage;
 use std::collections::{HashSet, VecDeque};
@@ -62,7 +68,7 @@ fn add_toplevel(
 
 #[test]
 fn buffer_scale_shrinks_the_hit_testable_area() {
-    use crate::compositor::protocol::state::{Buffer, BufferKind, ShmBuffer};
+    use crate::compositor::state::{Buffer, BufferKind, ShmBuffer};
     let mut state = CompositorState::new();
     let _rx = add_client(&mut state, 1);
     state.create_surface(1, 10);
@@ -85,11 +91,14 @@ fn buffer_scale_shrinks_the_hit_testable_area() {
     let surface = state.surfaces.get_mut(&(1, 10)).unwrap();
     surface.buffer_id = Some(11);
 
-    assert_eq!(super::surface_dimensions(&state, (1, 10)), (200, 100));
+    assert_eq!(
+        crate::compositor::surface_dimensions(&state, (1, 10)),
+        (200, 100)
+    );
 
     state.surfaces.get_mut(&(1, 10)).unwrap().buffer_scale = 2;
     assert_eq!(
-        super::surface_dimensions(&state, (1, 10)),
+        crate::compositor::surface_dimensions(&state, (1, 10)),
         (100, 50),
         "a scale-2 buffer covers half as much surface-local area"
     );
@@ -165,8 +174,7 @@ fn cycle_with_one_window_does_nothing() {
     assert_eq!(state.focused_surface, Some((1, 10)));
 }
 
-use super::scene;
-use super::{finish_buffer_releases, start_buffer_releases};
+use crate::compositor::{finish_buffer_releases, start_buffer_releases};
 use crate::shared::OutputId;
 
 /// A pool with two buffers, and a mapped surface showing the first.
@@ -226,10 +234,10 @@ fn state_with_two_buffers() -> CompositorState {
 #[test]
 fn a_replaced_buffer_waits_for_its_last_reader() {
     let mut state = state_with_two_buffers();
-    let mut cache = scene::SceneCache::new();
+    let mut cache = crate::compositor::scene::SceneCache::new();
 
     // A frame is drawn from buffer 101, so something is reading it.
-    let frame = scene::build(OutputId(1), 1, &state, &mut cache);
+    let frame = crate::compositor::scene::build(OutputId(1), 1, &state, &mut cache);
 
     // The client swaps to 102, which retires 101.
     state.surfaces.get_mut(&(1, 200)).unwrap().buffer_id = Some(102);
@@ -381,11 +389,11 @@ fn the_cascade_restarts_rather_than_marching_off_the_output() {
     }
 }
 
-use super::{
-    MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, edges_for_point, end_grab, resize_limits, update_grab,
-};
-use crate::compositor::protocol::state::{
+use crate::compositor::state::{
     Buffer, BufferKind, ClientObjectId, GrabKind, ResizeEdges, ShmBuffer,
+};
+use crate::compositor::{
+    MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, edges_for_point, end_grab, resize_limits, update_grab,
 };
 
 const WINDOW: ClientObjectId = (1, 10);
@@ -758,14 +766,17 @@ fn a_dmabuf_surface_has_a_size_like_any_other() {
     // answer — a dma-buf window that reported no size would be invisible to
     // hit-testing and confinement as well as to the scene.
     assert_eq!(state.surface_size((1, 10)), (64, 32));
-    assert_eq!(super::surface_dimensions(&state, (1, 10)), (64, 32));
+    assert_eq!(
+        crate::compositor::surface_dimensions(&state, (1, 10)),
+        (64, 32)
+    );
 }
 
 #[test]
 fn an_output_is_composed_only_once_it_has_asked() {
     let mut state = state_with_two_outputs();
     let (frames, mut rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
-    let mut pacer = super::FramePacer::new();
+    let mut pacer = crate::compositor::FramePacer::new();
 
     // Something changed, but no display has said it can show anything.
     // Composing now would be work thrown away, and would have the compositor
@@ -786,7 +797,7 @@ fn an_output_is_composed_only_once_it_has_asked() {
 fn a_standing_request_is_served_the_moment_something_changes() {
     let mut state = state_with_two_outputs();
     let (frames, rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
-    let mut pacer = super::FramePacer::new();
+    let mut pacer = crate::compositor::FramePacer::new();
 
     // The display is ready and nothing has changed, so there is nothing to
     // send it. The request has to outlive this moment: dropping it would make
@@ -805,7 +816,7 @@ fn a_standing_request_is_served_the_moment_something_changes() {
 fn serving_one_output_keeps_the_other_ones_scene() {
     let mut state = state_with_two_outputs();
     let (frames, mut rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
-    let mut pacer = super::FramePacer::new();
+    let mut pacer = crate::compositor::FramePacer::new();
 
     state.dirty = true;
     pacer.request(OutputId(1));
@@ -835,7 +846,7 @@ fn serving_one_output_keeps_the_other_ones_scene() {
 fn an_output_that_goes_away_is_forgotten() {
     let mut state = state_with_two_outputs();
     let (frames, _rx) = tokio::sync::watch::channel(crate::shared::Frame::new());
-    let mut pacer = super::FramePacer::new();
+    let mut pacer = crate::compositor::FramePacer::new();
 
     state.dirty = true;
     pacer.request(OutputId(1));
@@ -853,11 +864,9 @@ fn an_output_that_goes_away_is_forgotten() {
 
 // -- Drag and drop -----------------------------------------------------------
 
-use super::{enter_drag_surface, finish_drag, update_drag};
-use crate::compositor::protocol::state::{
-    DataDeviceBinding, DataSource, DataSourceRole, OfferKind,
-};
 use crate::compositor::protocol::{wl_data_device, wl_pointer};
+use crate::compositor::state::{DataDeviceBinding, DataSource, DataSourceRole, OfferKind};
+use crate::compositor::{enter_drag_surface, finish_drag, update_drag};
 
 const DRAG_SOURCE: u32 = 40;
 const DRAG_DEVICE_A: u32 = 41;
@@ -952,7 +961,7 @@ fn a_drag_takes_the_pointer_from_whoever_had_it() {
     state.pointer_surface = Some(WINDOW);
     state
         .pointers
-        .push(crate::compositor::protocol::state::PointerBinding {
+        .push(crate::compositor::state::PointerBinding {
             client_id: 1,
             object_id: 30,
         });
@@ -1195,10 +1204,10 @@ fn a_client_with_two_data_devices_is_entered_on_both() {
 
 // -- Globals coming and going ------------------------------------------------
 
-use super::{touch_cancel, touch_down, touch_motion, touch_up};
 use crate::compositor::protocol::wire_utils::ArgWriter;
 use crate::compositor::protocol::wl_touch;
 use crate::compositor::protocol::{ObjectType, handle_message, wl_registry};
+use crate::compositor::{touch_cancel, touch_down, touch_motion, touch_up};
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
 /// One output, at the origin.
@@ -1654,12 +1663,10 @@ fn a_touch_point_stays_with_the_surface_it_started_on() {
         .unwrap()
         .register_with_version(30, ObjectType::WlTouch, 8)
         .unwrap();
-    state
-        .touches
-        .push(crate::compositor::protocol::state::TouchBinding {
-            client_id: 1,
-            object_id: 30,
-        });
+    state.touches.push(crate::compositor::state::TouchBinding {
+        client_id: 1,
+        object_id: 30,
+    });
 
     // Land inside the window, which sits at (10, 10) and is 200x150.
     touch_down(&mut state, 0, 7, 50.0, 50.0);
@@ -1705,12 +1712,10 @@ fn cancelling_tells_every_client_holding_a_point() {
 #[test]
 fn a_disconnecting_client_takes_its_touch_points_with_it() {
     let (mut state, _rx) = state_with_a_focused_window();
-    state
-        .touches
-        .push(crate::compositor::protocol::state::TouchBinding {
-            client_id: 1,
-            object_id: 30,
-        });
+    state.touches.push(crate::compositor::state::TouchBinding {
+        client_id: 1,
+        object_id: 30,
+    });
     state.touch_points.insert(1, WINDOW);
 
     state.remove_client_resources(1);
@@ -1720,8 +1725,8 @@ fn a_disconnecting_client_takes_its_touch_points_with_it() {
 
 // -- Scroll axis detail ------------------------------------------------------
 
-use super::{deliver_scroll, deliver_scroll_end};
 use crate::compositor::protocol::wl_pointer as ptr;
+use crate::compositor::{deliver_scroll, deliver_scroll_end};
 use crate::shared::ScrollSource;
 
 /// A client with the pointer over its window, at the given `wl_pointer` version.
@@ -1737,7 +1742,7 @@ fn state_with_a_pointer(version: u32) -> (CompositorState, Receiver<WaylandProto
         .unwrap();
     state
         .pointers
-        .push(crate::compositor::protocol::state::PointerBinding {
+        .push(crate::compositor::state::PointerBinding {
             client_id: 1,
             object_id: 30,
         });

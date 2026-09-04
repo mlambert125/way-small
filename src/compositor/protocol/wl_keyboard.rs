@@ -9,9 +9,9 @@ use std::os::unix::io::FromRawFd;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::next_serial;
-use super::state::CompositorState;
-use super::wire_utils::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, build_message};
 use crate::wayland_socket::WaylandProtocolMessage;
 
 // Request opcodes
@@ -115,7 +115,7 @@ pub fn send_keymap(state: &mut CompositorState, client_id: u32, keyboard_id: u32
     // Send repeat_info (version 4+): rate=25 keys/sec, delay=600ms
     if client.version(keyboard_id) >= 4 {
         let args = ArgWriter::new().i32(25).i32(600).build();
-        let _ = client.send(message(keyboard_id, REPEAT_INFO, args));
+        let _ = client.send(build_message(keyboard_id, REPEAT_INFO, args));
     }
 }
 
@@ -131,7 +131,7 @@ pub fn send_enter(state: &mut CompositorState, client_id: u32, keyboard_id: u32,
         .array_u32(&keys)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(keyboard_id, ENTER, args));
+        let _ = client.send(build_message(keyboard_id, ENTER, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -142,7 +142,7 @@ pub fn send_leave(state: &mut CompositorState, client_id: u32, keyboard_id: u32,
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).u32(surface_id).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(keyboard_id, LEAVE, args));
+        let _ = client.send(build_message(keyboard_id, LEAVE, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -169,7 +169,7 @@ pub fn send_key(
         .u32(key_state)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(keyboard_id, KEY, args));
+        let _ = client.send(build_message(keyboard_id, KEY, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -194,7 +194,7 @@ pub fn send_modifiers(
         .u32(group)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(keyboard_id, MODIFIERS, args));
+        let _ = client.send(build_message(keyboard_id, MODIFIERS, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }

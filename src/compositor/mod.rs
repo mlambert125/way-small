@@ -11,13 +11,12 @@
 use crate::shared::{BackendMessage, BackendRequest, DmabufProbe, Frame, KeyState, MouseButton};
 use crate::shared::{OutputId, PresentedAt, Scene, ScrollSource, fourcc_name, output_contains};
 use crate::wayland_socket::WaylandSocketMessage;
-use protocol::CompositorState;
-use protocol::state::{ClientObjectId, GrabKind, OfferKind, ResizeEdges, region_contains};
-use protocol::wire_utils::{ArgWriter, f64_to_i32, message};
+use protocol::wire_utils::{ArgWriter, build_message, f64_to_i32};
 use protocol::{
     wl_data_device, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat,
     wl_surface, wl_touch, wp_presentation_feedback, xdg_popup, xdg_surface, xdg_toplevel,
 };
+use state::{ClientObjectId, CompositorState, GrabKind, OfferKind, ResizeEdges, region_contains};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,8 +27,7 @@ use tracing::{debug, info, warn};
 
 pub mod protocol;
 pub mod scene;
-#[cfg(test)]
-mod tests;
+pub mod state;
 pub mod workspace;
 
 /// How often the compositor does the work that no display paces.
@@ -43,13 +41,13 @@ pub mod workspace;
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(16);
 
 // evdev keycode for TAB (used for now for hard-coded keymap)
-const KEY_TAB: u32 = 15;
+pub(crate) const KEY_TAB: u32 = 15;
 // evdev keycode for LEFTALT (used for now for hard-coded keymap)
-const KEY_LEFTALT: u32 = 56;
+pub(crate) const KEY_LEFTALT: u32 = 56;
 // evdev keycode for F4 (used for now for hard-coded keymap)
-const KEY_F4: u32 = 62;
+pub(crate) const KEY_F4: u32 = 62;
 // evdev keycode for RIGHTALT (used for now for hard-coded keymap)
-const KEY_RIGHTALT: u32 = 100;
+pub(crate) const KEY_RIGHTALT: u32 = 100;
 // evdev keycode for ESC, which abandons a drag
 const KEY_ESC: u32 = 1;
 
@@ -62,13 +60,13 @@ const KEY_ESC: u32 = 1;
 const SCROLL_STEP: f64 = 10.0;
 
 /// Smallest window width an interactive resize will produce.
-const MIN_WINDOW_WIDTH: i32 = 120;
+pub(crate) const MIN_WINDOW_WIDTH: i32 = 120;
 /// Smallest window height an interactive resize will produce.
-const MIN_WINDOW_HEIGHT: i32 = 80;
+pub(crate) const MIN_WINDOW_HEIGHT: i32 = 80;
 
 /// A key combination the compositor acts on itself rather than forwarding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Binding {
+pub(crate) enum Binding {
     /// Alt+F4 — ask the focused toplevel to close.
     CloseWindow,
     /// Alt+Tab — move focus to the next toplevel.
@@ -96,14 +94,14 @@ struct HitResult {
 /// at any time — a page flip completing, a client committing — so the decision
 /// is made in one place after every pass of the loop rather than in whichever
 /// arm happened to settle the second half.
-struct FramePacer {
+pub(crate) struct FramePacer {
     /// The newest scene composed for each output.
     ///
     /// Kept so that every publication can carry all of them. The frame slot
     /// holds one value and a new publication replaces it, so a frame carrying
     /// only the output being served would drop the scene of an output whose
     /// backend had not drawn it yet.
-    published: HashMap<OutputId, Arc<Scene>>,
+    pub(crate) published: HashMap<OutputId, Arc<Scene>>,
     /// Outputs whose published scene is out of date.
     stale: HashSet<OutputId>,
     /// Outputs whose backend has asked for a frame and not been given one.
@@ -121,7 +119,7 @@ struct FramePacer {
 }
 
 impl FramePacer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             published: HashMap::new(),
             stale: HashSet::new(),
@@ -143,12 +141,12 @@ impl FramePacer {
     }
 
     /// Record that a backend is ready for another frame on this output.
-    fn request(&mut self, output_id: OutputId) {
+    pub(crate) fn request(&mut self, output_id: OutputId) {
         self.waiting.insert(output_id);
     }
 
     /// Drop everything remembered about outputs that no longer exist.
-    fn forget_gone_outputs(&mut self, state: &CompositorState) {
+    pub(crate) fn forget_gone_outputs(&mut self, state: &CompositorState) {
         let live: HashSet<OutputId> = state.outputs.iter().map(|o| o.id).collect();
         self.published.retain(|id, _| live.contains(id));
         self.stale.retain(|id| live.contains(id));
@@ -161,7 +159,7 @@ impl FramePacer {
     /// Never awaited, in line with the rule that the compositor task blocks on
     /// nothing: the slot holds one frame and a backend that has not kept up
     /// gets the newest.
-    fn publish(&mut self, state: &mut CompositorState, frames: &watch::Sender<Frame>) {
+    pub(crate) fn publish(&mut self, state: &mut CompositorState, frames: &watch::Sender<Frame>) {
         if state.dirty {
             self.invalidate(state);
             state.dirty = false;
@@ -231,7 +229,7 @@ pub async fn run_compositor(
         warn!("could not ask the backend about dma-buf support");
     }
 
-    let mut state = protocol::CompositorState::new();
+    let mut state = CompositorState::new();
     // Protocol handlers need this too: a client asking for a dma-buf buffer
     // cannot be answered until the backend has tried to import it.
     state.backend_sender = Some(backend_requests.clone());
@@ -807,7 +805,7 @@ fn raise_window(state: &mut CompositorState, surface: ClientObjectId) {
 /// The surface is settled here and remembered for the life of the point, so
 /// every later motion and the eventual lift go to the same client however far
 /// the finger travels.
-fn touch_down(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+pub(crate) fn touch_down(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
     state.dirty = true;
     let Some(hit) = hit_test(state, x, y) else {
         // Nothing there. The point is not recorded, so its motion and lift are
@@ -838,7 +836,7 @@ fn touch_down(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64
 
 /// A finger already down has moved, in the coordinates of the surface it
 /// started on — which may be nowhere near where it is now.
-fn touch_motion(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
+pub(crate) fn touch_motion(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f64) {
     state.dirty = true;
     let Some(&surface) = state.touch_points.get(&id) else {
         return;
@@ -852,7 +850,7 @@ fn touch_motion(state: &mut CompositorState, time_ms: u32, id: i32, x: f64, y: f
 }
 
 /// A finger has been lifted.
-fn touch_up(state: &mut CompositorState, time_ms: u32, id: i32) {
+pub(crate) fn touch_up(state: &mut CompositorState, time_ms: u32, id: i32) {
     state.dirty = true;
     let Some(surface) = state.touch_points.remove(&id) else {
         return;
@@ -868,7 +866,7 @@ fn touch_up(state: &mut CompositorState, time_ms: u32, id: i32) {
 /// Every client holding a point is told, not just the one under the last
 /// finger: a two-finger gesture spanning two windows leaves both of them
 /// waiting to be told how it ended.
-fn touch_cancel(state: &mut CompositorState) {
+pub(crate) fn touch_cancel(state: &mut CompositorState) {
     state.dirty = true;
     let mut clients: Vec<u32> = state.touch_points.values().map(|s| s.0).collect();
     clients.sort_unstable();
@@ -889,7 +887,7 @@ fn touch_cancel(state: &mut CompositorState) {
 /// then the distance; then the frame that says the picture is complete. A
 /// client acting on the distance before it knows the source cannot decide
 /// whether the scroll may have momentum.
-fn deliver_scroll(
+pub(crate) fn deliver_scroll(
     state: &mut CompositorState,
     time_ms: u32,
     dx: f64,
@@ -956,7 +954,7 @@ fn deliver_scroll(
 ///
 /// Only the axes that were actually moving are stopped: an `axis_stop` for an
 /// axis that never scrolled is a statement about something that never happened.
-fn deliver_scroll_end(state: &mut CompositorState, time_ms: u32) {
+pub(crate) fn deliver_scroll_end(state: &mut CompositorState, time_ms: u32) {
     let (vertical, horizontal) = (state.scrolling_vertical, state.scrolling_horizontal);
     state.scrolling_vertical = false;
     state.scrolling_horizontal = false;
@@ -1007,7 +1005,7 @@ fn alt_held(state: &CompositorState) -> bool {
 /// remapping to respect yet. If configurable xkb layouts land (see
 /// `docs/notes.md`), this should switch to the `mods_depressed` mask so that a
 /// remapped Alt still works.
-fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding> {
+pub(crate) fn match_binding(evdev_key: u32, pressed_keys: &HashSet<u32>) -> Option<Binding> {
     if !pressed_keys.contains(&KEY_LEFTALT) && !pressed_keys.contains(&KEY_RIGHTALT) {
         return None;
     }
@@ -1155,7 +1153,7 @@ fn bound_output_objects(state: &CompositorState, client_id: u32, output_id: Outp
 ///
 /// Only a request — the client decides whether to honour it, so the window is
 /// torn down later through the normal `xdg_toplevel.destroy` path, not here.
-fn close_focused_window(state: &mut CompositorState) {
+pub(crate) fn close_focused_window(state: &mut CompositorState) {
     let Some((client_id, wl_surface_id)) = state.focused_surface else {
         return;
     };
@@ -1177,7 +1175,7 @@ fn close_focused_window(state: &mut CompositorState) {
 /// A workspace stack is ordered bottom to top, so taking the bottom entry and
 /// pushing it on top rotates through every window on repeated presses rather
 /// than toggling between the most recent two.
-fn cycle_focus(state: &mut CompositorState) {
+pub(crate) fn cycle_focus(state: &mut CompositorState) {
     let Some(output_id) = state
         .focused_surface
         .and_then(|key| state.surface_output(key))
@@ -1237,7 +1235,7 @@ fn fire_frame_callbacks(
     for (client_id, callback_id) in callbacks {
         if let Some(client) = state.clients.get(client_id) {
             let args = ArgWriter::new().u32(timestamp_ms).build();
-            let _ = client.send(message(callback_id, 0, args));
+            let _ = client.send(build_message(callback_id, 0, args));
             client.unregister(callback_id);
         } else {
             debug!(
@@ -1254,7 +1252,7 @@ fn fire_frame_callbacks(
     let Some(presented_at) = presented_at else {
         for (client_id, feedback_id) in presentation {
             if let Some(client) = state.clients.get(client_id) {
-                let _ = client.send(message(
+                let _ = client.send(build_message(
                     feedback_id,
                     wp_presentation_feedback::DISCARDED,
                     Vec::new(),
@@ -1291,7 +1289,7 @@ fn fire_frame_callbacks(
                 // client decode it as `sync_output`, whose single argument is
                 // a non-nullable object — a zero there is a fatal decode error
                 // that takes the connection down.
-                let _ = client.send(message(
+                let _ = client.send(build_message(
                     feedback_id,
                     wp_presentation_feedback::PRESENTED,
                     args,
@@ -1313,7 +1311,7 @@ fn fire_frame_callbacks(
 /// buffer, and telling the client it may draw would corrupt what is on screen.
 /// Buffers still attached to a surface are skipped, which happens when several
 /// commits are batched and a buffer is re-attached after being replaced.
-fn start_buffer_releases(state: &mut CompositorState) {
+pub(crate) fn start_buffer_releases(state: &mut CompositorState) {
     for (client_id, buffer_id) in std::mem::take(&mut state.buffers_pending_release) {
         let still_attached = state
             .surfaces
@@ -1332,7 +1330,7 @@ fn start_buffer_releases(state: &mut CompositorState) {
 /// previous frame, which is dropped when a later frame replaces it or the
 /// backend finishes with it, and neither is tied to this compositor's idea of
 /// whether anything changed.
-fn finish_buffer_releases(state: &mut CompositorState) {
+pub(crate) fn finish_buffer_releases(state: &mut CompositorState) {
     if state.releasing_buffers.is_empty() {
         return;
     }
@@ -1358,7 +1356,7 @@ fn finish_buffer_releases(state: &mut CompositorState) {
     // Send wl_buffer.release (opcode 0, no args)
     for (client_id, buffer_id) in buffers_to_release {
         if let Some(client) = state.clients.get(client_id) {
-            let _ = client.send(message(buffer_id, 0, Vec::new()));
+            let _ = client.send(build_message(buffer_id, 0, Vec::new()));
         } else {
             debug!(
                 "Client {} disappeared before buffer release could be sent",
@@ -1383,7 +1381,10 @@ fn finish_buffer_releases(state: &mut CompositorState) {
 /// insists on a minimum larger than the display gets it: the compositor cannot
 /// make it render smaller, and configuring a size it will refuse achieves
 /// nothing.
-fn resize_limits(state: &CompositorState, surface: ClientObjectId) -> ((i32, i32), (i32, i32)) {
+pub(crate) fn resize_limits(
+    state: &CompositorState,
+    surface: ClientObjectId,
+) -> ((i32, i32), (i32, i32)) {
     let (display_width, display_height) = state
         .surface_output(surface)
         .and_then(|id| state.outputs.iter().find(|o| o.id == id))
@@ -1412,7 +1413,7 @@ fn limit_or(client_limit: i32, display_limit: i32) -> i32 {
 }
 
 /// Drive the active grab from a pointer position. Returns false if there is none.
-fn update_grab(state: &mut CompositorState, x: f64, y: f64) -> bool {
+pub(crate) fn update_grab(state: &mut CompositorState, x: f64, y: f64) -> bool {
     let Some(grab) = state.pointer_grab else {
         return false;
     };
@@ -1488,7 +1489,7 @@ fn update_grab(state: &mut CompositorState, x: f64, y: f64) -> bool {
 }
 
 /// End the active grab, telling a resized client it has stopped resizing.
-fn end_grab(state: &mut CompositorState) {
+pub(crate) fn end_grab(state: &mut CompositorState) {
     let Some(grab) = state.pointer_grab.take() else {
         return;
     };
@@ -1505,7 +1506,7 @@ fn end_grab(state: &mut CompositorState) {
 /// not its pointer: no `wl_pointer` event reaches anyone for the duration of a
 /// drag, and the target learns where the pointer is from
 /// `wl_data_device.motion`.
-fn update_drag(state: &mut CompositorState, time_ms: u32) -> bool {
+pub(crate) fn update_drag(state: &mut CompositorState, time_ms: u32) -> bool {
     let Some(drag) = state.drag.clone() else {
         return false;
     };
@@ -1552,7 +1553,12 @@ fn update_drag(state: &mut CompositorState, time_ms: u32) -> bool {
 /// offer belongs to the device it arrived on. The order within a device is
 /// forced: the client has to know the object exists and what mime types are
 /// behind it before it is told a drag is over it and asked to decide.
-fn enter_drag_surface(state: &mut CompositorState, surface: ClientObjectId, x: f64, y: f64) {
+pub(crate) fn enter_drag_surface(
+    state: &mut CompositorState,
+    surface: ClientObjectId,
+    x: f64,
+    y: f64,
+) {
     let Some(source) = state.drag.as_ref().map(|drag| drag.source) else {
         return;
     };
@@ -1603,7 +1609,7 @@ fn enter_drag_surface(state: &mut CompositorState, surface: ClientObjectId, x: f
 /// alive to mean "dropped but not finished" would put a second condition on
 /// every check of whether the pointer is spoken for, and the one place that
 /// forgot it would swallow the pointer for good.
-fn finish_drag(state: &mut CompositorState) {
+pub(crate) fn finish_drag(state: &mut CompositorState) {
     // Read before the drag is taken: this asks what the target accepted
     // through it.
     let accepted = state.drag_target_accepted();
@@ -1674,7 +1680,7 @@ fn configure_resizing(
 
 /// Which edges an Alt+drag resize should pull, from where in the window the
 /// pointer sits: the nearest corner, so any part of the window is usable.
-fn edges_for_point(
+pub(crate) fn edges_for_point(
     state: &CompositorState,
     surface: ClientObjectId,
     x: f64,
@@ -1700,7 +1706,7 @@ fn edges_for_point(
 /// Switch keyboard focus to a new toplevel surface. Sends keyboard enter/leave
 /// and `xdg_toplevel` activated/deactivated configure events. Pointer focus is
 /// tracked separately via `state.pointer_surface`.
-pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObjectId) {
+pub fn switch_focus(state: &mut CompositorState, new_key: ClientObjectId) {
     let old_key = state.focused_surface;
     if old_key == Some(new_key) {
         return;
@@ -1745,7 +1751,7 @@ pub fn switch_focus(state: &mut protocol::CompositorState, new_key: ClientObject
 /// workspace that is not displayed cannot be clicked. Windows are confined to
 /// their own output and never straddle two, so the order between outputs
 /// cannot matter — no two entries here overlap unless they share an output.
-fn visible_toplevels_top_down(state: &protocol::CompositorState) -> Vec<ClientObjectId> {
+fn visible_toplevels_top_down(state: &CompositorState) -> Vec<ClientObjectId> {
     let mut keys: Vec<ClientObjectId> = state
         .outputs
         .iter()
@@ -1758,7 +1764,7 @@ fn visible_toplevels_top_down(state: &protocol::CompositorState) -> Vec<ClientOb
 
 /// Hit-test the visible windows from top to bottom. Returns the toplevel and
 /// the specific surface (possibly a subsurface) under the pointer.
-fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<HitResult> {
+fn hit_test(state: &CompositorState, x: f64, y: f64) -> Option<HitResult> {
     let px = f64_to_i32(x);
     let py = f64_to_i32(y);
 
@@ -1783,7 +1789,7 @@ fn hit_test(state: &protocol::CompositorState, x: f64, y: f64) -> Option<HitResu
 /// Recursively hit-test a surface and its children at the given offset.
 /// Returns the specific surface key and its global offset if hit.
 fn hit_test_surface_tree(
-    state: &protocol::CompositorState,
+    state: &CompositorState,
     surface_key: ClientObjectId,
     offset_x: i32,
     offset_y: i32,
@@ -1843,7 +1849,7 @@ fn hit_test_surface_tree(
 }
 
 /// Get the pixel dimensions of a surface from its buffer (or viewport destination).
-fn surface_dimensions(state: &protocol::CompositorState, key: ClientObjectId) -> (i32, i32) {
+pub(crate) fn surface_dimensions(state: &CompositorState, key: ClientObjectId) -> (i32, i32) {
     let Some(surface) = state.surfaces.get(&key) else {
         return (0, 0);
     };

@@ -16,16 +16,13 @@
 //! Windows mapped while there is no output at all are held aside as unplaced
 //! and re-homed as soon as one appears.
 
-use super::protocol::state::ClientObjectId;
+use super::state::ClientObjectId;
 use crate::shared::{Output, OutputId};
 
-#[cfg(test)]
-mod tests;
-
 /// Where the first window on a workspace is placed, relative to its output.
-const CASCADE_START: i32 = 50;
+pub(crate) const CASCADE_START: i32 = 50;
 /// How far each subsequent window is offset from the last.
-const CASCADE_STEP: i32 = 50;
+pub(crate) const CASCADE_STEP: i32 = 50;
 
 /// A unique workspace id.
 ///

@@ -1,11 +1,11 @@
 //! Tests for the parts of the import path that need no GPU.
 //!
 //! The import itself is a driver call and is checked at runtime by
-//! [`super::DmabufImporter::self_test`] instead; what is unit-testable is the
+//! [`crate::backend::dmabuf_import::DmabufImporter::self_test`] instead; what is unit-testable is the
 //! reasoning around it — which is also where a mistake is silent rather than
 //! loud.
 
-use super::{advertisable_format, has_extension};
+use crate::backend::dmabuf_import::{advertisable_format, has_extension};
 use crate::shared::{
     DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_XRGB8888,
     dmabuf::{fourcc, fourcc_name},

@@ -14,10 +14,9 @@
 //! frame to say what the backend already has, so damage can be expressed
 //! against it.
 
-use super::protocol::CompositorState;
-use super::protocol::state::{Buffer, BufferKind, ClientObjectId, DefaultCursor};
 use super::protocol::wire_utils::f64_to_i32;
 use super::protocol::wl_shm::FORMAT_XRGB8888;
+use super::state::{Buffer, BufferKind, ClientObjectId, CompositorState, DefaultCursor};
 use crate::shared::{OUTPUT_MODE_CURRENT, Output, PoolMapping, output_contains, pixel_format};
 use crate::shared::{
     PixelFormat, Scene, SceneElement, TextureId, TextureImage, TextureSource, UploadPixels,
@@ -25,9 +24,6 @@ use crate::shared::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
-
-#[cfg(test)]
-mod tests;
 
 /// Number of bytes for representing one pixel
 const BYTES_PER_PIXEL: usize = 4;
@@ -272,7 +268,7 @@ fn ensure_image(
 /// Nothing is read and nothing is cached: the texture the backend builds from
 /// this samples the client's own memory, so a client drawing into it changes
 /// what is on screen without anything passing through here. That is also why
-/// the serial never moves — see [`crate::compositor::protocol::state::Buffer`].
+/// the serial never moves — see [`crate::compositor::state::Buffer`].
 fn imported_image(
     key: ClientObjectId,
     buffer: &Buffer,
@@ -413,7 +409,7 @@ fn repack_rows(
 /// The icon follows the pointer, offset by whatever the client attached it
 /// with. That offset is the only means a client has to position its icon — a
 /// toolkit centres one under the cursor by attaching at a negative dx and dy —
-/// which is why [`crate::compositor::protocol::state::Surface::offset`] is
+/// which is why [`crate::compositor::state::Surface::offset`] is
 /// tracked at all.
 ///
 /// Nothing has to be unwound when the drag ends: this reads `state.drag`, so
@@ -648,16 +644,12 @@ pub fn load_default_cursor() -> Option<DefaultCursor> {
 /// real information, but acting on it would mean splitting the quad along the
 /// region's edges, and one quad per window is what makes this renderer simple —
 /// so the useful case, a window that says all of it is opaque, is the one taken.
-fn surface_is_opaque(
-    surface: &crate::compositor::protocol::state::Surface,
-    width: i32,
-    height: i32,
-) -> bool {
+fn surface_is_opaque(surface: &crate::compositor::state::Surface, width: i32, height: i32) -> bool {
     let Some(region) = &surface.opaque_region else {
         return false;
     };
     region.iter().any(|rect| {
-        rect.op == crate::compositor::protocol::state::RegionOp::Add
+        rect.op == crate::compositor::state::RegionOp::Add
             && rect.x <= 0
             && rect.y <= 0
             && rect.x.saturating_add(rect.width) >= width

@@ -13,6 +13,8 @@ mod backend;
 mod compositor;
 mod config;
 mod shared;
+#[cfg(test)]
+mod tests;
 mod wayland_socket;
 
 /// Backend choices for compositor I/O

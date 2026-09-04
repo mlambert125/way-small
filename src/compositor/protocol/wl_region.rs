@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{CompositorState, RegionOp, RegionRect};
+use super::super::state::{CompositorState, RegionOp, RegionRect};
 use super::wire_utils::ArgReader;
 
 // Request opcodes

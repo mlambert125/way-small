@@ -34,9 +34,6 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tracing::debug;
 
-#[cfg(test)]
-mod tests;
-
 // EGL types, as the headers define them.
 type EGLDisplay = *const c_void;
 type EGLContext = *const c_void;
@@ -748,7 +745,7 @@ unsafe fn enumerate_modifiers(
 /// the driver named no modifiers, so the implicit layout is all there is, and
 /// that imports fine. "Nothing named" and "nothing usable" look alike and mean
 /// opposite things.
-fn advertisable_format(fourcc: u32, enumerated: &[(u64, bool)]) -> Option<DmabufFormat> {
+pub(crate) fn advertisable_format(fourcc: u32, enumerated: &[(u64, bool)]) -> Option<DmabufFormat> {
     if enumerated.is_empty() {
         return Some(DmabufFormat {
             fourcc,
@@ -795,6 +792,6 @@ unsafe fn load<T: Copy>(loader: &dyn Fn(&CStr) -> *const c_void, symbol: &CStr) 
 /// Substring matching would say yes to `EGL_EXT_image_dma_buf_import` for a
 /// driver offering only `EGL_EXT_image_dma_buf_import_modifiers`, which is a
 /// different extension with different entry points.
-fn has_extension(extensions: &str, wanted: &str) -> bool {
+pub(crate) fn has_extension(extensions: &str, wanted: &str) -> bool {
     extensions.split_whitespace().any(|e| e == wanted)
 }

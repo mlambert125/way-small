@@ -6,9 +6,9 @@
 use crate::compositor::protocol::ArgReader;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::next_serial;
-use super::state::CompositorState;
-use super::wire_utils::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, build_message};
 use crate::shared::ScrollSource;
 
 // Request opcodes
@@ -134,7 +134,7 @@ pub fn send_enter(
         .fixed(y)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, ENTER, args));
+        let _ = client.send(build_message(pointer_id, ENTER, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -145,7 +145,7 @@ pub fn send_leave(state: &mut CompositorState, client_id: u32, pointer_id: u32, 
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).u32(surface_id).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, LEAVE, args));
+        let _ = client.send(build_message(pointer_id, LEAVE, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -162,7 +162,7 @@ pub fn send_motion(
 ) {
     let args = ArgWriter::new().u32(time_ms).fixed(x).fixed(y).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, MOTION, args));
+        let _ = client.send(build_message(pointer_id, MOTION, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -193,7 +193,7 @@ pub fn send_button(
         .u32(btn_state)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, BUTTON, args));
+        let _ = client.send(build_message(pointer_id, BUTTON, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -211,7 +211,7 @@ pub fn send_axis(
 ) {
     let args = ArgWriter::new().u32(time_ms).u32(axis).fixed(value).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, AXIS, args));
+        let _ = client.send(build_message(pointer_id, AXIS, args));
     }
 }
 
@@ -220,7 +220,7 @@ pub fn send_frame(state: &mut CompositorState, client_id: u32, pointer_id: u32) 
     if let Some(client) = state.clients.get(client_id)
         && client.version(pointer_id) >= 5
     {
-        let _ = client.send(message(pointer_id, FRAME, Vec::new()));
+        let _ = client.send(build_message(pointer_id, FRAME, Vec::new()));
     }
 }
 
@@ -243,7 +243,7 @@ pub fn send_axis_source(
     if let Some(client) = state.clients.get(client_id)
         && client.version(pointer_id) >= AXIS_DETAIL_SINCE
     {
-        let _ = client.send(message(pointer_id, AXIS_SOURCE, args));
+        let _ = client.send(build_message(pointer_id, AXIS_SOURCE, args));
     }
 }
 
@@ -263,7 +263,7 @@ pub fn send_axis_stop(
     if let Some(client) = state.clients.get(client_id)
         && client.version(pointer_id) >= AXIS_DETAIL_SINCE
     {
-        let _ = client.send(message(pointer_id, AXIS_STOP, args));
+        let _ = client.send(build_message(pointer_id, AXIS_STOP, args));
     }
 }
 
@@ -304,6 +304,6 @@ pub fn send_axis_steps(
         )
     };
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(pointer_id, op_code, args));
+        let _ = client.send(build_message(pointer_id, op_code, args));
     }
 }

@@ -4,9 +4,10 @@
 //! nothing to fall back on if the compositor then refuses what it built. So
 //! what goes out here, and when, is worth pinning down.
 
-use super::{INTERFACE, VERSION, send_formats};
-use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter, message};
-use crate::compositor::protocol::{CompositorState, ObjectType, wl_registry};
+use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter, build_message};
+use crate::compositor::protocol::zwp_linux_dmabuf::{INTERFACE, VERSION, send_formats};
+use crate::compositor::protocol::{ObjectType, wl_registry};
+use crate::compositor::state::CompositorState;
 use crate::shared::dmabuf::fourcc;
 use crate::shared::{DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DmabufFormat};
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
@@ -225,11 +226,11 @@ fn creating_params_registers_an_object_to_describe_a_buffer_on() {
         .register(DMABUF, ObjectType::ZwpLinuxDmabuf)
         .unwrap();
 
-    super::handle(
+    crate::compositor::protocol::zwp_linux_dmabuf::handle(
         &mut state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,
-            message: message(DMABUF, 1, ArgWriter::new().u32(40).build()),
+            message: build_message(DMABUF, 1, ArgWriter::new().u32(40).build()),
         },
     );
 

@@ -16,8 +16,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::state::CompositorState;
 use super::wire_utils::ArgReader;
 
 /// The interface name, for the registry.

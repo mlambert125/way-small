@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use glow::HasContext;
 use tracing::{debug, warn};
 
-use super::dmabuf::{DmabufImporter, EglImage};
+use super::dmabuf_import::{DmabufImporter, EglImage};
 use crate::shared::{
     BACKGROUND_COLOR, DmabufFormat, DmabufProbe, Frame, PixelFormat, Scene, TextureId,
     TextureImage, TextureRect, TextureSource,
@@ -186,7 +186,7 @@ pub struct GlRenderer {
     textures: HashMap<TextureId, CachedTexture>,
     /// The dma-buf import path, if this driver has one. `None` means client
     /// GPU buffers cannot be drawn — nothing else changes.
-    dmabuf: Option<DmabufImporter>,
+    dmabuf_importer: Option<DmabufImporter>,
 }
 
 impl GlRenderer {
@@ -261,7 +261,7 @@ impl GlRenderer {
                 u_ignore_alpha,
                 u_swizzle,
                 textures: HashMap::new(),
-                dmabuf,
+                dmabuf_importer: dmabuf,
             })
         }
     }
@@ -274,7 +274,7 @@ impl GlRenderer {
     /// reports both to the compositor, which advertises dma-buf to clients only
     /// if there is something to advertise.
     pub fn dmabuf_support(&self) -> (Vec<DmabufFormat>, DmabufProbe) {
-        let Some(importer) = self.dmabuf.as_ref() else {
+        let Some(importer) = self.dmabuf_importer.as_ref() else {
             return (
                 Vec::new(),
                 DmabufProbe::Unsupported("no EGL dma-buf import path on this driver".into()),
@@ -298,7 +298,7 @@ impl GlRenderer {
     /// has to put to the driver before it can tell a client whether its buffer
     /// worked. The buffer is imported again for real when it is first drawn.
     pub fn verify_import(&self, image: &crate::shared::DmabufImage) -> bool {
-        self.dmabuf
+        self.dmabuf_importer
             .as_ref()
             .is_some_and(|importer| importer.import(image).is_ok())
     }
@@ -523,7 +523,7 @@ impl GlRenderer {
     /// alternative would be tearing down a client for its driver's answer.
     fn import(&mut self, image: &TextureImage) -> Option<glow::Texture> {
         let dmabuf = image.dmabuf()?;
-        let Some(importer) = self.dmabuf.as_ref() else {
+        let Some(importer) = self.dmabuf_importer.as_ref() else {
             warn!("no dma-buf import path: cannot draw texture {:?}", image.id);
             return None;
         };

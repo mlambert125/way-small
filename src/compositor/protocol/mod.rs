@@ -4,18 +4,12 @@
 //! constants (`ObjectType`, globals table, serial generation), and provides
 //! the top-level `handle_message()` dispatch.
 
+use super::state::CompositorState;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
-pub use client::ClientState;
-pub use state::CompositorState;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU32, Ordering};
-pub use wire_utils::{ArgReader, ArgWriter, message};
+pub use wire_utils::{ArgReader, ArgWriter, build_message};
 
-#[cfg(test)]
-mod tests;
-
-pub mod client;
-pub mod state;
 pub mod wire_utils;
 pub mod wl_buffer;
 pub mod wl_callback;
@@ -61,7 +55,7 @@ pub fn next_serial() -> u32 {
 }
 
 /// `wl_display.error` codes. Every one of them is fatal — see
-/// [`ClientState::send_error`].
+/// [`crate::compositor::state::ClientState::send_error`].
 ///
 /// The object named does not exist, or the client is not allowed to name it.
 pub const ERROR_INVALID_OBJECT: u32 = 0;

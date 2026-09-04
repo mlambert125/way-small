@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 use super::wire_utils::ArgReader;
 
 // Request opcodes
@@ -72,7 +72,7 @@ fn handle_set_position(state: &mut CompositorState, msg: &WaylandProtocolMessage
     if let Some(&surface_id) = state.subsurface_map.get(&(client_id, subsurface_id))
         && let Some(surface) = state.surfaces.get_mut(&(client_id, surface_id))
     {
-        surface.subsurface_position = super::state::clamp_surface_offset(x, y);
+        surface.subsurface_position = super::super::state::clamp_surface_offset(x, y);
         state.dirty = true;
     }
 }

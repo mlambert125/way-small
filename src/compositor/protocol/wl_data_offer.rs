@@ -16,13 +16,10 @@ use std::os::fd::OwnedFd;
 
 use tracing::debug;
 
-#[cfg(test)]
-mod tests;
-
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{ClientObjectId, CompositorState, OfferKind};
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::super::state::{ClientObjectId, CompositorState, OfferKind};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 use super::{wl_data_device_manager, wl_data_source};
 
 // Request opcodes
@@ -212,7 +209,7 @@ fn handle_set_actions(state: &mut CompositorState, msg: &WaylandProtocolMessageW
 pub fn send_offer(state: &mut CompositorState, offer: ClientObjectId, mime_type: &str) {
     let args = ArgWriter::new().string(mime_type).build();
     if let Some(client) = state.clients.get(offer.0) {
-        let _ = client.send(message(offer.1, OFFER, args));
+        let _ = client.send(build_message(offer.1, OFFER, args));
     }
 }
 
@@ -225,7 +222,7 @@ pub fn send_source_actions(state: &mut CompositorState, offer: ClientObjectId, a
     if let Some(client) = state.clients.get(offer.0)
         && client.version(offer.1) >= wl_data_source::ACTIONS_SINCE
     {
-        let _ = client.send(message(offer.1, SOURCE_ACTIONS, args));
+        let _ = client.send(build_message(offer.1, SOURCE_ACTIONS, args));
     }
 }
 
@@ -235,6 +232,6 @@ pub fn send_action(state: &mut CompositorState, offer: ClientObjectId, action: u
     if let Some(client) = state.clients.get(offer.0)
         && client.version(offer.1) >= wl_data_source::ACTIONS_SINCE
     {
-        let _ = client.send(message(offer.1, ACTION, args));
+        let _ = client.send(build_message(offer.1, ACTION, args));
     }
 }

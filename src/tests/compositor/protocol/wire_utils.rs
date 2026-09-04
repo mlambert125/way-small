@@ -1,7 +1,7 @@
 //! Tests for the wire format, and in particular for the one distinction it
 //! makes that is easy to write past: a null string is not an empty one.
 
-use super::{ArgReader, ArgWriter};
+use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter};
 
 #[test]
 fn a_null_string_is_not_an_empty_one() {

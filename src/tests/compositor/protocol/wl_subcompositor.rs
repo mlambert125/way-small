@@ -1,10 +1,10 @@
 //! Tests for `wl_subcompositor`: the shape of the surface tree a client is
 //! allowed to build.
 
-use super::handle;
-use crate::compositor::protocol::state::MAX_SURFACE_OFFSET;
 use crate::compositor::protocol::wire_utils::ArgWriter;
-use crate::compositor::protocol::{CompositorState, ObjectType};
+use crate::compositor::protocol::wl_subcompositor::handle;
+use crate::compositor::protocol::{ObjectType, wl_subsurface};
+use crate::compositor::state::{CompositorState, MAX_SURFACE_OFFSET};
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -94,7 +94,7 @@ fn a_wild_offset_is_brought_within_bounds() {
     let (mut state, _token) = state_with_two_surfaces();
     get_subsurface(&mut state, SUBSURFACE, CHILD, PARENT);
 
-    super::super::wl_subsurface::handle(
+    wl_subsurface::handle(
         &mut state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,

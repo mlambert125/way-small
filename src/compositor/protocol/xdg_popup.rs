@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::super::state::CompositorState;
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -89,7 +89,7 @@ pub fn send_configure(
         .i32(height)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(popup_id, CONFIGURE, args));
+        let _ = client.send(build_message(popup_id, CONFIGURE, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -99,7 +99,7 @@ pub fn send_configure(
 #[allow(dead_code)]
 pub fn send_popup_done(state: &mut CompositorState, client_id: u32, popup_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(popup_id, POPUP_DONE, Vec::new()));
+        let _ = client.send(build_message(popup_id, POPUP_DONE, Vec::new()));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }
@@ -155,7 +155,7 @@ fn handle_reposition(state: &mut CompositorState, msg: &WaylandProtocolMessageWi
         .map(|xdg| xdg.wl_surface_id)
         && let Some(surface) = state.surfaces.get_mut(&(client_id, wl_surface_id))
     {
-        surface.subsurface_position = super::state::clamp_surface_offset(x, y);
+        surface.subsurface_position = super::super::state::clamp_surface_offset(x, y);
     }
 
     send_repositioned(state, client_id, popup_id, token);
@@ -172,6 +172,6 @@ fn send_repositioned(state: &mut CompositorState, client_id: u32, popup_id: u32,
     if let Some(client) = state.clients.get(client_id)
         && client.version(popup_id) >= REPOSITION_SINCE
     {
-        let _ = client.send(message(popup_id, REPOSITIONED, args));
+        let _ = client.send(build_message(popup_id, REPOSITIONED, args));
     }
 }

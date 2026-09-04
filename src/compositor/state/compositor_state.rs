@@ -3,14 +3,14 @@
 //! `CompositorState` holds everything shared across all clients: the client
 //! collection, shm pools, buffers, surfaces, and (eventually) outputs, etc.
 
-use super::super::workspace::{Workspace, Workspaces};
-use super::client::Clients;
-use super::wire_utils::f64_to_i32;
-use super::wl_data_device_manager::{
+use super::super::protocol::wire_utils::f64_to_i32;
+use super::super::protocol::wl_data_device_manager::{
     DND_ACTION_ASK, DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_NONE,
 };
-use super::wl_pointer;
-use super::{wl_data_device, wl_data_offer, wl_data_source};
+use super::super::protocol::wl_pointer;
+use super::super::protocol::{wl_data_device, wl_data_offer, wl_data_source};
+use super::super::workspace::{Workspace, Workspaces};
+use super::client_state::Clients;
 use crate::shared::{
     BufferGuard, BufferTransform, DmabufImage, DmabufPlane, Output, OutputId, PoolMapping,
     TextureRect, cursor_bounds, output_contains,
@@ -21,9 +21,6 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use strum::FromRepr;
-
-#[cfg(test)]
-mod tests;
 
 /// The furthest a surface may sit from its parent, in either direction.
 ///
@@ -43,6 +40,19 @@ pub const MAX_SURFACE_OFFSET: i32 = 1 << 20;
 
 /// The most planes a buffer can have, per `zwp_linux_buffer_params_v1`.
 pub const MAX_DMABUF_PLANES: usize = 4;
+
+/// How long the visual bell stays on screen.
+///
+/// Long enough to be seen at a glance, short enough not to be in the way — a
+/// bell is an alert, and one that outstays it becomes an obstruction.
+const BELL_DURATION: Duration = Duration::from_millis(120);
+
+/// How many input serials are remembered per client for
+/// [`CompositorState::recent_input_serials`].
+///
+/// Long enough to cover any batch a client could reasonably be working through,
+/// short enough that a stale serial from minutes ago is not still honoured.
+const RECENT_INPUT_SERIALS: usize = 32;
 
 /// A client object-id tuple holding a `client_id` paired with an object id.  This pair
 /// is needed because object ids are only unique per client, so the `client_id` is paired
@@ -631,7 +641,7 @@ pub enum OfferKind {
 /// A `wl_data_offer`: the compositor's handle on a source, held by the receiver.
 ///
 /// The id is the compositor's rather than the client's — see
-/// [`super::client::ClientState::allocate_id`] — because the protocol has the
+/// [`super::client_state::ClientState::allocate_id`] — because the protocol has the
 /// compositor name it in `wl_data_device.data_offer`, and there is no round
 /// trip in which the client could name it instead.
 #[derive(Debug)]
@@ -864,19 +874,6 @@ pub struct CompositorState {
     pub recent_input_serials: HashMap<u32, VecDeque<u32>>,
 }
 
-/// How long the visual bell stays on screen.
-///
-/// Long enough to be seen at a glance, short enough not to be in the way — a
-/// bell is an alert, and one that outstays it becomes an obstruction.
-const BELL_DURATION: Duration = Duration::from_millis(120);
-
-/// How many input serials are remembered per client for
-/// [`CompositorState::recent_input_serials`].
-///
-/// Long enough to cover any batch a client could reasonably be working through,
-/// short enough that a stale serial from minutes ago is not still honoured.
-const RECENT_INPUT_SERIALS: usize = 32;
-
 /// Settle the action for a drag from the two sides' masks.
 ///
 /// Both sides name a set of actions they will allow, and the receiving side
@@ -897,7 +894,7 @@ fn resolve_action(
     offer_preferred: u32,
     offer_version: u32,
 ) -> u32 {
-    let actions_since = super::wl_data_source::ACTIONS_SINCE;
+    let actions_since = super::super::protocol::wl_data_source::ACTIONS_SINCE;
     let source_actions = if source_version >= actions_since {
         source_actions
     } else {
@@ -940,7 +937,7 @@ impl CompositorState {
             outputs: Vec::new(),
             output_global_names: HashMap::new(),
             output_bindings: HashMap::new(),
-            next_global_number: u32::try_from(super::GLOBALS.len()).unwrap_or(1),
+            next_global_number: u32::try_from(super::super::protocol::GLOBALS.len()).unwrap_or(1),
             pointers: Vec::new(),
             keyboards: Vec::new(),
             touches: Vec::new(),
@@ -986,7 +983,7 @@ impl CompositorState {
         }
     }
 
-    /// Flash an output, for [`super::xdg_system_bell`].
+    /// Flash an output, for [`super::super::protocol::xdg_system_bell`].
     pub fn ring_bell(&mut self, output_id: OutputId) {
         self.bell_until
             .insert(output_id, Instant::now() + BELL_DURATION);
@@ -1176,7 +1173,9 @@ impl CompositorState {
                 })
         };
 
-        Some(super::xdg_positioner::place(pos, available))
+        Some(super::super::protocol::xdg_positioner::place(
+            pos, available,
+        ))
     }
 
     /// The surface at the root of a subsurface or popup tree.
@@ -1360,7 +1359,7 @@ impl CompositorState {
             if fullscreen {
                 self.raise_with_children(toplevel);
             }
-            super::xdg_toplevel::configure(self, toplevel, size.0, size.1);
+            super::super::protocol::xdg_toplevel::configure(self, toplevel, size.0, size.1);
         } else {
             let restore = self.xdg_toplevels.get_mut(&toplevel).and_then(|t| {
                 t.maximized = false;
@@ -1377,7 +1376,7 @@ impl CompositorState {
             {
                 s.position = position;
             }
-            super::xdg_toplevel::configure(self, toplevel, size.0, size.1);
+            super::super::protocol::xdg_toplevel::configure(self, toplevel, size.0, size.1);
         }
         self.dirty = true;
         true

@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::super::state::CompositorState;
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 use super::{GLOBALS, ObjectType, wl_output, wl_seat, wl_shm, zwp_linux_dmabuf};
 use crate::shared::OutputId;
 
@@ -147,7 +147,10 @@ pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_i
             .string(global.interface)
             .u32(global.version)
             .build();
-        if client.send(message(registry_id, GLOBAL, args)).is_err() {
+        if client
+            .send(build_message(registry_id, GLOBAL, args))
+            .is_err()
+        {
             return;
         }
     }
@@ -160,7 +163,10 @@ pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_i
             .string(zwp_linux_dmabuf::INTERFACE)
             .u32(zwp_linux_dmabuf::VERSION)
             .build();
-        if client.send(message(registry_id, GLOBAL, args)).is_err() {
+        if client
+            .send(build_message(registry_id, GLOBAL, args))
+            .is_err()
+        {
             return;
         }
     }
@@ -172,7 +178,10 @@ pub fn advertise_globals(state: &mut CompositorState, client_id: u32, registry_i
             .string("wl_output")
             .u32(super::WL_OUTPUT_VERSION)
             .build();
-        if client.send(message(registry_id, GLOBAL, args)).is_err() {
+        if client
+            .send(build_message(registry_id, GLOBAL, args))
+            .is_err()
+        {
             return;
         }
     }
@@ -199,7 +208,7 @@ pub fn broadcast_global(
                     .string(interface)
                     .u32(version)
                     .build();
-                let _ = client.send(message(*obj_id, GLOBAL, args));
+                let _ = client.send(build_message(*obj_id, GLOBAL, args));
             }
         }
     }
@@ -221,7 +230,7 @@ pub fn broadcast_global_remove(state: &mut CompositorState, global_name: u32) {
         for (obj_id, obj_type) in &client.objects {
             if *obj_type == ObjectType::WlRegistry {
                 let args = ArgWriter::new().u32(global_name).build();
-                let _ = client.send(message(*obj_id, GLOBAL_REMOVE, args));
+                let _ = client.send(build_message(*obj_id, GLOBAL_REMOVE, args));
             }
         }
     }

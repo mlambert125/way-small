@@ -1,9 +1,8 @@
 //! Tests for `wl_surface` damage: mapping a commit's damage rectangles
 //! into the buffer pixels an upload can use.
 
-use super::committed_damage;
-use crate::compositor::protocol::CompositorState;
-use crate::compositor::protocol::state::ViewportState;
+use crate::compositor::protocol::wl_surface::committed_damage;
+use crate::compositor::state::{CompositorState, ViewportState};
 use crate::shared::TextureRect;
 
 const CLIENT: u32 = 1;

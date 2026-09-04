@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
+use super::super::state::{DataDeviceBinding, DataSource, DataSourceRole};
 use super::ObjectType;
-use super::state::CompositorState;
-use super::state::{DataDeviceBinding, DataSource, DataSourceRole};
 use super::wire_utils::ArgReader;
 use super::wl_data_device;
 

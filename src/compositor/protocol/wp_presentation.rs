@@ -9,9 +9,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // wp_presentation request opcodes
 const DESTROY: u16 = 0;
@@ -68,7 +68,7 @@ pub fn send_clock_id(state: &mut CompositorState, client_id: u32, object_id: u32
     // CLOCK_MONOTONIC = 1 on Linux
     let args = ArgWriter::new().u32(1).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(object_id, CLOCK_ID, args));
+        let _ = client.send(build_message(object_id, CLOCK_ID, args));
     } else {
         tracing::warn!("Received message from unknown client {}", client_id);
     }

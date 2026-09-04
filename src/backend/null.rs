@@ -19,9 +19,6 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-#[cfg(test)]
-mod tests;
-
 /// Run the null backend in a loop until stopped
 pub async fn run_null_backend(
     backend_sender: Sender<BackendMessage>,

@@ -6,10 +6,12 @@
 //! falling back to shm. Putting a case on the wrong side of that line either
 //! kills clients that did nothing wrong or lets a bad request through.
 
-use super::{ADD, CREATE, CREATE_IMMED, DESTROY, handle, resolve_import};
-use crate::compositor::protocol::state::BufferKind;
-use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter, message};
-use crate::compositor::protocol::{CompositorState, ObjectType, wl_display};
+use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter, build_message};
+use crate::compositor::protocol::zwp_linux_buffer_params::{
+    ADD, CREATE, CREATE_IMMED, DESTROY, handle, resolve_import,
+};
+use crate::compositor::protocol::{ObjectType, wl_display};
+use crate::compositor::state::{BufferKind, CompositorState};
 use crate::shared::dmabuf::fourcc;
 use crate::shared::{DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_INVALID, DmabufFormat};
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
@@ -51,7 +53,7 @@ fn state_with_params() -> (CompositorState, Receiver<WaylandProtocolMessage>) {
         .unwrap();
     state.dmabuf_params.insert(
         (CLIENT, PARAMS),
-        crate::compositor::protocol::state::BufferParams::default(),
+        crate::compositor::state::BufferParams::default(),
     );
     (state, rx)
 }
@@ -74,7 +76,7 @@ fn add_plane(state: &mut CompositorState, index: u32, stride: u32, modifier: u64
         state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,
-            message: message(
+            message: build_message(
                 PARAMS,
                 ADD,
                 ArgWriter::new()
@@ -102,7 +104,7 @@ fn create(state: &mut CompositorState, width: i32, height: i32, format: u32, fla
         state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,
-            message: message(
+            message: build_message(
                 PARAMS,
                 CREATE,
                 ArgWriter::new()
@@ -323,7 +325,7 @@ fn destroying_the_params_cancels_an_import_still_in_flight() {
     });
     state.pending_dmabuf_imports.insert(
         7,
-        crate::compositor::protocol::state::PendingImport {
+        crate::compositor::state::PendingImport {
             client_id: CLIENT,
             params_id: PARAMS,
             immediate: None,
@@ -337,7 +339,7 @@ fn destroying_the_params_cancels_an_import_still_in_flight() {
         &mut state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,
-            message: message(PARAMS, DESTROY, Vec::new()),
+            message: build_message(PARAMS, DESTROY, Vec::new()),
         },
         Vec::new(),
     );
@@ -365,7 +367,7 @@ fn a_buffer_the_driver_refuses_stays_an_object_the_client_still_owns() {
     });
     state.buffers.insert(
         (CLIENT, BUFFER),
-        crate::compositor::protocol::state::Buffer {
+        crate::compositor::state::Buffer {
             client_id: CLIENT,
             width: SIDE,
             height: SIDE,
@@ -375,7 +377,7 @@ fn a_buffer_the_driver_refuses_stays_an_object_the_client_still_owns() {
     );
     state.pending_dmabuf_imports.insert(
         7,
-        crate::compositor::protocol::state::PendingImport {
+        crate::compositor::state::PendingImport {
             client_id: CLIENT,
             params_id: PARAMS,
             immediate: Some((BUFFER, 42)),
@@ -415,7 +417,7 @@ fn a_verdict_for_a_buffer_id_since_reused_is_ignored() {
     // under the same id, which is legal once the id has been released.
     state.buffers.insert(
         (CLIENT, BUFFER),
-        crate::compositor::protocol::state::Buffer {
+        crate::compositor::state::Buffer {
             client_id: CLIENT,
             width: SIDE,
             height: SIDE,
@@ -425,7 +427,7 @@ fn a_verdict_for_a_buffer_id_since_reused_is_ignored() {
     );
     state.pending_dmabuf_imports.insert(
         7,
-        crate::compositor::protocol::state::PendingImport {
+        crate::compositor::state::PendingImport {
             client_id: CLIENT,
             params_id: PARAMS,
             immediate: Some((BUFFER, 42)),
@@ -455,7 +457,7 @@ fn a_created_buffer_is_named_from_the_compositors_half_of_the_id_space() {
     });
     state.pending_dmabuf_imports.insert(
         7,
-        crate::compositor::protocol::state::PendingImport {
+        crate::compositor::state::PendingImport {
             client_id: CLIENT,
             params_id: PARAMS,
             immediate: None,
@@ -475,7 +477,7 @@ fn a_created_buffer_is_named_from_the_compositors_half_of_the_id_space() {
     }
     let buffer_id = created.expect("the client should have been given a buffer");
     assert!(
-        crate::compositor::protocol::client::is_server_id(buffer_id),
+        crate::compositor::state::is_server_id(buffer_id),
         "a buffer the compositor names must not collide with the client's own ids"
     );
     assert!(state.buffers.contains_key(&(CLIENT, buffer_id)));
@@ -491,7 +493,7 @@ fn create_immed_registers_the_buffer_the_client_named() {
         &mut state,
         &WaylandProtocolMessageWithClientInfo {
             client_id: CLIENT,
-            message: message(
+            message: build_message(
                 PARAMS,
                 CREATE_IMMED,
                 ArgWriter::new()

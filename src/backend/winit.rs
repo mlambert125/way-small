@@ -8,10 +8,10 @@
 //! The GL context is created and made current on the winit thread and never
 //! leaves it, which is why compositing lives here rather than in the
 //! compositor task. The same EGL display is what client GPU buffers are
-//! imported through — see [`super::dmabuf`] — so a dma-buf a client hands over
+//! imported through — see [`super::dmabuf_import`] — so a dma-buf a client hands over
 //! is sampled by the same renderer, on the same thread, with no upload.
 
-use super::dmabuf::DmabufImporter;
+use super::dmabuf_import::DmabufImporter;
 use super::gl_renderer::GlRenderer;
 use crate::shared::{
     BackendMessage, BackendRequest, ButtonState, DmabufFormat, DmabufProbe, Frame, KeyState,
@@ -98,7 +98,7 @@ struct App {
     /// Cancellation token for this host to cancel the compositor at large
     /// when a window is closed, or an unrecoverable error occurs
     cancel_token: CancellationToken,
-    /// xkb_context and xkb_keymap must outlive xkb_state
+    /// `xkb_context` and `xkb_keymap` must outlive `xkb_state`
     #[allow(dead_code)]
     xkb_context: xkb::Context,
     /// XKB keyboard map for mapping winit keycodes to xkb keymaps

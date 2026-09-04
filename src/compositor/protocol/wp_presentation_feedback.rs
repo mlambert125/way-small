@@ -6,7 +6,7 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 
 // Event opcodes
 /// `sync_output(output: object<wl_output>)`. Optional, and never sent: it

@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{ClientObjectId, CompositorState, GrabKind, ResizeEdges};
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::super::state::{ClientObjectId, CompositorState, GrabKind, ResizeEdges};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -19,8 +19,8 @@ const SET_APP_ID: u16 = 3;
 const SHOW_WINDOW_MENU: u16 = 4;
 const MOVE: u16 = 5;
 const RESIZE: u16 = 6;
-const SET_MAX_SIZE: u16 = 7;
-const SET_MIN_SIZE: u16 = 8;
+pub(crate) const SET_MAX_SIZE: u16 = 7;
+pub(crate) const SET_MIN_SIZE: u16 = 8;
 const SET_MAXIMIZED: u16 = 9;
 const UNSET_MAXIMIZED: u16 = 10;
 const SET_FULLSCREEN: u16 = 11;
@@ -200,7 +200,7 @@ fn send_configure_bounds(state: &mut CompositorState, key: ClientObjectId) {
     if let Some(client) = state.clients.get(key.0)
         && client.version(key.1) >= CONFIGURE_BOUNDS_SINCE
     {
-        let _ = client.send(message(key.1, CONFIGURE_BOUNDS, args));
+        let _ = client.send(build_message(key.1, CONFIGURE_BOUNDS, args));
     }
 }
 
@@ -222,7 +222,7 @@ pub fn send_wm_capabilities(state: &mut CompositorState, client_id: u32, topleve
     if let Some(client) = state.clients.get(client_id)
         && client.version(toplevel_id) >= WM_CAPABILITIES_SINCE
     {
-        let _ = client.send(message(toplevel_id, WM_CAPABILITIES, args));
+        let _ = client.send(build_message(toplevel_id, WM_CAPABILITIES, args));
     }
 }
 
@@ -384,7 +384,7 @@ fn handle_resize(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 /// client could seize the pointer whenever it liked. The serial it quotes must
 /// be one we minted for a button press, and that button must still be down —
 /// a grab beginning after the user let go has nothing to follow.
-fn grab_target(
+pub(crate) fn grab_target(
     state: &CompositorState,
     client_id: u32,
     toplevel_id: u32,
@@ -512,7 +512,7 @@ fn send_configure_with_states(
         args = args.u32(s);
     }
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(toplevel_id, CONFIGURE, args.build()));
+        let _ = client.send(build_message(toplevel_id, CONFIGURE, args.build()));
     }
 }
 
@@ -531,7 +531,7 @@ pub fn xdg_ids_for_surface(
             return None;
         }
         match &xdg_surface.role {
-            Some(super::state::XdgRole::Toplevel(tid)) => Some((key.1, *tid)),
+            Some(super::super::state::XdgRole::Toplevel(tid)) => Some((key.1, *tid)),
             _ => None,
         }
     })
@@ -572,7 +572,11 @@ pub fn send_activated(
     let args = ArgWriter::new().u32(serial).build();
 
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(xdg_surface_id, super::xdg_surface::CONFIGURE, args));
+        let _ = client.send(build_message(
+            xdg_surface_id,
+            super::xdg_surface::CONFIGURE,
+            args,
+        ));
     }
 }
 
@@ -583,9 +587,6 @@ pub fn send_activated(
 /// toplevel, which tears the window down through the normal destroy path.
 pub fn send_close(state: &mut CompositorState, client_id: u32, toplevel_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(toplevel_id, CLOSE, Vec::new()));
+        let _ = client.send(build_message(toplevel_id, CLOSE, Vec::new()));
     }
 }
-
-#[cfg(test)]
-mod tests;

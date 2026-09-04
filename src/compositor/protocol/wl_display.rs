@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::{ArgReader, ArgWriter, ObjectType, message, next_serial, wl_registry};
+use super::super::state::CompositorState;
+use super::{ArgReader, ArgWriter, ObjectType, build_message, next_serial, wl_registry};
 
 // The wl_display global is always object id 1 for every client.
 pub const OBJECT_ID: u32 = 1;
@@ -38,7 +38,10 @@ pub fn handle(state: &mut CompositorState, msg: &WaylandProtocolMessageWithClien
     }
 }
 
-fn handle_sync(state: &mut super::ClientState, msg: &WaylandProtocolMessageWithClientInfo) {
+fn handle_sync(
+    state: &mut super::super::state::ClientState,
+    msg: &WaylandProtocolMessageWithClientInfo,
+) {
     let Some(callback_id) = ArgReader::new(&msg.message.args).new_id() else {
         state.send_error(OBJECT_ID, 0, "wl_display.sync: missing callback id");
         return;
@@ -52,7 +55,7 @@ fn handle_sync(state: &mut super::ClientState, msg: &WaylandProtocolMessageWithC
     let serial = next_serial();
     let args = ArgWriter::new().u32(serial).build();
     if state
-        .send(message(callback_id, WL_CALLBACK_DONE, args))
+        .send(build_message(callback_id, WL_CALLBACK_DONE, args))
         .is_err()
     {
         return;

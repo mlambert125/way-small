@@ -4,8 +4,8 @@
 //! `ObjectType)` and a channel sender for pushing events back to the client.
 //! The Clients struct manages the collection of all active client states.
 
-use super::wire_utils::{ArgWriter, message};
-use super::{ObjectType, wl_display};
+use super::super::protocol::wire_utils::{ArgWriter, build_message};
+use super::super::protocol::{ObjectType, wl_display};
 use crate::wayland_socket::{CLIENT_SEND_QUEUE_LIMIT, WaylandProtocolMessage};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::OwnedFd;
@@ -157,7 +157,7 @@ impl ClientState {
             return;
         }
         let args = ArgWriter::new().u32(id).build();
-        let _ = self.send(message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args));
+        let _ = self.send(build_message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args));
     }
 
     /// Queue a message for delivery to this client's wayland socket
@@ -217,7 +217,7 @@ impl ClientState {
             .u32(code)
             .string(msg)
             .build();
-        let _ = self.send(message(wl_display::OBJECT_ID, wl_display::ERROR, args));
+        let _ = self.send(build_message(wl_display::OBJECT_ID, wl_display::ERROR, args));
         self.cancel_token.cancel();
     }
 }

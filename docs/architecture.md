@@ -57,7 +57,7 @@ src/
     workspace.rs     outputs, their workspaces, and the windows on them
     protocol/        request dispatch and all compositor state
   backend/           each backend, and the GL renderer they share
-    dmabuf.rs        importing client GPU buffers through EGL
+    dmabuf_import.rs importing client GPU buffers through EGL
 ```
 
 Every subsystem is a folder with a `mod.rs`, whether or not it has grown a second file yet.

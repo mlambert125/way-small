@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -170,7 +170,7 @@ fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     if let (Some(popup_wl), Some(parent_wl)) = (popup_wl_surface, parent_wl_surface) {
         if let Some(surface) = state.surfaces.get_mut(&(client_id, popup_wl)) {
             surface.parent = Some(parent_wl);
-            surface.subsurface_position = super::state::clamp_surface_offset(x, y);
+            surface.subsurface_position = super::super::state::clamp_surface_offset(x, y);
         }
         if let Some(parent) = state.surfaces.get_mut(&(client_id, parent_wl)) {
             parent.children.push(popup_wl);
@@ -187,7 +187,7 @@ fn handle_get_popup(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
         tracing::warn!("Received message from unknown client {}", msg.client_id);
         return;
     };
-    let _ = client.send(message(xdg_surface_id, CONFIGURE, configure_args));
+    let _ = client.send(build_message(xdg_surface_id, CONFIGURE, configure_args));
 }
 
 fn handle_set_window_geometry(
@@ -236,6 +236,6 @@ pub fn send_configure(
 ) {
     let args = ArgWriter::new().u32(serial).build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(xdg_surface_id, CONFIGURE, args));
+        let _ = client.send(build_message(xdg_surface_id, CONFIGURE, args));
     }
 }

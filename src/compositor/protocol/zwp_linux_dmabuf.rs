@@ -24,9 +24,9 @@ use tracing::debug;
 use crate::shared::{DRM_FORMAT_MOD_INVALID, DmabufFormat};
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::{BufferParams, CompositorState};
 use super::ObjectType;
-use super::state::{BufferParams, CompositorState};
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 /// The interface name, as it goes out in `wl_registry.global`.
 pub const INTERFACE: &str = "zwp_linux_dmabuf_v1";
@@ -129,7 +129,7 @@ pub fn send_formats(state: &mut CompositorState, client_id: u32, dmabuf_id: u32)
             // All an old client can be told is that the format works; which
             // layouts do is not expressible before version 3.
             let args = ArgWriter::new().u32(format.fourcc).build();
-            if client.send(message(dmabuf_id, FORMAT, args)).is_err() {
+            if client.send(build_message(dmabuf_id, FORMAT, args)).is_err() {
                 return;
             }
             continue;
@@ -141,7 +141,10 @@ pub fn send_formats(state: &mut CompositorState, client_id: u32, dmabuf_id: u32)
                 .u32(u32::try_from(modifier >> 32).unwrap_or(0))
                 .u32(u32::try_from(modifier & 0xffff_ffff).unwrap_or(0))
                 .build();
-            if client.send(message(dmabuf_id, MODIFIER, args)).is_err() {
+            if client
+                .send(build_message(dmabuf_id, MODIFIER, args))
+                .is_err()
+            {
                 return;
             }
         }
@@ -161,6 +164,3 @@ fn advertised_modifiers(format: &DmabufFormat) -> impl Iterator<Item = u64> {
         .copied()
         .chain(std::iter::once(DRM_FORMAT_MOD_INVALID))
 }
-
-#[cfg(test)]
-mod tests;

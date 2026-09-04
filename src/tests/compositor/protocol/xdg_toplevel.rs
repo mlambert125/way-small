@@ -1,9 +1,9 @@
 //! Tests for `xdg_toplevel`: size hints, and who is entitled to start an
 //! interactive move or resize.
 
-use super::{SET_MAX_SIZE, SET_MIN_SIZE, grab_target, handle};
-use crate::compositor::protocol::CompositorState;
 use crate::compositor::protocol::wire_utils::ArgWriter;
+use crate::compositor::protocol::xdg_toplevel::{SET_MAX_SIZE, SET_MIN_SIZE, grab_target, handle};
+use crate::compositor::state::CompositorState;
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
 
 const CLIENT: u32 = 1;

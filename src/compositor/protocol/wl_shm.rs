@@ -10,10 +10,10 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::ClientState;
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::client::ClientState;
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 pub const CREATE_POOL: u16 = 0;
@@ -102,7 +102,7 @@ fn handle_create_pool(
 pub fn send_formats(client: &mut ClientState, shm_id: u32) {
     for &fmt in &[FORMAT_ARGB8888, FORMAT_XRGB8888] {
         let args = ArgWriter::new().u32(fmt).build();
-        if client.send(message(shm_id, FORMAT, args)).is_err() {
+        if client.send(build_message(shm_id, FORMAT, args)).is_err() {
             return;
         }
     }

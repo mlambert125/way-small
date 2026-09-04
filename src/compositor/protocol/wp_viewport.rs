@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 use super::wire_utils::ArgReader;
 
 // wp_viewport request opcodes

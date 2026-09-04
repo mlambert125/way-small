@@ -2,9 +2,8 @@
 //! become a quad, which output a window is drawn on, and how damage is
 //! carried to the backend.
 
-use super::{SceneCache, build};
-use crate::compositor::protocol::CompositorState;
-use crate::compositor::protocol::state::ViewportState;
+use crate::compositor::scene::{SceneCache, build};
+use crate::compositor::state::{CompositorState, ViewportState};
 use crate::shared::{
     OUTPUT_MODE_CURRENT, Output, OutputGeometry, OutputId, OutputMode, OutputSubpixel,
     OutputTransform,

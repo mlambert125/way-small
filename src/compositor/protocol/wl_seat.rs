@@ -8,9 +8,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const GET_POINTER: u16 = 0;
@@ -65,7 +65,7 @@ fn handle_get_pointer(state: &mut CompositorState, msg: &WaylandProtocolMessageW
     {
         return;
     }
-    state.pointers.push(super::state::PointerBinding {
+    state.pointers.push(super::super::state::PointerBinding {
         client_id: msg.client_id,
         object_id: pointer_id,
     });
@@ -101,7 +101,7 @@ fn handle_get_touch(state: &mut CompositorState, msg: &WaylandProtocolMessageWit
     {
         return;
     }
-    state.touches.push(super::state::TouchBinding {
+    state.touches.push(super::super::state::TouchBinding {
         client_id: msg.client_id,
         object_id: touch_id,
     });
@@ -132,7 +132,7 @@ fn handle_get_keyboard(state: &mut CompositorState, msg: &WaylandProtocolMessage
     {
         return;
     }
-    state.keyboards.push(super::state::KeyboardBinding {
+    state.keyboards.push(super::super::state::KeyboardBinding {
         client_id: msg.client_id,
         object_id: keyboard_id,
     });
@@ -159,10 +159,10 @@ pub fn send_seat_info(state: &mut CompositorState, client_id: u32, seat_id: u32)
     }
 
     let args = ArgWriter::new().u32(caps).build();
-    let _ = client.send(message(seat_id, CAPABILITIES, args));
+    let _ = client.send(build_message(seat_id, CAPABILITIES, args));
 
     let args = ArgWriter::new().string("default").build();
-    let _ = client.send(message(seat_id, NAME, args));
+    let _ = client.send(build_message(seat_id, NAME, args));
 }
 
 /// Tell every client that has bound the seat what it can now do.

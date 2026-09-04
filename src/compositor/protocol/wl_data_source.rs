@@ -11,8 +11,8 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::{ClientObjectId, CompositorState};
-use super::wire_utils::{ArgReader, ArgWriter, message, message_with_fds};
+use super::super::state::{ClientObjectId, CompositorState};
+use super::wire_utils::{ArgReader, ArgWriter, build_message, build_message_with_fds};
 use super::wl_data_device_manager;
 
 // Request opcodes
@@ -116,7 +116,7 @@ fn handle_set_actions(state: &mut CompositorState, msg: &WaylandProtocolMessageW
 pub fn send_target(state: &mut CompositorState, source: ClientObjectId, mime_type: Option<&str>) {
     let args = ArgWriter::new().string_or_null(mime_type).build();
     if let Some(client) = state.clients.get(source.0) {
-        let _ = client.send(message(source.1, TARGET, args));
+        let _ = client.send(build_message(source.1, TARGET, args));
     }
 }
 
@@ -135,7 +135,7 @@ pub fn send_send(
 ) {
     let args = ArgWriter::new().string(mime_type).build();
     if let Some(client) = state.clients.get(source.0) {
-        let _ = client.send(message_with_fds(source.1, SEND, args, vec![fd]));
+        let _ = client.send(build_message_with_fds(source.1, SEND, args, vec![fd]));
     }
 }
 
@@ -145,7 +145,7 @@ pub fn send_send(
 /// the compositor can no longer make good on the source for any other reason.
 pub fn send_cancelled(state: &mut CompositorState, source: ClientObjectId) {
     if let Some(client) = state.clients.get(source.0) {
-        let _ = client.send(message(source.1, CANCELLED, Vec::new()));
+        let _ = client.send(build_message(source.1, CANCELLED, Vec::new()));
     }
 }
 
@@ -156,7 +156,7 @@ pub fn send_dnd_drop_performed(state: &mut CompositorState, source: ClientObject
     if let Some(client) = state.clients.get(source.0)
         && client.version(source.1) >= ACTIONS_SINCE
     {
-        let _ = client.send(message(source.1, DND_DROP_PERFORMED, Vec::new()));
+        let _ = client.send(build_message(source.1, DND_DROP_PERFORMED, Vec::new()));
     }
 }
 
@@ -168,7 +168,7 @@ pub fn send_dnd_finished(state: &mut CompositorState, source: ClientObjectId) {
     if let Some(client) = state.clients.get(source.0)
         && client.version(source.1) >= ACTIONS_SINCE
     {
-        let _ = client.send(message(source.1, DND_FINISHED, Vec::new()));
+        let _ = client.send(build_message(source.1, DND_FINISHED, Vec::new()));
     }
 }
 
@@ -179,6 +179,6 @@ pub fn send_action(state: &mut CompositorState, source: ClientObjectId, action: 
     if let Some(client) = state.clients.get(source.0)
         && client.version(source.1) >= ACTIONS_SINCE
     {
-        let _ = client.send(message(source.1, ACTION, args));
+        let _ = client.send(build_message(source.1, ACTION, args));
     }
 }

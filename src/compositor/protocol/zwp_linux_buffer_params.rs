@@ -20,12 +20,12 @@
 //! `failed` event, because only the second is something a client can recover
 //! from.
 
-use super::ObjectType;
-use super::state::{
+use super::super::state::{
     Buffer, BufferKind, ClientObjectId, CompositorState, MAX_DMABUF_PLANES, PendingImport,
     PendingPlane,
 };
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::ObjectType;
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 use crate::shared::{
     BackendRequest, DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR, DmabufImage, DmabufPlane,
 };
@@ -34,15 +34,12 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use tracing::debug;
 
-#[cfg(test)]
-mod tests;
-
 // Request opcodes
-const DESTROY: u16 = 0;
+pub(crate) const DESTROY: u16 = 0;
 /// Carries a file descriptor — see `super::request_fd_count`.
 pub const ADD: u16 = 1;
-const CREATE: u16 = 2;
-const CREATE_IMMED: u16 = 3;
+pub(crate) const CREATE: u16 = 2;
+pub(crate) const CREATE_IMMED: u16 = 3;
 
 // Event opcodes
 const CREATED: u16 = 0;
@@ -492,7 +489,7 @@ fn send_failed(state: &mut CompositorState, key: ClientObjectId) {
         return;
     }
     if let Some(client) = state.clients.get(key.0) {
-        let _ = client.send(message(key.1, FAILED, Vec::new()));
+        let _ = client.send(build_message(key.1, FAILED, Vec::new()));
     }
 }
 
@@ -565,7 +562,7 @@ pub fn resolve_import(state: &mut CompositorState, token: u64, imported: bool) {
         return;
     };
     let args = ArgWriter::new().u32(buffer_id).build();
-    let _ = client.send(message(pending.params_id, CREATED, args));
+    let _ = client.send(build_message(pending.params_id, CREATED, args));
     register_dmabuf(
         state,
         pending.client_id,
@@ -581,7 +578,7 @@ pub fn resolve_import(state: &mut CompositorState, token: u64, imported: bool) {
 /// Logged as well as sent: this disconnects the client, and a client that
 /// vanishes with no explanation on either side is the hardest kind of bug to
 /// find from the outside.
-fn fatal(client: &super::client::ClientState, object_id: u32, code: u32, reason: &str) {
+fn fatal(client: &super::super::state::ClientState, object_id: u32, code: u32, reason: &str) {
     tracing::warn!("zwp_linux_buffer_params_v1 error {code} on object {object_id}: {reason}");
     client.send_error(object_id, code, reason);
     client.cancel_token.cancel();

@@ -1,9 +1,9 @@
 //! Tests for the clipboard: who is offered the selection, when, and what they
 //! are sent.
 
-use super::super::state::{CompositorState, DataSourceRole, OfferKind};
-use super::super::wire_utils::{ArgReader, ArgWriter};
-use super::super::{ObjectType, handle_message};
+use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter};
+use crate::compositor::protocol::{ObjectType, handle_message, wl_data_device, wl_data_source};
+use crate::compositor::state::{CompositorState, DataSourceRole, OfferKind};
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -126,11 +126,11 @@ fn the_focused_client_is_offered_the_selection_in_order() {
     assert_eq!(sent.len(), 3);
     assert_eq!(
         (sent[0].object_id, sent[0].op_code),
-        (DEVICE, super::DATA_OFFER)
+        (DEVICE, wl_data_device::DATA_OFFER)
     );
     let offer_id = ArgReader::new(&sent[0].args).u32().unwrap();
     assert!(
-        offer_id >= super::super::client::SERVER_ID_BASE,
+        offer_id >= crate::compositor::state::SERVER_ID_BASE,
         "the compositor names the offer, so the id is from its own half"
     );
 
@@ -142,7 +142,7 @@ fn the_focused_client_is_offered_the_selection_in_order() {
 
     assert_eq!(
         (sent[2].object_id, sent[2].op_code),
-        (DEVICE, super::SELECTION)
+        (DEVICE, wl_data_device::SELECTION)
     );
     assert_eq!(ArgReader::new(&sent[2].args).u32().unwrap(), offer_id);
 }
@@ -161,7 +161,8 @@ fn a_client_is_offered_its_own_selection_back() {
     let sent = drain(&mut rx);
     assert!(
         sent.iter()
-            .any(|m| m.op_code == super::SELECTION && ArgReader::new(&m.args).u32() != Some(0)),
+            .any(|m| m.op_code == wl_data_device::SELECTION
+                && ArgReader::new(&m.args).u32() != Some(0)),
         "the owner should still be offered a readable selection"
     );
 }
@@ -201,7 +202,7 @@ fn a_client_binding_a_device_while_focused_is_offered_the_selection_at_once() {
     let sent = drain(&mut late_rx);
     assert!(
         sent.iter()
-            .any(|m| m.object_id == DEVICE + 1 && m.op_code == super::SELECTION),
+            .any(|m| m.object_id == DEVICE + 1 && m.op_code == wl_data_device::SELECTION),
         "the new device should be told what is on the clipboard: {sent:?}",
     );
 }
@@ -227,7 +228,7 @@ fn a_null_source_clears_the_clipboard() {
     let selection = sent
         .iter()
         .rev()
-        .find(|m| m.op_code == super::SELECTION)
+        .find(|m| m.op_code == wl_data_device::SELECTION)
         .expect("a null selection should be sent");
     assert_eq!(ArgReader::new(&selection.args).u32(), Some(0));
 }
@@ -259,7 +260,7 @@ fn replacing_the_selection_cancels_the_source_it_displaced() {
     let sent = drain(&mut rx);
     assert!(
         sent.iter()
-            .any(|m| m.object_id == SOURCE && m.op_code == super::super::wl_data_source::CANCELLED),
+            .any(|m| m.object_id == SOURCE && m.op_code == wl_data_source::CANCELLED),
         "the displaced source should be cancelled: {sent:?}",
     );
 }

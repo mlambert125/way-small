@@ -1,7 +1,7 @@
 //! Tests for compositor state: region arithmetic, and the defences that
 //! keep a client from taking the compositor down with its shm pool.
 
-use super::PoolMapping;
+use crate::shared::PoolMapping;
 use crate::shared::patched_pages;
 use std::os::unix::io::RawFd;
 
@@ -76,7 +76,7 @@ fn truncating_an_unsealable_pool_blanks_it_rather_than_killing_us() {
     drop(mapping);
     unsafe { libc::close(fd) };
 }
-use super::{RegionOp, RegionRect, region_contains};
+use crate::compositor::state::{RegionOp, RegionRect, region_contains};
 
 fn r(op: RegionOp, x: i32, y: i32, width: i32, height: i32) -> RegionRect {
     RegionRect {
@@ -136,8 +136,8 @@ mod cursor {
     // `f64` represents without loss.
     #![allow(clippy::float_cmp)]
 
-    use crate::compositor::protocol::CompositorState;
     use crate::compositor::protocol::wire_utils::f64_to_i32;
+    use crate::compositor::state::CompositorState;
     use crate::shared::{
         OUTPUT_MODE_CURRENT, Output, OutputGeometry, OutputId, OutputMode, OutputSubpixel,
         OutputTransform,
@@ -254,7 +254,7 @@ mod cursor {
 /// A disconnecting client must take its pools with it.
 mod disconnect {
     use super::pool_file;
-    use crate::compositor::protocol::CompositorState;
+    use crate::compositor::state::CompositorState;
 
     const CLIENT: u32 = 1;
     const POOL: u32 = 100;
@@ -285,7 +285,9 @@ mod disconnect {
 
 // -- The data protocols ------------------------------------------------------
 
-use super::{CompositorState, DataDeviceBinding, DataOffer, DataSource, DataSourceRole, OfferKind};
+use crate::compositor::state::{
+    CompositorState, DataDeviceBinding, DataOffer, DataSource, DataSourceRole, OfferKind,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::channel;

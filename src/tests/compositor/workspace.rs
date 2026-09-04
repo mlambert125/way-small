@@ -2,8 +2,8 @@
 //! exist, which window is in which, and what happens to the windows of an
 //! output that goes away.
 
-use super::{CASCADE_START, CASCADE_STEP, Workspaces};
-use crate::compositor::protocol::state::ClientObjectId;
+use crate::compositor::state::ClientObjectId;
+use crate::compositor::workspace::{CASCADE_START, CASCADE_STEP, Workspaces};
 use crate::shared::{
     OUTPUT_MODE_CURRENT, Output, OutputGeometry, OutputId, OutputMode, OutputSubpixel,
     OutputTransform,

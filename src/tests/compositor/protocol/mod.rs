@@ -1,8 +1,18 @@
 //! Tests for request dispatch: what happens to a client that sends something
 //! the compositor cannot make sense of.
 
-use super::{CompositorState, handle_message};
+mod wire_utils;
+mod wl_data_device;
+mod wl_data_offer;
+mod wl_subcompositor;
+mod wl_surface;
+mod xdg_toplevel;
+mod zwp_linux_buffer_params;
+mod zwp_linux_dmabuf;
+
+use crate::compositor::protocol::handle_message;
 use crate::compositor::protocol::wire_utils::ArgWriter;
+use crate::compositor::state::CompositorState;
 use crate::wayland_socket::{WaylandProtocolMessage, WaylandProtocolMessageWithClientInfo};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -35,7 +45,7 @@ fn client_with_a_surface() -> (
         .clients
         .get(CLIENT)
         .unwrap()
-        .register(SURFACE, super::ObjectType::WlSurface)
+        .register(SURFACE, crate::compositor::protocol::ObjectType::WlSurface)
         .unwrap();
     (state, token, rx)
 }
@@ -58,7 +68,8 @@ fn deliver(state: &mut CompositorState, object_id: u32, op_code: u16, args: Vec<
 /// Whether the client was sent a `wl_display.error`.
 fn was_sent_an_error(rx: &mut Receiver<WaylandProtocolMessage>) -> bool {
     std::iter::from_fn(|| rx.try_recv().ok()).any(|m| {
-        m.object_id == super::wl_display::OBJECT_ID && m.op_code == super::wl_display::ERROR
+        m.object_id == crate::compositor::protocol::wl_display::OBJECT_ID
+            && m.op_code == crate::compositor::protocol::wl_display::ERROR
     })
 }
 
@@ -96,7 +107,10 @@ fn a_request_that_is_merely_unimplemented_is_not_fatal() {
         .clients
         .get(CLIENT)
         .unwrap()
-        .register(POSITIONER, super::ObjectType::XdgPositioner)
+        .register(
+            POSITIONER,
+            crate::compositor::protocol::ObjectType::XdgPositioner,
+        )
         .unwrap();
 
     // `set_reactive` is part of the xdg_wm_base version this compositor

@@ -8,9 +8,9 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::next_serial;
-use super::state::CompositorState;
-use super::wire_utils::{ArgWriter, message};
+use super::wire_utils::{ArgWriter, build_message};
 
 // Request opcodes
 const RELEASE: u16 = 0;
@@ -79,7 +79,7 @@ pub fn send_down(
         .fixed(y)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(touch_id, DOWN, args));
+        let _ = client.send(build_message(touch_id, DOWN, args));
     }
 }
 
@@ -99,7 +99,7 @@ pub fn send_up(
         .i32(point_id)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(touch_id, UP, args));
+        let _ = client.send(build_message(touch_id, UP, args));
     }
 }
 
@@ -120,7 +120,7 @@ pub fn send_motion(
         .fixed(y)
         .build();
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(touch_id, MOTION, args));
+        let _ = client.send(build_message(touch_id, MOTION, args));
     }
 }
 
@@ -132,7 +132,7 @@ pub fn send_motion(
 /// consistent.
 pub fn send_frame(state: &mut CompositorState, client_id: u32, touch_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(touch_id, FRAME, Vec::new()));
+        let _ = client.send(build_message(touch_id, FRAME, Vec::new()));
     }
 }
 
@@ -143,6 +143,6 @@ pub fn send_frame(state: &mut CompositorState, client_id: u32, touch_id: u32) {
 /// — a gesture recogniser, or the compositor — has taken the sequence over.
 pub fn send_cancel(state: &mut CompositorState, client_id: u32, touch_id: u32) {
     if let Some(client) = state.clients.get(client_id) {
-        let _ = client.send(message(touch_id, CANCEL, Vec::new()));
+        let _ = client.send(build_message(touch_id, CANCEL, Vec::new()));
     }
 }

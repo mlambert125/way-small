@@ -1,14 +1,15 @@
 //! Tests for the receiving end: the descriptor relay that is the whole of a
 //! transfer, and the action negotiation that decides what a drop means.
 
-use super::super::state::{CompositorState, DataOffer, OfferKind};
-use super::super::wire_utils::{ArgReader, ArgWriter};
-use super::super::wl_data_device::tests::{
-    DEVICE, SOURCE, SURFACE, add_data_client, deliver, drain, offer_selection,
+use super::wl_data_device::{
+    DEVICE, MANAGER, SOURCE, SURFACE, add_data_client, deliver, drain, offer_selection,
 };
-use super::super::wl_data_device_manager::{
+use crate::compositor::protocol::wire_utils::{ArgReader, ArgWriter};
+use crate::compositor::protocol::wl_data_device_manager::{
     DND_ACTION_ASK, DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_NONE,
 };
+use crate::compositor::protocol::{wl_data_device, wl_data_source, wl_display};
+use crate::compositor::state::{CompositorState, DataOffer, OfferKind};
 use crate::wayland_socket::WaylandProtocolMessage;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -18,7 +19,7 @@ use tokio::sync::mpsc::Receiver;
 fn offer_id_from(sent: &[WaylandProtocolMessage]) -> u32 {
     let data_offer = sent
         .iter()
-        .find(|m| m.object_id == DEVICE && m.op_code == super::super::wl_data_device::DATA_OFFER)
+        .find(|m| m.object_id == DEVICE && m.op_code == wl_data_device::DATA_OFFER)
         .expect("a data_offer event");
     ArgReader::new(&data_offer.args).u32().unwrap()
 }
@@ -68,7 +69,7 @@ fn receive(state: &mut CompositorState, client_id: u32, offer: u32, mime: &str) 
         state,
         client_id,
         offer,
-        super::RECEIVE,
+        crate::compositor::protocol::wl_data_offer::RECEIVE,
         ArgWriter::new().string(mime).build(),
     );
     read_end
@@ -83,7 +84,7 @@ fn receive_hands_the_pipe_to_the_source_and_the_clients_talk_directly() {
     let sent = drain(&mut owner_rx);
     let asked = sent
         .iter()
-        .find(|m| m.object_id == SOURCE && m.op_code == super::super::wl_data_source::SEND)
+        .find(|m| m.object_id == SOURCE && m.op_code == wl_data_source::SEND)
         .expect("the source should be asked to send");
     assert_eq!(
         ArgReader::new(&asked.args).string().unwrap(),
@@ -97,7 +98,7 @@ fn receive_hands_the_pipe_to_the_source_and_the_clients_talk_directly() {
     let mut relayed = sent;
     let write_end = relayed
         .iter_mut()
-        .find(|m| m.op_code == super::super::wl_data_source::SEND)
+        .find(|m| m.op_code == wl_data_source::SEND)
         .and_then(|m| m.fds.pop())
         .expect("the relayed descriptor");
     let mut writer = std::fs::File::from(write_end);
@@ -165,8 +166,7 @@ fn an_offer_the_compositor_has_forgotten_can_still_be_destroyed() {
     assert!(
         !sent
             .iter()
-            .any(|m| m.object_id == super::super::wl_display::OBJECT_ID
-                && m.op_code == super::super::wl_display::ERROR),
+            .any(|m| m.object_id == wl_display::OBJECT_ID && m.op_code == wl_display::ERROR),
         "destroying a forgotten offer is not an error: {sent:?}",
     );
     assert!(!state.data_offers.contains_key(&(2, offer)));
@@ -181,7 +181,7 @@ fn drag_offer(source_actions: u32, offer_actions: u32, preferred: u32) -> (Compo
     deliver(
         &mut state,
         1,
-        super::super::wl_data_device::tests::MANAGER,
+        MANAGER,
         0,
         ArgWriter::new().u32(SOURCE).build(),
     );
@@ -200,7 +200,7 @@ fn drag_offer(source_actions: u32, offer_actions: u32, preferred: u32) -> (Compo
         .clients
         .get(2)
         .unwrap()
-        .allocate_id_with_version(super::super::ObjectType::WlDataOffer, 3)
+        .allocate_id_with_version(crate::compositor::protocol::ObjectType::WlDataOffer, 3)
         .unwrap();
     state.data_offers.insert(
         (2, offer_id),
@@ -269,7 +269,7 @@ fn an_action_mask_with_undefined_bits_disconnects_the_client() {
     deliver(
         &mut state,
         1,
-        super::super::wl_data_device::tests::MANAGER,
+        MANAGER,
         0,
         ArgWriter::new().u32(SOURCE).build(),
     );
@@ -329,8 +329,7 @@ fn finish_after_a_drop_tells_the_source_it_is_done() {
     let sent = drain(&mut owner_rx);
     assert!(
         sent.iter()
-            .any(|m| m.object_id == SOURCE
-                && m.op_code == super::super::wl_data_source::DND_FINISHED),
+            .any(|m| m.object_id == SOURCE && m.op_code == wl_data_source::DND_FINISHED),
         "the source should hear that the target is done: {sent:?}",
     );
     assert!(

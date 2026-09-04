@@ -9,9 +9,9 @@ use tracing::debug;
 use crate::shared::TextureRect;
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::{ClientObjectId, CompositorState, PendingRegion};
 use super::ObjectType;
-use super::state::{ClientObjectId, CompositorState, PendingRegion};
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -45,7 +45,7 @@ pub fn send_enter(
     debug!("wl_surface.enter: surface_id={surface_id} output={output_object_id}");
     if let Some(client) = state.clients.get(client_id) {
         let args = ArgWriter::new().u32(output_object_id).build();
-        let _ = client.send(message(surface_id, ENTER, args));
+        let _ = client.send(build_message(surface_id, ENTER, args));
     }
 }
 
@@ -59,7 +59,7 @@ pub fn send_leave(
     debug!("wl_surface.leave: surface_id={surface_id} output={output_object_id}");
     if let Some(client) = state.clients.get(client_id) {
         let args = ArgWriter::new().u32(output_object_id).build();
-        let _ = client.send(message(surface_id, LEAVE, args));
+        let _ = client.send(build_message(surface_id, LEAVE, args));
     }
 }
 
@@ -135,7 +135,7 @@ fn handle_offset(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 /// raw `i32`s from the client and are later added to a cursor position, which
 /// overflows if nothing bounds them.
 fn accumulate_offset(pending: &mut (i32, i32), x: i32, y: i32) {
-    *pending = super::state::clamp_surface_offset(
+    *pending = super::super::state::clamp_surface_offset(
         pending.0.saturating_add(x),
         pending.1.saturating_add(y),
     );
@@ -395,7 +395,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
         // double-buffered state so that it is correct if anything else comes
         // to need it.
         let offset = std::mem::take(&mut surface.pending.offset);
-        surface.offset = super::state::clamp_surface_offset(
+        surface.offset = super::super::state::clamp_surface_offset(
             surface.offset.0.saturating_add(offset.0),
             surface.offset.1.saturating_add(offset.1),
         );
@@ -456,7 +456,7 @@ fn handle_commit(state: &mut CompositorState, msg: &WaylandProtocolMessageWithCl
 /// uncertain case collapses to it: damage is a promise that everything
 /// *outside* it is unchanged, so a rectangle we cannot place accurately is
 /// worse than no rectangle at all.
-fn committed_damage(
+pub(crate) fn committed_damage(
     state: &CompositorState,
     key: ClientObjectId,
     buffer_id: u32,
@@ -533,6 +533,3 @@ fn clamp_rect(rect: TextureRect, width: i32, height: i32) -> Option<TextureRect>
 fn clamped_i32(value: f64) -> i32 {
     value as i32
 }
-
-#[cfg(test)]
-mod tests;

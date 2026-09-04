@@ -7,9 +7,9 @@ use tracing::debug;
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
+use super::super::state::CompositorState;
 use super::ObjectType;
-use super::state::CompositorState;
-use super::wire_utils::{ArgReader, ArgWriter, message};
+use super::wire_utils::{ArgReader, ArgWriter, build_message};
 
 // Request opcodes
 const DESTROY: u16 = 0;
@@ -124,5 +124,5 @@ pub fn send_ping(state: &mut CompositorState, client_id: u32, wm_base_id: u32, s
         return;
     };
     let args = ArgWriter::new().u32(serial).build();
-    let _ = client.send(message(wm_base_id, PING, args));
+    let _ = client.send(build_message(wm_base_id, PING, args));
 }

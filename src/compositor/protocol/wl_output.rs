@@ -6,8 +6,8 @@
 
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
-use super::wire_utils::{ArgWriter, message};
+use super::super::state::CompositorState;
+use super::wire_utils::{ArgWriter, build_message};
 use crate::shared::OutputId;
 
 // Request opcodes
@@ -66,7 +66,7 @@ pub fn send_output_info(
         .string(&output.geometry.model)
         .i32(output.geometry.transform as i32)
         .build();
-    let _ = client.send(message(obj_id, GEOMETRY, args));
+    let _ = client.send(build_message(obj_id, GEOMETRY, args));
 
     // wl_output.mode (one event per mode)
     for mode in &output.modes {
@@ -76,25 +76,25 @@ pub fn send_output_info(
             .i32(mode.height)
             .i32(mode.refresh_mhz)
             .build();
-        let _ = client.send(message(obj_id, MODE, args));
+        let _ = client.send(build_message(obj_id, MODE, args));
     }
 
     // wl_output.scale (version 2+)
     if version >= 2 {
         let args = ArgWriter::new().i32(output.scale).build();
-        let _ = client.send(message(obj_id, SCALE, args));
+        let _ = client.send(build_message(obj_id, SCALE, args));
 
         // wl_output.name and wl_output.description (version 4+)
         if version >= 4 {
             let args = ArgWriter::new().string(&output.name).build();
-            let _ = client.send(message(obj_id, NAME, args));
+            let _ = client.send(build_message(obj_id, NAME, args));
 
             let args = ArgWriter::new().string(&output.description).build();
-            let _ = client.send(message(obj_id, DESCRIPTION, args));
+            let _ = client.send(build_message(obj_id, DESCRIPTION, args));
         }
 
         // wl_output.done — sent once after all property events for this output.
-        let _ = client.send(message(obj_id, DONE, Vec::new()));
+        let _ = client.send(build_message(obj_id, DONE, Vec::new()));
     }
 }
 
@@ -130,7 +130,7 @@ pub fn broadcast_mode(state: &mut CompositorState) {
                 .string(&output.geometry.model)
                 .i32(output.geometry.transform as i32)
                 .build();
-            let _ = client.send(message(obj_id, GEOMETRY, args));
+            let _ = client.send(build_message(obj_id, GEOMETRY, args));
 
             // All modes
             for mode in &output.modes {
@@ -140,12 +140,12 @@ pub fn broadcast_mode(state: &mut CompositorState) {
                     .i32(mode.height)
                     .i32(mode.refresh_mhz)
                     .build();
-                let _ = client.send(message(obj_id, MODE, args));
+                let _ = client.send(build_message(obj_id, MODE, args));
             }
 
             // wl_output.done — once after all property events (version 2+)
             if version >= 2 {
-                let _ = client.send(message(obj_id, DONE, Vec::new()));
+                let _ = client.send(build_message(obj_id, DONE, Vec::new()));
             }
         }
     }

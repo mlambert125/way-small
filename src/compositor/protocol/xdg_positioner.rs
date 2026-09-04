@@ -7,13 +7,13 @@
 use enumflags2::BitFlags;
 use tracing::debug;
 
-use super::state::{
+use super::super::state::{
     XdgPositionerAnchor, XdgPositionerConstraintAdjustment, XdgPositionerGravity,
     XdgPositionerState,
 };
 use crate::wayland_socket::WaylandProtocolMessageWithClientInfo;
 
-use super::state::CompositorState;
+use super::super::state::CompositorState;
 use super::wire_utils::ArgReader;
 
 // Request opcodes
@@ -362,7 +362,7 @@ fn flip_y_gravity(gravity: XdgPositionerGravity) -> XdgPositionerGravity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compositor::protocol::state::XdgPositionerState;
+    use crate::compositor::state::XdgPositionerState;
 
     /// A 20x20 popup hung off the bottom-left of a 10x10 anchor rect at (100, 100).
     fn positioner() -> XdgPositionerState {
