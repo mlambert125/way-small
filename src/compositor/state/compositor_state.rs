@@ -194,14 +194,6 @@ pub struct SurfacePending {
     pub offset: (i32, i32),
 }
 
-/// Bring a client-chosen surface offset within [`MAX_SURFACE_OFFSET`].
-pub fn clamp_surface_offset(x: i32, y: i32) -> (i32, i32) {
-    (
-        x.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
-        y.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
-    )
-}
-
 #[derive(Debug)]
 pub struct Surface {
     pub client_id: u32,
@@ -406,23 +398,6 @@ impl RegionRect {
     }
 }
 
-/// Whether a point falls inside the region built from these operations.
-///
-/// The operations are replayed in order rather than reduced to a set of
-/// disjoint rectangles. Order is significant: a rectangle added after a
-/// subtraction re-includes the overlapping area, so keeping adds and subtracts
-/// in separate lists would get that case wrong. Replaying is exact for point
-/// queries, which is all the compositor needs a region for.
-pub fn region_contains(rects: &[RegionRect], x: i32, y: i32) -> bool {
-    let mut inside = false;
-    for rect in rects {
-        if rect.contains(x, y) {
-            inside = rect.op == RegionOp::Add;
-        }
-    }
-    inside
-}
-
 /// A `wl_surface.set_input_region` or `set_opaque_region` waiting to be applied
 /// at the next commit.
 #[derive(Debug, Default, Clone)]
@@ -447,6 +422,7 @@ pub struct Region {
 #[derive(Debug)]
 pub enum XdgRole {
     Toplevel(u32),
+    #[allow(dead_code)]
     Popup(u32),
 }
 
@@ -872,53 +848,6 @@ pub struct CompositorState {
     /// the press that is *currently held*, and loosening that to serve the
     /// clipboard would weaken move and resize by a side effect.
     pub recent_input_serials: HashMap<u32, VecDeque<u32>>,
-}
-
-/// Settle the action for a drag from the two sides' masks.
-///
-/// Both sides name a set of actions they will allow, and the receiving side
-/// names one within its set that it would rather have. The preference wins
-/// where the other side also offers it; failing that the lowest bit of what
-/// they agree on does, which puts copy ahead of move ahead of ask.
-///
-/// A client too old to have `set_actions` at all is not the same as one that
-/// has it and never called it, which is why the versions come in here rather
-/// than the defaults being written into the state. A version 1 or 2 source can
-/// only mean a plain copy, and a version 1 or 2 target has no way to refuse
-/// anything, so it is taken to accept whatever is on offer and to prefer a
-/// copy — which is exactly the behaviour it had before actions existed.
-fn resolve_action(
-    source_actions: u32,
-    source_version: u32,
-    offer_actions: u32,
-    offer_preferred: u32,
-    offer_version: u32,
-) -> u32 {
-    let actions_since = super::super::protocol::wl_data_source::ACTIONS_SINCE;
-    let source_actions = if source_version >= actions_since {
-        source_actions
-    } else {
-        DND_ACTION_COPY
-    };
-    let (offer_actions, offer_preferred) = if offer_version >= actions_since {
-        (offer_actions, offer_preferred)
-    } else {
-        (DND_ACTION_COPY, DND_ACTION_COPY)
-    };
-
-    let available = source_actions & offer_actions;
-    if available == 0 {
-        return DND_ACTION_NONE;
-    }
-    if offer_preferred & available != 0 {
-        return offer_preferred;
-    }
-    for action in [DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_ASK] {
-        if available & action != 0 {
-            return action;
-        }
-    }
-    DND_ACTION_NONE
 }
 
 impl CompositorState {
@@ -2411,4 +2340,76 @@ impl CompositorState {
             self.focused_surface = None;
         }
     }
+}
+
+/// Settle the action for a drag from the two sides' masks.
+///
+/// Both sides name a set of actions they will allow, and the receiving side
+/// names one within its set that it would rather have. The preference wins
+/// where the other side also offers it; failing that the lowest bit of what
+/// they agree on does, which puts copy ahead of move ahead of ask.
+///
+/// A client too old to have `set_actions` at all is not the same as one that
+/// has it and never called it, which is why the versions come in here rather
+/// than the defaults being written into the state. A version 1 or 2 source can
+/// only mean a plain copy, and a version 1 or 2 target has no way to refuse
+/// anything, so it is taken to accept whatever is on offer and to prefer a
+/// copy — which is exactly the behaviour it had before actions existed.
+fn resolve_action(
+    source_actions: u32,
+    source_version: u32,
+    offer_actions: u32,
+    offer_preferred: u32,
+    offer_version: u32,
+) -> u32 {
+    let actions_since = super::super::protocol::wl_data_source::ACTIONS_SINCE;
+    let source_actions = if source_version >= actions_since {
+        source_actions
+    } else {
+        DND_ACTION_COPY
+    };
+    let (offer_actions, offer_preferred) = if offer_version >= actions_since {
+        (offer_actions, offer_preferred)
+    } else {
+        (DND_ACTION_COPY, DND_ACTION_COPY)
+    };
+
+    let available = source_actions & offer_actions;
+    if available == 0 {
+        return DND_ACTION_NONE;
+    }
+    if offer_preferred & available != 0 {
+        return offer_preferred;
+    }
+    for action in [DND_ACTION_COPY, DND_ACTION_MOVE, DND_ACTION_ASK] {
+        if available & action != 0 {
+            return action;
+        }
+    }
+    DND_ACTION_NONE
+}
+
+/// Whether a point falls inside the region built from these operations.
+///
+/// The operations are replayed in order rather than reduced to a set of
+/// disjoint rectangles. Order is significant: a rectangle added after a
+/// subtraction re-includes the overlapping area, so keeping adds and subtracts
+/// in separate lists would get that case wrong. Replaying is exact for point
+/// queries, which is all the compositor needs a region for.
+pub fn region_contains(rects: &[RegionRect], x: i32, y: i32) -> bool {
+    let mut inside = false;
+    for rect in rects {
+        if rect.contains(x, y) {
+            inside = rect.op == RegionOp::Add;
+        }
+    }
+    inside
+}
+
+/// Bring a client-chosen surface offset within [`MAX_SURFACE_OFFSET`].
+pub fn clamp_surface_offset(x: i32, y: i32) -> (i32, i32) {
+    (
+        x.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
+        y.clamp(-MAX_SURFACE_OFFSET, MAX_SURFACE_OFFSET),
+    )
 }

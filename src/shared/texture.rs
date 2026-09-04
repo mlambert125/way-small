@@ -6,7 +6,7 @@
 //! holding; for a client's own GPU buffer it means an import, and there is
 //! nothing to send at all. Which of the two it is, is [`TextureSource`].
 
-use super::buffer::BufferGuard;
+use super::buffer_guard::BufferGuard;
 use super::dmabuf::DmabufImage;
 use std::sync::Arc;
 

@@ -4,13 +4,10 @@ use super::output::OutputId;
 use super::texture::TextureImage;
 use std::sync::Arc;
 
-/// How a client has already transformed its buffer, from
-/// `wl_surface.set_buffer_transform`.
-///
-/// The value says what the client did, so drawing it correctly means undoing
-/// it. A surface that names `Rotate90` has a buffer whose width and height are
-/// the other way round from the surface's, which is why this reaches geometry
-/// as well as sampling.
+/// Background color for compositor
+pub const BACKGROUND_COLOR: u32 = 0xff1a_1a2e;
+
+/// How a client has already transformed its buffer, from `wl_surface.set_buffer_transform`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BufferTransform {
     #[default]
@@ -25,8 +22,7 @@ pub enum BufferTransform {
 }
 
 impl BufferTransform {
-    /// From the `wl_output.transform` value a client sends, or `None` if it is
-    /// not one of the eight the protocol defines.
+    /// From the `wl_output.transform` value a client sends, or `None` if it is invalid
     pub fn from_wire(value: u32) -> Option<Self> {
         Some(match value {
             0 => Self::Normal,

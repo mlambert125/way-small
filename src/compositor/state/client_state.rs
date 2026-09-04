@@ -45,7 +45,7 @@ pub struct ClientState {
 
 impl ClientState {
     /// Create a new client state with a provided sender for talking back to
-    /// the socket, an fd_queue containing ancillary socket fds, and a cancellation
+    /// the socket, an `fd_queue` containing ancillary socket fds, and a cancellation
     /// token for killing the underlying socket
     pub fn new(
         sender: Sender<WaylandProtocolMessage>,
@@ -157,7 +157,11 @@ impl ClientState {
             return;
         }
         let args = ArgWriter::new().u32(id).build();
-        let _ = self.send(build_message(wl_display::OBJECT_ID, wl_display::DELETE_ID, args));
+        let _ = self.send(build_message(
+            wl_display::OBJECT_ID,
+            wl_display::DELETE_ID,
+            args,
+        ));
     }
 
     /// Queue a message for delivery to this client's wayland socket
@@ -217,7 +221,11 @@ impl ClientState {
             .u32(code)
             .string(msg)
             .build();
-        let _ = self.send(build_message(wl_display::OBJECT_ID, wl_display::ERROR, args));
+        let _ = self.send(build_message(
+            wl_display::OBJECT_ID,
+            wl_display::ERROR,
+            args,
+        ));
         self.cancel_token.cancel();
     }
 }

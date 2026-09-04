@@ -11,6 +11,7 @@ pub const OUTPUT_MODE_PREFERRED: u32 = 0x2;
 /// Transform on this output (flipped/rotated)
 #[derive(Debug, Clone, Copy, FromRepr)]
 #[repr(u32)]
+#[allow(dead_code)]
 pub enum OutputTransform {
     /// No transform applied
     Normal = 0,
@@ -33,6 +34,7 @@ pub enum OutputTransform {
 /// The arrangement of subpixels on the display
 #[derive(Debug, Clone, Copy, FromRepr)]
 #[repr(u32)]
+#[allow(dead_code)]
 pub enum OutputSubpixel {
     /// Unknown
     Unknown = 0,
@@ -72,9 +74,7 @@ pub struct OutputGeometry {
 /// The mode of an output/monitor
 #[derive(Debug, Clone)]
 pub struct OutputMode {
-    /// Flags indicating additional details of this mode:
-    ///   - `OUTPUT_MODE_CURRENT`
-    ///   - `OUTPUT_MODE_PREFERRED`
+    /// Flags indicating additional details of this mode: (`OUTPUT_MODE_CURRENT`, `OUTPUT_MODE_PREFERRED`)
     pub flags: u32,
     /// Width for this mode
     pub width: i32,

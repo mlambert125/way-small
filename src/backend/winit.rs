@@ -1,15 +1,4 @@
 //! Winit display backend.
-//!
-//! Opens a window on the host compositor via winit, draws the scenes it
-//! receives from the compositor through GLES 3.0, and translates host input
-//! events (keyboard, mouse, focus) into `BackendMessages` sent to the
-//! compositor loop. Also manages XKB state for keycode-to-keysym resolution.
-//!
-//! The GL context is created and made current on the winit thread and never
-//! leaves it, which is why compositing lives here rather than in the
-//! compositor task. The same EGL display is what client GPU buffers are
-//! imported through — see [`super::dmabuf_import`] — so a dma-buf a client hands over
-//! is sampled by the same renderer, on the same thread, with no upload.
 
 use super::dmabuf_import::DmabufImporter;
 use super::gl_renderer::GlRenderer;
@@ -18,7 +7,7 @@ use crate::shared::{
     MouseButton, PresentedAt, Scene, fourcc_name,
 };
 use crate::shared::{OUTPUT_MODE_CURRENT, OUTPUT_MODE_PREFERRED, Output, OutputId, ScrollSource};
-use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
+use glutin::config::GlConfig;
 use glutin::context::{
     ContextApi, ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext, Version,
 };
@@ -226,7 +215,11 @@ impl App {
         let window_attributes = WindowAttributes::default().with_title("way-small");
         let (window, config) = DisplayBuilder::new()
             .with_window_attributes(Some(window_attributes))
-            .build(event_loop, ConfigTemplateBuilder::new(), pick_config)
+            .build(
+                event_loop,
+                glutin::config::ConfigTemplateBuilder::new(),
+                pick_glutin_config,
+            )
             .map_err(|e| anyhow::anyhow!("failed to create GL display: {e}"))?;
         let window = Arc::new(
             window.ok_or_else(|| anyhow::anyhow!("GL display builder returned no window"))?,
@@ -322,52 +315,10 @@ impl App {
     }
 }
 
-/// Log what the driver said about dma-buf, at the level the answer deserves.
-///
-/// A failed probe is a warning rather than a debug line: the extensions are
-/// there, so a client will be told dma-buf works, and it will not.
-fn report_dmabuf_support(support: &(Vec<DmabufFormat>, DmabufProbe)) {
-    let (formats, probe) = support;
-    match probe {
-        DmabufProbe::Passed => info!(
-            "dma-buf import working: {} format(s), e.g. {}",
-            formats.len(),
-            formats
-                .iter()
-                .take(4)
-                .map(|f| fourcc_name(f.fourcc))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        DmabufProbe::Unsupported(reason) => info!("dma-buf import unavailable: {reason}"),
-        DmabufProbe::Untested(reason) => info!(
-            "dma-buf import available for {} format(s) but unverified: {reason}",
-            formats.len(),
-        ),
-        DmabufProbe::Failed(reason) => {
-            warn!("dma-buf import is advertised by the driver but does not work: {reason}");
-        }
-    }
-}
-
-/// Prefer the config with the fewest samples: this compositor draws axis-aligned
-/// quads, so multisampling would cost bandwidth and change nothing.
-fn pick_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
-    configs
-        .reduce(|best, config| {
-            if config.num_samples() < best.num_samples() {
-                config
-            } else {
-                best
-            }
-        })
-        .expect("no GL config available")
-}
-
 impl ApplicationHandler<UserEvent> for App {
     /// Called once when the app starts and is ready.  This is a bit poorly
     /// named for platforms that don't do tombstoning (desktops), but that's
-    /// what winit::application::ApplicationHandler calls it
+    /// what `winit::application::ApplicationHandler` calls it
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gl.is_some() {
             return;
@@ -602,12 +553,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // which unit — and the unit only exists because the devices
                 // differ.
                 let (dx, dy, source, v120_x, v120_y) = match delta {
+                    #[allow(clippy::cast_possible_truncation)]
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (
                         f64::from(x),
                         f64::from(y),
                         ScrollSource::Wheel,
-                        detents_to_v120(x),
-                        detents_to_v120(y),
+                        (x * 120.0) as i32,
+                        (y * 120.0) as i32,
                     ),
                     winit::event::MouseScrollDelta::PixelDelta(pos) => {
                         (pos.x, pos.y, ScrollSource::Finger, 0, 0)
@@ -649,6 +601,50 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
     }
+}
+
+/// Log what the driver said about dma-buf, at the level the answer deserves.
+///
+/// A failed probe is a warning rather than a debug line: the extensions are
+/// there, so a client will be told dma-buf works, and it will not.
+fn report_dmabuf_support(support: &(Vec<DmabufFormat>, DmabufProbe)) {
+    let (formats, probe) = support;
+    match probe {
+        DmabufProbe::Passed => info!(
+            "dma-buf import working: {} format(s), e.g. {}",
+            formats.len(),
+            formats
+                .iter()
+                .take(4)
+                .map(|f| fourcc_name(f.fourcc))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        DmabufProbe::Unsupported(reason) => info!("dma-buf import unavailable: {reason}"),
+        DmabufProbe::Untested(reason) => info!(
+            "dma-buf import available for {} format(s) but unverified: {reason}",
+            formats.len(),
+        ),
+        DmabufProbe::Failed(reason) => {
+            warn!("dma-buf import is advertised by the driver but does not work: {reason}");
+        }
+    }
+}
+
+/// Prefer the config with the fewest samples: this compositor draws axis-aligned
+/// quads, so multisampling would cost bandwidth and change nothing.
+fn pick_glutin_config(
+    configs: Box<dyn Iterator<Item = glutin::config::Config> + '_>,
+) -> glutin::config::Config {
+    configs
+        .reduce(|best, config| {
+            if config.num_samples() < best.num_samples() {
+                config
+            } else {
+                best
+            }
+        })
+        .expect("no GL config available")
 }
 
 /// Runs this wayland backend, waiting for frames from the compositor and
@@ -730,13 +726,4 @@ pub fn run_winit_backend(
     };
     event_loop.run_app(&mut app)?;
     Ok(())
-}
-
-/// Wheel detents as 120ths of a click, which is the unit the protocol uses.
-///
-/// The fraction exists so a high-resolution wheel can report part of a detent
-/// without a separate event from an ordinary one.
-#[allow(clippy::cast_possible_truncation)]
-fn detents_to_v120(detents: f32) -> i32 {
-    (detents * 120.0) as i32
 }
